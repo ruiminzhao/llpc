@@ -28,12 +28,11 @@
 * @brief VKGC source file: contains implementation of VKGC pipeline dump utility.
 ***********************************************************************************************************************
 */
+#include "vkgcPipelineDumper.h"
+#include "vkgcElfReader.h"
+#include "vkgcUtil.h"
 #include "llvm/Support/Mutex.h"
 #include "llvm/Support/raw_ostream.h"
-
-#include "vkgcElfReader.h"
-#include "vkgcPipelineDumper.h"
-#include "vkgcUtil.h"
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
@@ -57,6 +56,9 @@ namespace Vkgc {
 std::ostream &operator<<(std::ostream &out, VkVertexInputRate inputRate);
 std::ostream &operator<<(std::ostream &out, VkFormat format);
 std::ostream &operator<<(std::ostream &out, VkPrimitiveTopology topology);
+#if VKI_RAY_TRACING
+std::ostream &operator<<(std::ostream &out, VkRayTracingShaderGroupTypeKHR type);
+#endif
 std::ostream &operator<<(std::ostream &out, ResourceMappingNodeType type);
 std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing);
 std::ostream &operator<<(std::ostream &out, NggCompactMode compactMode);
@@ -122,6 +124,10 @@ void *VKAPI_CALL IPipelineDumper::BeginPipelineDump(const PipelineDumpOptions *d
   MetroHash::Hash hash = {};
   if (pipelineInfo.pComputeInfo)
     hash = PipelineDumper::generateHashForComputePipeline(pipelineInfo.pComputeInfo, false, false);
+#if VKI_RAY_TRACING
+  else if (pipelineInfo.pRayTracingInfo)
+    hash = PipelineDumper::generateHashForRayTracingPipeline(pipelineInfo.pRayTracingInfo, false);
+#endif
   else {
     assert(pipelineInfo.pGraphicsInfo);
     hash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo.pGraphicsInfo, false, false);
@@ -259,6 +265,56 @@ uint64_t VKAPI_CALL IPipelineDumper::GetPipelineHash(const ComputePipelineBuildI
   return MetroHash::compact64(&hash);
 }
 
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Calculates ray tracing pipeline hash code.
+//
+// @param pipelineInfo : Info to build this ray tracing pipeline
+uint64_t VKAPI_CALL IPipelineDumper::GetPipelineHash(const RayTracingPipelineBuildInfo *pipelineInfo) {
+  auto hash = PipelineDumper::generateHashForRayTracingPipeline(pipelineInfo, false);
+  return MetroHash::compact64(&hash);
+}
+
+// =====================================================================================================================
+// Gets ray tracing pipeline name.
+//
+// @param rtPipelineInfo : Info to build this ray tracing pipeline
+// @param [Out] pipeNameOut : The full name of this ray tracing pipeline
+// @param nameBufSize : Size of the buffer to store pipeline name
+void VKAPI_CALL IPipelineDumper::GetPipelineName(const RayTracingPipelineBuildInfo *rtPipelineInfo, char *pipeNameOut,
+                                                 const size_t nameBufSize) {
+  auto hash = PipelineDumper::generateHashForRayTracingPipeline(rtPipelineInfo, false);
+  PipelineBuildInfo pipelineInfo = {};
+  pipelineInfo.pRayTracingInfo = rtPipelineInfo;
+  std::string pipeName = PipelineDumper::getPipelineInfoFileName(pipelineInfo, MetroHash::compact64(&hash));
+  snprintf(pipeNameOut, nameBufSize, "%s", pipeName.c_str());
+}
+
+// =====================================================================================================================
+// Gets ray tracing pipeline name.
+//
+// @param rtPipelineInfo : Info to build this ray tracing pipeline
+// @param [Out] pipeNameOut : The full name of this ray tracing pipeline
+// @param nameBufSize : Size of the buffer to store pipeline name
+// @param hashCode64 : Precalculated Hash code of pipeline
+void VKAPI_CALL IPipelineDumper::GetPipelineName(const RayTracingPipelineBuildInfo *rtPipelineInfo, char *pipeNameOut,
+                                                 const size_t nameBufSize, uint64_t hashCode64) {
+  PipelineBuildInfo pipelineInfo = {};
+  pipelineInfo.pRayTracingInfo = rtPipelineInfo;
+  std::string pipeName = PipelineDumper::getPipelineInfoFileName(pipelineInfo, hashCode64);
+  snprintf(pipeNameOut, nameBufSize, "%s", pipeName.c_str());
+}
+
+// =====================================================================================================================
+/// Dumps ray tracing pipeline metadata.
+///
+/// @param [in]  dumpFile       The handle of pipeline dump file
+/// @param [in]  pipelineMeta   Ray tracing pipeline metadata binary
+void VKAPI_CALL IPipelineDumper::DumpRayTracingPipelineMetadata(void *dumpFile, BinaryData *pipelineMeta) {
+  PipelineDumper::dumpRayTracingPipelineMetadata(reinterpret_cast<PipelineDumpFile *>(dumpFile), pipelineMeta);
+}
+#endif
+
 // =====================================================================================================================
 // Gets the file name of SPIR-V binary according the specified shader hash.
 //
@@ -280,6 +336,12 @@ std::string PipelineDumper::getPipelineInfoFileName(PipelineBuildInfo pipelineIn
   if (pipelineInfo.pComputeInfo) {
     snprintf(fileName, 64, "PipelineCs_0x%016" PRIX64, hashCode64);
   }
+#if VKI_RAY_TRACING
+  else if (pipelineInfo.pRayTracingInfo) {
+    auto length = snprintf(fileName, 64, "PipelineRays_0x%016" PRIX64, hashCode64);
+    (void(length)); // unused
+  }
+#endif
   else {
     assert(pipelineInfo.pGraphicsInfo);
     const char *fileNamePrefix = nullptr;
@@ -398,6 +460,10 @@ PipelineDumpFile *PipelineDumper::BeginPipelineDump(const PipelineDumpOptions *d
       if (pipelineInfo.pGraphicsInfo)
         dumpGraphicsPipelineInfo(&dumpFile->dumpFile, dumpOptions->pDumpDir, pipelineInfo.pGraphicsInfo);
 
+#if VKI_RAY_TRACING
+      if (pipelineInfo.pRayTracingInfo)
+        dumpRayTracingPipelineInfo(&dumpFile->dumpFile, dumpOptions->pDumpDir, pipelineInfo.pRayTracingInfo);
+#endif
     }
   }
 
@@ -434,16 +500,11 @@ void PipelineDumper::dumpResourceMappingNode(const ResourceMappingNode *userData
   case ResourceMappingNodeType::DescriptorFmask:
   case ResourceMappingNodeType::DescriptorBufferCompact:
   case ResourceMappingNodeType::PushConst:
-// clang-format off
-#if  (LLPC_CLIENT_INTERFACE_MAJOR_VERSION>= 50)
   case ResourceMappingNodeType::InlineBuffer:
-#endif
-  // clang-format on
   case ResourceMappingNodeType::DescriptorConstBuffer:
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
-  case ResourceMappingNodeType::DescriptorConstTexelBuffer:
-  {
+  case ResourceMappingNodeType::DescriptorConstTexelBuffer: {
     char setHexvalue[64] = {};
     snprintf(setHexvalue, 64, "0x%08" PRIX32, userDataNode->srdRange.set);
     dumpFile << prefix << ".set = " << setHexvalue << "\n";
@@ -519,10 +580,12 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   dumpFile << "options.debugMode = " << shaderInfo->options.debugMode << "\n";
   dumpFile << "options.enablePerformanceData = " << shaderInfo->options.enablePerformanceData << "\n";
   dumpFile << "options.allowReZ = " << shaderInfo->options.allowReZ << "\n";
+  dumpFile << "options.forceLateZ = " << shaderInfo->options.forceLateZ << "\n";
   dumpFile << "options.vgprLimit = " << shaderInfo->options.vgprLimit << "\n";
   dumpFile << "options.sgprLimit = " << shaderInfo->options.sgprLimit << "\n";
   dumpFile << "options.maxThreadGroupsPerComputeUnit = " << shaderInfo->options.maxThreadGroupsPerComputeUnit << "\n";
   dumpFile << "options.waveSize = " << shaderInfo->options.waveSize << "\n";
+  dumpFile << "options.subgroupSize = " << shaderInfo->options.subgroupSize << "\n";
   dumpFile << "options.wgpMode = " << shaderInfo->options.wgpMode << "\n";
   dumpFile << "options.waveBreakSize = " << shaderInfo->options.waveBreakSize << "\n";
   dumpFile << "options.forceLoopUnrollCount = " << shaderInfo->options.forceLoopUnrollCount << "\n";
@@ -543,6 +606,12 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   dumpFile << "options.disableFastMathFlags = " << shaderInfo->options.disableFastMathFlags << "\n";
   dumpFile << "options.ldsSpillLimitDwords = " << shaderInfo->options.ldsSpillLimitDwords << "\n";
   dumpFile << "options.scalarizeWaterfallLoads = " << shaderInfo->options.scalarizeWaterfallLoads << "\n";
+  dumpFile << "options.overrideShaderThreadGroupSizeX = " << shaderInfo->options.overrideShaderThreadGroupSizeX << "\n";
+  dumpFile << "options.overrideShaderThreadGroupSizeY = " << shaderInfo->options.overrideShaderThreadGroupSizeY << "\n";
+  dumpFile << "options.overrideShaderThreadGroupSizeZ = " << shaderInfo->options.overrideShaderThreadGroupSizeZ << "\n";
+  dumpFile << "options.nsaThreshold = " << shaderInfo->options.nsaThreshold << "\n";
+  dumpFile << "options.aggressiveInvariantLoads = " << shaderInfo->options.aggressiveInvariantLoads << "\n";
+  dumpFile << "options.disableInvariantLoads = " << shaderInfo->options.disableInvariantLoads << "\n";
   dumpFile << "\n";
 }
 
@@ -551,44 +620,44 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
 //
 // @param resourceMapping : Pipeline resource mapping data
 // @param [out] dumpFile : Dump file
-void PipelineDumper::dumpResourceMappingInfo(const ResourceMappingData* resourceMapping, std::ostream &dumpFile) {
-    dumpFile << "[ResourceMapping]\n";
+void PipelineDumper::dumpResourceMappingInfo(const ResourceMappingData *resourceMapping, std::ostream &dumpFile) {
+  dumpFile << "[ResourceMapping]\n";
 
-    // Output descriptor range value
-    if (resourceMapping->staticDescriptorValueCount > 0) {
-        for (unsigned i = 0; i < resourceMapping->staticDescriptorValueCount; ++i) {
-            auto staticDescriptorValue = &resourceMapping->pStaticDescriptorValues[i];
-            dumpFile << "descriptorRangeValue[" << i << "].visibility = " << staticDescriptorValue->visibility << "\n";
-            dumpFile << "descriptorRangeValue[" << i << "].type = " << staticDescriptorValue->type << "\n";
-            dumpFile << "descriptorRangeValue[" << i << "].set = " << staticDescriptorValue->set << "\n";
-            dumpFile << "descriptorRangeValue[" << i << "].binding = " << staticDescriptorValue->binding << "\n";
-            dumpFile << "descriptorRangeValue[" << i << "].arraySize = " << staticDescriptorValue->arraySize << "\n";
-            for (unsigned j = 0; j < staticDescriptorValue->arraySize; ++j) {
-                dumpFile << "descriptorRangeValue[" << i << "].uintData = ";
-                const unsigned descriptorSizeInDw =
-                    4 + (staticDescriptorValue->type == ResourceMappingNodeType::DescriptorYCbCrSampler
-                             ? (sizeof(SamplerYCbCrConversionMetaData) / 4)
-                             : 0);
+  // Output descriptor range value
+  if (resourceMapping->staticDescriptorValueCount > 0) {
+    for (unsigned i = 0; i < resourceMapping->staticDescriptorValueCount; ++i) {
+      auto staticDescriptorValue = &resourceMapping->pStaticDescriptorValues[i];
+      dumpFile << "descriptorRangeValue[" << i << "].visibility = " << staticDescriptorValue->visibility << "\n";
+      dumpFile << "descriptorRangeValue[" << i << "].type = " << staticDescriptorValue->type << "\n";
+      dumpFile << "descriptorRangeValue[" << i << "].set = " << staticDescriptorValue->set << "\n";
+      dumpFile << "descriptorRangeValue[" << i << "].binding = " << staticDescriptorValue->binding << "\n";
+      dumpFile << "descriptorRangeValue[" << i << "].arraySize = " << staticDescriptorValue->arraySize << "\n";
+      for (unsigned j = 0; j < staticDescriptorValue->arraySize; ++j) {
+        dumpFile << "descriptorRangeValue[" << i << "].uintData = ";
+        const unsigned descriptorSizeInDw =
+            4 + (staticDescriptorValue->type == ResourceMappingNodeType::DescriptorYCbCrSampler
+                     ? (sizeof(SamplerYCbCrConversionMetaData) / 4)
+                     : 0);
 
-                for (unsigned k = 0; k < descriptorSizeInDw - 1; ++k)
-                    dumpFile << staticDescriptorValue->pValue[k] << ", ";
-                dumpFile << staticDescriptorValue->pValue[descriptorSizeInDw - 1] << "\n";
-            }
-        }
-        dumpFile << "\n";
+        for (unsigned k = 0; k < descriptorSizeInDw - 1; ++k)
+          dumpFile << staticDescriptorValue->pValue[k] << ", ";
+        dumpFile << staticDescriptorValue->pValue[descriptorSizeInDw - 1] << "\n";
+      }
     }
+    dumpFile << "\n";
+  }
 
-    // Output resource node mapping
-    if (resourceMapping->userDataNodeCount > 0) {
-        char prefixBuff[64] = {};
-        for (unsigned i = 0; i < resourceMapping->userDataNodeCount; ++i) {
-            auto userDataNode = &resourceMapping->pUserDataNodes[i];
-            snprintf(prefixBuff, 64, "userDataNode[%u]", i);
-            dumpFile << prefixBuff << ".visibility = " << userDataNode->visibility << "\n";
-            dumpResourceMappingNode(&userDataNode->node, prefixBuff, dumpFile);
-        }
-        dumpFile << "\n";
+  // Output resource node mapping
+  if (resourceMapping->userDataNodeCount > 0) {
+    char prefixBuff[64] = {};
+    for (unsigned i = 0; i < resourceMapping->userDataNodeCount; ++i) {
+      auto userDataNode = &resourceMapping->pUserDataNodes[i];
+      snprintf(prefixBuff, 64, "userDataNode[%u]", i);
+      dumpFile << prefixBuff << ".visibility = " << userDataNode->visibility << "\n";
+      dumpResourceMappingNode(&userDataNode->node, prefixBuff, dumpFile);
     }
+    dumpFile << "\n";
+  }
 }
 
 // =====================================================================================================================
@@ -680,6 +749,19 @@ void PipelineDumper::dumpComputeStateInfo(const ComputePipelineBuildInfo *pipeli
   // Output pipeline states
   dumpFile << "deviceIndex = " << pipelineInfo->deviceIndex << "\n";
   dumpPipelineOptions(&pipelineInfo->options, dumpFile);
+#if VKI_RAY_TRACING
+  // Output shader library binary
+  if (pipelineInfo->shaderLibrary.codeSize > 0) {
+    MetroHash::Hash hash = {};
+    MetroHash64::Hash(reinterpret_cast<const uint8_t *>(pipelineInfo->shaderLibrary.pCode),
+                      pipelineInfo->shaderLibrary.codeSize, hash.bytes);
+    DumpSpirvBinary(dumpDir, &pipelineInfo->shaderLibrary, &hash);
+
+    std::string shaderLibraryName = getSpirvBinaryFileName(&hash);
+    dumpFile << "shaderLibrary = " << shaderLibraryName << "\n";
+    dumpRayTracingRtState(&pipelineInfo->rtState, dumpFile);
+  }
+#endif
 }
 
 // =====================================================================================================================
@@ -710,6 +792,11 @@ void PipelineDumper::dumpPipelineOptions(const PipelineOptions *options, std::os
   dumpFile << "options.optimizationLevel = " << options->optimizationLevel << "\n";
 #endif
   dumpFile << "options.threadGroupSwizzleMode = " << options->threadGroupSwizzleMode << "\n";
+  dumpFile << "options.reverseThreadGroup = " << options->reverseThreadGroup << "\n";
+
+#if VKI_RAY_TRACING
+  dumpFile << "options.internalRtShaders = " << options->internalRtShaders << "\n";
+#endif
 }
 
 // =====================================================================================================================
@@ -791,6 +878,19 @@ void PipelineDumper::dumpGraphicsStateInfo(const GraphicsPipelineBuildInfo *pipe
   dumpFile << "enableUberFetchShader = " << pipelineInfo->enableUberFetchShader << "\n";
   dumpFile << "enableEarlyCompile = " << pipelineInfo->enableEarlyCompile << "\n";
   dumpPipelineOptions(&pipelineInfo->options, dumpFile);
+#if VKI_RAY_TRACING
+  // Output shader library binary
+  if (pipelineInfo->shaderLibrary.codeSize > 0) {
+    MetroHash::Hash hash = {};
+    MetroHash64::Hash(reinterpret_cast<const uint8_t *>(pipelineInfo->shaderLibrary.pCode),
+                      pipelineInfo->shaderLibrary.codeSize, hash.bytes);
+    DumpSpirvBinary(dumpDir, &pipelineInfo->shaderLibrary, &hash);
+
+    std::string shaderLibraryName = getSpirvBinaryFileName(&hash);
+    dumpFile << "shaderLibrary = " << shaderLibraryName << "\n";
+    dumpRayTracingRtState(&pipelineInfo->rtState, dumpFile);
+  }
+#endif
   dumpFile << "\n\n";
 
   // Output vertex input state
@@ -820,7 +920,6 @@ void PipelineDumper::dumpGraphicsStateInfo(const GraphicsPipelineBuildInfo *pipe
       dumpFile << "divisor[" << i << "].divisor = " << divisor->divisor << "\n";
     }
   }
-
 }
 
 // =====================================================================================================================
@@ -855,6 +954,217 @@ void PipelineDumper::dumpGraphicsPipelineInfo(std::ostream *dumpFile, const char
 
   dumpFile->flush();
 }
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Dumps ray tracing pipeline build info to file.
+//
+// @param dumpFile : Pipeline dump file
+// @param dumpDir : Directory of pipeline dump
+// @param pipelineInfo : Info of the ray tracing pipeline to be built
+void PipelineDumper::dumpRayTracingPipelineInfo(std::ostream *dumpFile, const char *dumpDir,
+                                                const RayTracingPipelineBuildInfo *pipelineInfo) {
+  dumpVersionInfo(*dumpFile);
+
+  // Dump pipeline
+  for (unsigned i = 0; i < pipelineInfo->shaderCount; ++i) {
+    const PipelineShaderInfo *shaderInfo = &pipelineInfo->pShaders[i];
+
+    dumpPipelineShaderInfo(shaderInfo, *dumpFile);
+  }
+
+  dumpResourceMappingInfo(&pipelineInfo->resourceMapping, *dumpFile);
+
+  dumpRayTracingStateInfo(pipelineInfo, dumpDir, *dumpFile);
+
+  dumpFile->flush();
+}
+
+// =====================================================================================================================
+// Dumps ray tracing pipeline state info to file.
+//
+// @param pipelineInfo : Info of the ray tracing pipeline to be built
+// @param dumpDir : Directory of pipeline dump
+// @param dumpFile : Pipeline dump file
+void PipelineDumper::dumpRayTracingStateInfo(const RayTracingPipelineBuildInfo *pipelineInfo, const char *dumpDir,
+                                             std::ostream &dumpFile) {
+  dumpFile << "[RayTracingPipelineState]\n";
+
+  // Output pipeline states
+  dumpFile << "deviceIndex = " << pipelineInfo->deviceIndex << "\n";
+  dumpPipelineOptions(&pipelineInfo->options, dumpFile);
+
+  // Output shader groups
+  for (unsigned i = 0; i < pipelineInfo->shaderGroupCount; ++i) {
+    auto shaderGroup = &pipelineInfo->pShaderGroups[i];
+    dumpFile << "groups[" << i << "].type = " << shaderGroup->type << "\n";
+    dumpFile << "groups[" << i << "].generalShader = " << static_cast<int>(shaderGroup->generalShader) << "\n";
+    dumpFile << "groups[" << i << "].closestHitShader = " << static_cast<int>(shaderGroup->closestHitShader) << "\n";
+    dumpFile << "groups[" << i << "].anyHitShader = " << static_cast<int>(shaderGroup->anyHitShader) << "\n";
+    dumpFile << "groups[" << i << "].intersectionShader = " << static_cast<int>(shaderGroup->intersectionShader)
+             << "\n";
+  }
+
+  // Output trace ray shader binary
+  MetroHash::Hash hash = {};
+  MetroHash64::Hash(reinterpret_cast<const uint8_t *>(pipelineInfo->shaderTraceRay.pCode),
+                    pipelineInfo->shaderTraceRay.codeSize, hash.bytes);
+  DumpSpirvBinary(dumpDir, &pipelineInfo->shaderTraceRay, &hash);
+
+  std::string traceRayName = getSpirvBinaryFileName(&hash);
+  dumpFile << "shaderTraceRay = " << traceRayName << "\n";
+  dumpFile << "maxRecursionDepth = " << pipelineInfo->maxRecursionDepth << "\n";
+  dumpFile << "indirectStageMask = " << pipelineInfo->indirectStageMask << "\n";
+  dumpRayTracingRtState(&pipelineInfo->rtState, dumpFile);
+  dumpFile << "payloadSizeMaxInLib = " << pipelineInfo->payloadSizeMaxInLib << "\n";
+  dumpFile << "attributeSizeMaxInLib = " << pipelineInfo->attributeSizeMaxInLib << "\n";
+  dumpFile << "hasPipelineLibrary = " << pipelineInfo->hasPipelineLibrary << "\n";
+  dumpFile << "pipelineLibStageMask = " << pipelineInfo->pipelineLibStageMask << "\n";
+}
+
+// =====================================================================================================================
+// Dumps ray tracing pipeline state info to file.
+//
+// @param rtState : Pipeline ray tracing state
+// @param dumpFile : Pipeline dump file
+void PipelineDumper::dumpRayTracingRtState(const RtState *rtState, std::ostream &dumpStream) {
+  dumpStream << "rtState.bvhResDescSize = " << rtState->bvhResDesc.dataSizeInDwords << "\n";
+  for (unsigned i = 0; i < rtState->bvhResDesc.dataSizeInDwords; ++i)
+    dumpStream << "rtState.bvhResDesc[" << i << "] = " << rtState->bvhResDesc.descriptorData[i] << "\n";
+
+  dumpStream << "rtState.nodeStrideShift = " << rtState->nodeStrideShift << "\n";
+  dumpStream << "rtState.staticPipelineFlags = " << rtState->staticPipelineFlags << "\n";
+  dumpStream << "rtState.triCompressMode = " << rtState->triCompressMode << "\n";
+  dumpStream << "rtState.pipelineFlags = " << rtState->pipelineFlags << "\n";
+  dumpStream << "rtState.threadGroupSizeX = " << rtState->threadGroupSizeX << "\n";
+  dumpStream << "rtState.threadGroupSizeY = " << rtState->threadGroupSizeY << "\n";
+  dumpStream << "rtState.threadGroupSizeZ = " << rtState->threadGroupSizeZ << "\n";
+  dumpStream << "rtState.boxSortHeuristicMode = " << rtState->boxSortHeuristicMode << "\n";
+  dumpStream << "rtState.counterMode = " << rtState->counterMode << "\n";
+  dumpStream << "rtState.counterMask = " << rtState->counterMask << "\n";
+  dumpStream << "rtState.rayQueryCsSwizzle = " << rtState->rayQueryCsSwizzle << "\n";
+  dumpStream << "rtState.ldsStackSize = " << rtState->ldsStackSize << "\n";
+  dumpStream << "rtState.dispatchRaysThreadGroupSize = " << rtState->dispatchRaysThreadGroupSize << "\n";
+  dumpStream << "rtState.ldsSizePerThreadGroup = " << rtState->ldsSizePerThreadGroup << "\n";
+  dumpStream << "rtState.outerTileSize = " << rtState->outerTileSize << "\n";
+  dumpStream << "rtState.dispatchDimSwizzleMode = " << rtState->dispatchDimSwizzleMode << "\n";
+  dumpStream << "rtState.exportConfig.indirectCallingConvention = " << rtState->exportConfig.indirectCallingConvention
+             << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.raygen = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.raygen << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.miss = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.miss << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.closestHit = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.closestHit << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.anyHit = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.anyHit << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.intersection = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.intersection << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.callable = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.callable << "\n";
+  dumpStream << "rtState.exportConfig.indirectCalleeSavedRegs.traceRays = "
+             << rtState->exportConfig.indirectCalleeSavedRegs.traceRays << "\n";
+  dumpStream << "rtState.exportConfig.enableUniformNoReturn = " << rtState->exportConfig.enableUniformNoReturn << "\n";
+  dumpStream << "rtState.exportConfig.enableTraceRayArgsInLds = " << rtState->exportConfig.enableTraceRayArgsInLds
+             << "\n";
+  dumpStream << "rtState.exportConfig.readsDispatchRaysIndex = " << rtState->exportConfig.readsDispatchRaysIndex
+             << "\n";
+  dumpStream << "rtState.exportConfig.enableDynamicLaunch = " << rtState->exportConfig.enableDynamicLaunch << "\n";
+  dumpStream << "rtState.exportConfig.emitRaytracingShaderDataToken = "
+             << rtState->exportConfig.emitRaytracingShaderDataToken << "\n";
+  dumpStream << "rtState.enableRayQueryCsSwizzle = " << rtState->enableRayQueryCsSwizzle << "\n";
+  dumpStream << "rtState.enableDispatchRaysInnerSwizzle = " << rtState->enableDispatchRaysInnerSwizzle << "\n";
+  dumpStream << "rtState.enableDispatchRaysOuterSwizzle = " << rtState->enableDispatchRaysOuterSwizzle << "\n";
+  dumpStream << "rtState.forceInvalidAccelStruct = " << rtState->forceInvalidAccelStruct << "\n";
+  dumpStream << "rtState.enableRayTracingCounters = " << rtState->enableRayTracingCounters << "\n";
+  dumpStream << "rtState.enableOptimalLdsStackSizeForIndirect = " << rtState->enableOptimalLdsStackSizeForIndirect
+             << "\n";
+  dumpStream << "rtState.enableOptimalLdsStackSizeForUnified = " << rtState->enableOptimalLdsStackSizeForUnified
+             << "\n";
+
+  for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
+    dumpStream << "rtState.gpurtFuncTable.pFunc[" << i << "] = " << rtState->gpurtFuncTable.pFunc[i] << "\n";
+  }
+}
+
+// =====================================================================================================================
+/// Dumps ray tracing pipeline metadata.
+///
+/// @param [in]  dumpFile       The pointer of pipeline dump file
+/// @param [in]  pipelineMeta   Ray tracing pipeline metadata binary
+void PipelineDumper::dumpRayTracingPipelineMetadata(PipelineDumpFile *dumpFile, const BinaryData *pipelineMeta) {
+  if (!dumpFile)
+    return;
+
+  if (!pipelineMeta->pCode || pipelineMeta->codeSize == 0)
+    return;
+
+  auto extPos = dumpFile->binaryFileName.rfind('.');
+  assert(extPos != std::string::npos);
+  std::string metaFileName = dumpFile->binaryFileName.substr(0, extPos) + ".meta";
+
+  dumpFile->binaryFile.open(metaFileName.c_str(), std::ostream::out | std::ostream::binary);
+  if (!dumpFile->binaryFile.bad()) {
+    dumpFile->binaryFile.write(reinterpret_cast<const char *>(pipelineMeta->pCode), pipelineMeta->codeSize);
+    dumpFile->binaryFile.close();
+  }
+}
+// =====================================================================================================================
+// Update hash code for the pipeline rtstate
+//
+// @param rtState : Pipeline rtstate
+// @param [in,out] hasher : Haher to generate hash code
+void PipelineDumper::updateHashForRtState(const RtState *rtState, MetroHash64 *hasher) {
+  hasher->Update(rtState->nodeStrideShift);
+  hasher->Update(rtState->staticPipelineFlags);
+  hasher->Update(rtState->triCompressMode);
+  hasher->Update(rtState->threadGroupSizeX);
+  hasher->Update(rtState->threadGroupSizeY);
+  hasher->Update(rtState->threadGroupSizeZ);
+  for (unsigned i = 0; i < rtState->bvhResDesc.dataSizeInDwords; ++i)
+    hasher->Update(rtState->bvhResDesc.descriptorData[i]);
+
+  hasher->Update(rtState->counterMask);
+  hasher->Update(rtState->rayQueryCsSwizzle);
+  hasher->Update(rtState->ldsStackSize);
+  hasher->Update(rtState->dispatchRaysThreadGroupSize);
+  hasher->Update(rtState->ldsSizePerThreadGroup);
+  hasher->Update(rtState->outerTileSize);
+  hasher->Update(rtState->dispatchDimSwizzleMode);
+  hasher->Update(rtState->exportConfig.indirectCallingConvention);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.raygen);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.miss);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.closestHit);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.anyHit);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.intersection);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.callable);
+  hasher->Update(rtState->exportConfig.indirectCalleeSavedRegs.traceRays);
+  hasher->Update(rtState->exportConfig.enableUniformNoReturn);
+  hasher->Update(rtState->exportConfig.enableTraceRayArgsInLds);
+  hasher->Update(rtState->exportConfig.readsDispatchRaysIndex);
+  hasher->Update(rtState->exportConfig.enableDynamicLaunch);
+  hasher->Update(rtState->exportConfig.emitRaytracingShaderDataToken);
+  hasher->Update(rtState->enableRayQueryCsSwizzle);
+  hasher->Update(rtState->enableDispatchRaysInnerSwizzle);
+  hasher->Update(rtState->enableDispatchRaysOuterSwizzle);
+  hasher->Update(rtState->forceInvalidAccelStruct);
+  hasher->Update(rtState->enableRayTracingCounters);
+  hasher->Update(rtState->enableOptimalLdsStackSizeForIndirect);
+  hasher->Update(rtState->enableOptimalLdsStackSizeForUnified);
+
+  for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
+    size_t funcNameLen = 0;
+    if (rtState->gpurtFuncTable.pFunc[i]) {
+      funcNameLen = strlen(rtState->gpurtFuncTable.pFunc[i]);
+      hasher->Update(funcNameLen);
+      hasher->Update(reinterpret_cast<const uint8_t *>(rtState->gpurtFuncTable.pFunc[i]), funcNameLen);
+    } else {
+      hasher->Update(funcNameLen);
+    }
+  }
+}
+
+#endif
 
 // =====================================================================================================================
 // Builds hash code from graphics pipeline build info.  If stage is a specific stage of the graphics pipeline, then only
@@ -911,6 +1221,10 @@ MetroHash::Hash PipelineDumper::generateHashForGraphicsPipeline(const GraphicsPi
   if (unlinkedShaderType != UnlinkedStageVertexProcess)
     updateHashForFragmentState(pipeline, &hasher, isRelocatableShader);
 
+#if VKI_RAY_TRACING
+  if (pipeline->shaderLibrary.codeSize > 0)
+    updateHashForRtState(&pipeline->rtState, &hasher);
+#endif
   MetroHash::Hash hash = {};
   hasher.Finalize(hash.bytes);
 
@@ -936,6 +1250,10 @@ MetroHash::Hash PipelineDumper::generateHashForComputePipeline(const ComputePipe
 
   updateHashForPipelineOptions(&pipeline->options, &hasher, isCacheHash, isRelocatableShader, UnlinkedStageCompute);
 
+#if VKI_RAY_TRACING
+  if (pipeline->shaderLibrary.codeSize > 0)
+    updateHashForRtState(&pipeline->rtState, &hasher);
+#endif
   // Relocatable shaders force an unlinked compilation.
   hasher.Update(pipeline->unlinked || isRelocatableShader);
 
@@ -944,6 +1262,60 @@ MetroHash::Hash PipelineDumper::generateHashForComputePipeline(const ComputePipe
 
   return hash;
 }
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Builds hash code from ray tracing pipeline build info.
+//
+// @param pipeline : Info to build a ray tracing pipeline
+// @param isCacheHash : TRUE if the hash is used by shader cache
+MetroHash::Hash PipelineDumper::generateHashForRayTracingPipeline(const RayTracingPipelineBuildInfo *pipeline,
+                                                                  bool isCacheHash) {
+  MetroHash64 hasher;
+
+  hasher.Update(pipeline->shaderCount);
+  for (unsigned i = 0; i < pipeline->shaderCount; ++i) {
+    updateHashForPipelineShaderInfo(pipeline->pShaders[i].entryStage, &pipeline->pShaders[i], isCacheHash, &hasher,
+                                    /*isRelocatableShader=*/false);
+  }
+
+  updateHashForResourceMappingInfo(&pipeline->resourceMapping, &hasher);
+
+  hasher.Update(pipeline->deviceIndex);
+
+  updateHashForPipelineOptions(&pipeline->options, &hasher, isCacheHash, /*isRelocatableShader=*/false,
+                               UnlinkedStageRayTracing);
+
+  hasher.Update(pipeline->shaderGroupCount);
+  for (unsigned i = 0; i < pipeline->shaderGroupCount; ++i) {
+    auto shaderGroup = &pipeline->pShaderGroups[i];
+    hasher.Update(shaderGroup->type);
+    hasher.Update(shaderGroup->generalShader);
+    hasher.Update(shaderGroup->closestHitShader);
+    hasher.Update(shaderGroup->anyHitShader);
+    hasher.Update(shaderGroup->intersectionShader);
+  }
+
+  hasher.Update(pipeline->maxRecursionDepth);
+  hasher.Update(pipeline->indirectStageMask);
+  updateHashForRtState(&pipeline->rtState, &hasher);
+
+  hasher.Update(pipeline->payloadSizeMaxInLib);
+  hasher.Update(pipeline->attributeSizeMaxInLib);
+
+  if (isCacheHash) {
+    hasher.Update(pipeline->shaderTraceRay.codeSize);
+    if (pipeline->shaderTraceRay.codeSize > 0) {
+      hasher.Update(static_cast<const uint8_t *>(pipeline->shaderTraceRay.pCode), pipeline->shaderTraceRay.codeSize);
+    }
+  }
+
+  MetroHash::Hash hash = {};
+  hasher.Finalize(hash.bytes);
+
+  return hash;
+}
+#endif
 
 // =====================================================================================================================
 // Updates hash code context for vertex input state
@@ -1129,6 +1501,11 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
   hasher->Update(options->optimizationLevel);
 #endif
   hasher->Update(options->threadGroupSwizzleMode);
+  hasher->Update(options->reverseThreadGroup);
+
+#if VKI_RAY_TRACING
+  hasher->Update(options->internalRtShaders);
+#endif
 }
 
 // =====================================================================================================================
@@ -1174,10 +1551,12 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
       hasher->Update(options.debugMode);
       hasher->Update(options.enablePerformanceData);
       hasher->Update(options.allowReZ);
+      hasher->Update(options.forceLateZ);
       hasher->Update(options.sgprLimit);
       hasher->Update(options.vgprLimit);
       hasher->Update(options.maxThreadGroupsPerComputeUnit);
       hasher->Update(options.waveSize);
+      hasher->Update(options.subgroupSize);
       hasher->Update(options.wgpMode);
 
       if (!isRelocatableShader)
@@ -1201,6 +1580,12 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
       hasher->Update(options.disableFastMathFlags);
       hasher->Update(options.ldsSpillLimitDwords);
       hasher->Update(options.scalarizeWaterfallLoads);
+      hasher->Update(options.overrideShaderThreadGroupSizeX);
+      hasher->Update(options.overrideShaderThreadGroupSizeY);
+      hasher->Update(options.overrideShaderThreadGroupSizeZ);
+      hasher->Update(options.nsaThreshold);
+      hasher->Update(options.aggressiveInvariantLoads);
+      hasher->Update(options.disableInvariantLoads);
     }
   }
 }
@@ -1279,8 +1664,7 @@ void PipelineDumper::updateHashForResourceMappingNode(const ResourceMappingNode 
   case ResourceMappingNodeType::DescriptorConstBuffer:
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
-  case ResourceMappingNodeType::DescriptorConstTexelBuffer:
-  {
+  case ResourceMappingNodeType::DescriptorConstTexelBuffer: {
     hasher->Update(userDataNode->srdRange);
     break;
   }
@@ -1297,11 +1681,7 @@ void PipelineDumper::updateHashForResourceMappingNode(const ResourceMappingNode 
     // Do nothing for the stream-out table
     break;
   }
-// clang-format off
-#if  (LLPC_CLIENT_INTERFACE_MAJOR_VERSION>= 50)
   case ResourceMappingNodeType::InlineBuffer:
-#endif
-  // clang-format on
   case ResourceMappingNodeType::PushConst: {
     if (!isRootNode)
       hasher->Update(userDataNode->srdRange);
@@ -1572,8 +1952,7 @@ OStream &operator<<(OStream &out, ElfReader<Elf> &reader) {
     } else if (strncmp(section->name, Util::Abi::AmdGpuCommentName, sizeof(Util::Abi::AmdGpuCommentName) - 1) == 0) {
       auto name = section->name;
 
-      if (strncmp(name, Util::Abi::AmdGpuCommentAmdIlName, sizeof(Util::Abi::AmdGpuCommentAmdIlName) - 1) == 0)
-      {
+      if (strncmp(name, Util::Abi::AmdGpuCommentAmdIlName, sizeof(Util::Abi::AmdGpuCommentAmdIlName) - 1) == 0) {
         // Output text based sections
         out << section->name << " (size = " << section->secHead.sh_size << " bytes)\n";
 
@@ -1822,6 +2201,29 @@ std::ostream &operator<<(std::ostream &out, VkPrimitiveTopology topology) {
 
   return out << string;
 }
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Translates enum "VkRayTracingShaderGroupTypeKHR" to string and output to ostream.
+//
+// @param [out] out : Output stream
+// @param type : Ray tracing shader group type
+std::ostream &operator<<(std::ostream &out, VkRayTracingShaderGroupTypeKHR type) {
+  const char *string = nullptr;
+  switch (type) {
+    CASE_ENUM_TO_STRING(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+    CASE_ENUM_TO_STRING(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
+    CASE_ENUM_TO_STRING(VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR)
+    CASE_ENUM_TO_STRING(VK_RAY_TRACING_SHADER_GROUP_TYPE_MAX_ENUM_KHR)
+    break;
+  default:
+    llvm_unreachable("Should never be called!");
+    break;
+  }
+
+  return out << string;
+}
+#endif
 
 // =====================================================================================================================
 // Translates enum "VkFormat" to string and output to ostream.

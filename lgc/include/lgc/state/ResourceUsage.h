@@ -156,6 +156,10 @@ struct ResourceUsage {
   unsigned numVgprsAvailable = UINT32_MAX; // Number of available VGPRs
   bool useImages = false;                  // Whether images are used
 
+#if VKI_RAY_TRACING
+  bool useRayQueryLdsStack = false; // Whether ray query uses LDS stack
+#endif
+
   // Usage of built-ins
   struct {
     // Per-stage built-in usage
@@ -278,20 +282,20 @@ struct ResourceUsage {
         unsigned pullMode : 1;      // Whether pull mode interpolation is used
         unsigned custom : 1;        // Whether custom interpolation is used
         // Input
-        unsigned fragCoord : 1;        // Whether gl_FragCoord is used
-        unsigned frontFacing : 1;      // Whether gl_FrontFacing is used
-        unsigned clipDistance : 4;     // Array size of gl_ClipDistance[] (0 means unused)
-        unsigned cullDistance : 4;     // Array size of gl_CullDistance[] (0 means unused)
-        unsigned pointCoord : 1;       // Whether gl_PointCoord is used
-        unsigned primitiveId : 1;      // Whether gl_PrimitiveID is used
-        unsigned sampleId : 1;         // Whether gl_SampleID is used
-        unsigned samplePosition : 1;   // Whether gl_SamplePosition is used
-        unsigned sampleMaskIn : 1;     // Whether gl_SampleMaskIn[] is used
-        unsigned layer : 1;            // Whether gl_Layer is used
-        unsigned viewportIndex : 1;    // Whether gl_ViewportIndex is used
-        unsigned helperInvocation : 1; // Whether gl_HelperInvocation is used
-        unsigned viewIndex : 1;        // Whether gl_ViewIndex is used
-        unsigned shadingRate : 1;      // Whether gl_ShadingRate is used
+        unsigned fragCoord : 1;                // Whether gl_FragCoord is used
+        unsigned frontFacing : 1;              // Whether gl_FrontFacing is used
+        unsigned clipDistance : 4;             // Array size of gl_ClipDistance[] (0 means unused)
+        unsigned cullDistance : 4;             // Array size of gl_CullDistance[] (0 means unused)
+        unsigned pointCoord : 1;               // Whether gl_PointCoord is used
+        unsigned primitiveId : 1;              // Whether gl_PrimitiveID is used
+        unsigned sampleId : 1;                 // Whether gl_SampleID is used
+        unsigned samplePosition : 1;           // Whether gl_SamplePosition is used
+        unsigned sampleMaskIn : 1;             // Whether gl_SampleMaskIn[] is used
+        unsigned layer : 1;                    // Whether gl_Layer is used
+        unsigned viewportIndex : 1;            // Whether gl_ViewportIndex is used
+        unsigned helperInvocation : 1;         // Whether gl_HelperInvocation is used
+        unsigned viewIndex : 1;                // Whether gl_ViewIndex is used
+        unsigned shadingRate : 1;              // Whether gl_ShadingRate is used
         unsigned baryCoordNoPersp : 1;         // Whether gl_BaryCoordNoPersp is used (AMD extension)
         unsigned baryCoordNoPerspCentroid : 1; // Whether gl_BaryCoordNoPerspCentroid is used (AMD extension)
         unsigned baryCoordNoPerspSample : 1;   // Whether gl_BaryCoordNoPerspSample is used (AMD extension)
@@ -397,6 +401,9 @@ struct ResourceUsage {
         unsigned tessFactorStride; // Size of tess factor stride (in dword)
 
         unsigned tessOnChipLdsSize; // On-chip LDS size (exclude off-chip LDS buffer) (in dword)
+#if VKI_RAY_TRACING
+        unsigned rayQueryLdsStackSize; // Ray query LDS stack size
+#endif
 
         bool initialized; // Whether calcFactor has been initialized
       } calcFactor;
@@ -428,10 +435,28 @@ struct ResourceUsage {
         unsigned inputVertices;      // Number of GS input vertices
         unsigned primAmpFactor;      // GS primitive amplification factor
         bool enableMaxVertOut;       // Whether to allow each GS instance to emit maximum vertices (NGG)
+#if VKI_RAY_TRACING
+        unsigned rayQueryLdsStackSize; // Ray query LDS stack size
+#endif
       } calcFactor = {};
 
       unsigned outLocCount[MaxGsStreams] = {};
     } gs;
+
+    struct {
+      // Map from IDs of built-in outputs to locations of generic per-vertex outputs (used by vertex export to export
+      // built-in outputs to fragment shader)
+      std::map<BuiltInKind, unsigned> builtInExportLocs;
+
+      // Map from IDs of per-primitive built-in outputs to locations of generic per-primitive outputs (used by vertex
+      // export to export built-in outputs to fragment shader)
+      std::map<BuiltInKind, unsigned> perPrimitiveBuiltInExportLocs;
+
+      // Count of mapped location for generic outputs (excluding those special locations to which the built-ins
+      // are mapped)
+      unsigned genericOutputMapLocCount = 0;
+      unsigned perPrimitiveGenericOutputMapLocCount = 0;
+    } mesh;
 
     struct {
       // Original shader specified locations before location map (from tightly packed locations to shader
@@ -454,7 +479,7 @@ struct ResourceUsage {
 
 // Represents stream-out data
 struct StreamOutData {
-  unsigned tablePtr; // Table pointer for stream-out
+  unsigned tablePtr;                                   // Table pointer for stream-out
   unsigned streamInfo;                                 // Stream-out info (ID, vertex count, enablement)
   unsigned writeIndex;                                 // Write index for stream-out
   unsigned streamOffsets[MaxTransformFeedbackBuffers]; // Stream-out Offset
@@ -472,10 +497,10 @@ struct InterfaceData {
   static const unsigned MaxEsGsOffsetCount = 6;
   static const unsigned MaxCsUserDataCount = 16;
 
-  unsigned userDataCount = 0;                  // User data count
+  unsigned userDataCount = 0; // User data count
 
   struct {
-    unsigned sizeInDwords = 0;              // Spill table size in dwords
+    unsigned sizeInDwords = 0; // Spill table size in dwords
   } spillTable;
 
   // Usage of user data registers for internal-use variables
@@ -556,6 +581,7 @@ struct InterfaceData {
         unsigned dispatchDims;       // Dispatch dimensions
         unsigned baseRingEntryIndex; // Base entry index (first workgroup) of mesh/task shader ring for current dispatch
         unsigned pipeStatsBuf;       // Pipeline statistics buffer
+        unsigned flatWorkgroupId;    // Flat workgroup ID (emulated by HW vertex ID)
       } mesh;
 
       // Fragment shader
@@ -596,8 +622,8 @@ struct InterfaceData {
       } cs;
     };
 
-    bool initialized;                          // Whether entryArgIdxs has been initialized
-                                               //   by PatchEntryPointMutate
+    bool initialized; // Whether entryArgIdxs has been initialized
+                      //   by PatchEntryPointMutate
   } entryArgIdxs = {};
 
   InterfaceData();

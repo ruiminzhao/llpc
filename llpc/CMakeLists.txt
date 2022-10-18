@@ -65,7 +65,6 @@ if(ICD_BUILD_LLPC)
     set(LLVM_INCLUDE_TOOLS ON CACHE BOOL Force)
     set(LLVM_INCLUDE_UTILS ON CACHE BOOL Force)
     set(LLVM_ENABLE_TERMINFO OFF CACHE BOOL Force)
-    set(LLVM_ENABLE_ZLIB OFF CACHE BOOL Force)
     if (NOT WIN32)
         # Build optimized version of llvm-tblgen even in debug builds, for faster build times.
         #
@@ -117,11 +116,24 @@ if(ICD_BUILD_LLPC)
             Target
             TransformUtils
         )
+        # Some of the games using old versions of the tcmalloc lib are crashing
+        # when allocating aligned memory. C++17 enables aligned new by default,
+        # so we need to disable it to prevent those crashes.
+        if(NOT WIN32)
+            foreach (lib ${llvm_libs})
+                target_compile_options(${lib} PRIVATE "-fno-aligned-new")
+            endforeach()
+        endif()
         target_link_libraries(llpc PUBLIC ${llvm_libs})
     endif()
 
     # Always link statically against libLLVMlgc
     llvm_map_components_to_libnames(extra_llvm_libs lgc)
+    if(NOT WIN32)
+        foreach (lib ${extra_llvm_libs})
+            target_compile_options(${lib} PRIVATE "-fno-aligned-new")
+        endforeach()
+    endif()
     target_link_libraries(llpc PUBLIC ${extra_llvm_libs})
 endif()
 
@@ -179,6 +191,12 @@ target_include_directories(llpc
         ${LLVM_INCLUDE_DIRS}
 )
 
+#if VKI_RAY_TRACING
+if(VKI_RAY_TRACING)
+  target_include_directories(llpc PRIVATE ${XGL_GPURT_PATH})
+endif()
+#endif
+
 if(WIN32)
     target_compile_definitions(llpc PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 endif()
@@ -194,6 +212,13 @@ if(ICD_BUILD_LLPC)
         context/llpcPipelineContext.cpp
         context/llpcShaderCacheManager.cpp
     )
+#if VKI_RAY_TRACING
+if(VKI_RAY_TRACING)
+    target_sources(llpc PRIVATE
+         context/llpcRayTracingContext.cpp
+         )
+endif()
+#endif
 
 # llpc/lower
     target_sources(llpc PRIVATE
@@ -208,6 +233,18 @@ if(ICD_BUILD_LLPC)
         lower/llpcSpirvLowerTranslator.cpp
         lower/llpcSpirvLowerUtil.cpp
     )
+
+#if VKI_RAY_TRACING
+if(VKI_RAY_TRACING)
+    target_sources(llpc PRIVATE
+        lower/llpcSpirvLowerRayQuery.cpp
+        lower/llpcSpirvLowerRayQueryPostInline.cpp
+        lower/llpcSpirvLowerRayTracing.cpp
+        lower/llpcSpirvLowerRayTracingBuiltIn.cpp
+        lower/llpcSpirvLowerRayTracingIntrinsics.cpp
+    )
+endif()
+#endif
 
 # llpc/translator
     target_sources(llpc PRIVATE
@@ -304,6 +341,14 @@ add_library(llpc_standalone_compiler
     tool/llpcPipelineBuilder.cpp
 )
 
+#if VKI_RAY_TRACING
+if(VKI_RAY_TRACING)
+    target_sources(llpc_standalone_compiler PRIVATE
+        tool/llpcRayTracingPipelineBuilder.cpp
+        )
+endif()
+#endif
+
 add_dependencies(llpc_standalone_compiler llpc)
 
 target_compile_definitions(llpc_standalone_compiler PUBLIC
@@ -344,6 +389,13 @@ target_link_libraries(llpc_standalone_compiler PUBLIC
 )
 if(UNIX)
     target_link_libraries(llpc_standalone_compiler PUBLIC dl)
+endif()
+
+if (NOT LLVM_LINK_LLVM_DYLIB)
+    llvm_map_components_to_libnames(llvm_libs
+        AsmParser
+    )
+    target_link_libraries(llpc_standalone_compiler PUBLIC ${llvm_libs})
 endif()
 
 set_compiler_options(llpc_standalone_compiler ${LLPC_ENABLE_WERROR})

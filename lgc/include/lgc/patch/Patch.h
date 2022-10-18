@@ -62,7 +62,9 @@ void initializeLegacyPatchSetupTargetFeaturesPass(PassRegistry &);
 void initializeLegacyPatchWorkaroundsPass(PassRegistry &);
 void initializeLegacyPatchReadFirstLanePass(PassRegistry &);
 void initializeLegacyPatchWaveSizeAdjustPass(PassRegistry &);
+void initializeLegacyPatchImageDerivativesPass(PassRegistry &);
 void initializeLegacyPatchInitializeWorkgroupMemoryPass(PassRegistry &);
+void initializeLegacyPatchInvariantLoadsPass(PassRegistry &);
 } // namespace llvm
 
 namespace lgc {
@@ -91,7 +93,9 @@ inline void initializePatchPasses(llvm::PassRegistry &passRegistry) {
   initializeLegacyPatchWorkaroundsPass(passRegistry);
   initializeLegacyPatchReadFirstLanePass(passRegistry);
   initializeLegacyPatchWaveSizeAdjustPass(passRegistry);
+  initializeLegacyPatchImageDerivativesPass(passRegistry);
   initializeLegacyPatchInitializeWorkgroupMemoryPass(passRegistry);
+  initializeLegacyPatchInvariantLoadsPass(passRegistry);
 }
 
 llvm::ModulePass *createLegacyLowerFragColorExport();
@@ -112,7 +116,9 @@ llvm::ModulePass *createLegacyPatchSetupTargetFeatures();
 llvm::ModulePass *createLegacyPatchWorkarounds();
 llvm::FunctionPass *createLegacyPatchReadFirstLane();
 llvm::ModulePass *createLegacyPatchWaveSizeAdjust();
+llvm::ModulePass *createLegacyPatchImageDerivatives();
 llvm::ModulePass *createLegacyPatchInitializeWorkgroupMemory();
+llvm::FunctionPass *createLegacyPatchInvariantLoads();
 class PipelineState;
 class PassManager;
 
@@ -123,9 +129,9 @@ public:
   Patch() : m_module(nullptr), m_context(nullptr), m_shaderStage(ShaderStageInvalid), m_entryPoint(nullptr) {}
   virtual ~Patch() {}
 
-  static void addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, bool addReplayerPass,
-                        llvm::Timer *patchTimer, llvm::Timer *optTimer,
-                        Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, llvm::CodeGenOpt::Level optLevel);
+  static void addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, llvm::Timer *patchTimer,
+                        llvm::Timer *optTimer, Pipeline::CheckShaderCacheFunc checkShaderCacheFunc,
+                        llvm::CodeGenOpt::Level optLevel);
 
   // Register all the patching passes into the given pass manager
   static void registerPasses(lgc::PassManager &passMgr);

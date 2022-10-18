@@ -125,7 +125,7 @@ Expected<BinaryData> GraphicsPipelineBuilder::buildGraphicsPipeline() {
     // If not compiling from pipeline, lay out user data now.
     if (compileInfo.doAutoLayout)
       doAutoLayoutDesc(stage, moduleData.spirvBin, pipelineInfo, shaderInfo, nodeSets, pushConstSize,
-                       /*autoLayoutDesc = */ compileInfo.autoLayoutDesc);
+                       /*autoLayoutDesc = */ compileInfo.autoLayoutDesc, false);
   }
 
   if (compileInfo.doAutoLayout)
@@ -146,9 +146,12 @@ Expected<BinaryData> GraphicsPipelineBuilder::buildGraphicsPipeline() {
   pipelineInfo->options.scalarBlockLayout = compileInfo.scalarBlockLayout;
   pipelineInfo->options.enableScratchAccessBoundsChecks = compileInfo.scratchAccessBoundsChecks;
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
-  if (compileInfo.optimizationLevel.hasValue()) {
-    pipelineInfo->options.optimizationLevel = compileInfo.optimizationLevel.getValue();
+  if (compileInfo.optimizationLevel.has_value()) {
+    pipelineInfo->options.optimizationLevel = compileInfo.optimizationLevel.value();
   }
+#endif
+#if VKI_RAY_TRACING
+  pipelineInfo->options.internalRtShaders = compileInfo.internalRtShaders;
 #endif
 
   PipelineBuildInfo localPipelineInfo = {};

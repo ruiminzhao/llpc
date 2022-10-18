@@ -112,7 +112,7 @@ Value *ArithBuilder::CreateFpTruncWithRounding(Value *value, Type *destTy, Round
 
   if ((roundingMode == RoundingMode::TowardNegative) || (roundingMode == RoundingMode::TowardPositive)) {
     // RTN/RTP: Use fptrunc_round intrinsic.
-    StringRef roundingModeStr = convertRoundingModeToStr(roundingMode).getValue();
+    StringRef roundingModeStr = convertRoundingModeToStr(roundingMode).value();
     Value *roundingMode = MetadataAsValue::get(getContext(), MDString::get(getContext(), roundingModeStr));
     Value *result = scalarize(value, [=](Value *inValue) {
       return CreateIntrinsic(Intrinsic::fptrunc_round, {getHalfTy(), inValue->getType()}, {inValue, roundingMode});
@@ -441,7 +441,7 @@ Value *ArithBuilder::CreateATan2(Value *y, Value *x, const Twine &instName) {
   Value *p1 = CreateFMul(signY, getPi(signY->getType()));
 
   Value *absXEqualsAbsY = CreateFCmpOEQ(absX, absY);
-  // pOneIfEqual to (x == y) ? 1.0 : -1.0
+  // oneIfEqual to (x == y) ? 1.0 : -1.0
   Value *oneIfEqual = CreateSelect(CreateFCmpOEQ(x, y), one, negOne);
 
   Value *yOverX = fDivFast(y, x);
@@ -648,7 +648,7 @@ Value *ArithBuilder::CreateSqrt(Value *x, const Twine &instName) {
     auto scaleDown = CreateSelect(scaling, ConstantInt::get(expTy, -128, true), ConstantInt::get(expTy, 0));
     auto half = ConstantFP::get(x->getType(), 0.5);
 
-    x = CreateLdexp(x, scaleUp); // Scale up X if it is too small, make it a normal one
+    x = CreateLdexp(x, scaleUp); // Scale up x if it is too small, make it a normal one
     auto y = scalarize(x, [this](Value *x) { return CreateUnaryIntrinsic(Intrinsic::amdgcn_rsq, x); });
     auto g = CreateFMul(x, y);
     auto h = CreateFMul(half, y);
@@ -665,13 +665,82 @@ Value *ArithBuilder::CreateSqrt(Value *x, const Twine &instName) {
 
     g = CreateLdexp(g, scaleDown); // Scale down the result
 
-    // If X is +INF, +0, or -0, use its original value
+    // If x is +INF, +0, or -0, use its original value
     return CreateSelect(
         createCallAmdgcnClass(x, CmpClass::PositiveInfinity | CmpClass::PositiveZero | CmpClass::NegativeZero), x, g,
         instName);
   }
 
   return CreateUnaryIntrinsic(Intrinsic::sqrt, x, nullptr, instName);
+}
+
+// =====================================================================================================================
+// Create a inverse square root operation for a scalar or vector FP value.
+//
+// @param x : Input value X
+// @param instName : Name to give instruction(s)
+Value *ArithBuilder::CreateInverseSqrt(Value *x, const Twine &instName) {
+  if (x->getType()->getScalarType()->isDoubleTy()) {
+    // NOTE: For double type, the SQRT and RSQ instructions don't have required precision, we apply Goldschmidt's
+    // algorithm to improve the result:
+    //
+    //   y0 = rsq(x)
+    //   g0 = x * y0
+    //   h0 = 0.5 * y0
+    //
+    //   r0 = 0.5 - h0 * g0
+    //   g1 = g0 * r0 + g0
+    //   h1 = h0 * r0 + h0
+    //
+    //   r1 = 0.5 - h1 * g1
+    //   g2 = g1 * r1 + g1
+    //   h2 = h1 * r1 + h1
+    //
+    //   r2 = 0.5 - h2 * g2
+    //   h3 = h2 * r2 + h2
+    //
+    //   inverseSqrt(x) = 2 * h3
+    //
+
+    // TODO: In the future, this should be totally done in LLVM backend.
+
+    // x < 2^-768
+    auto scaling = CreateFCmpOLT(x, getFpConstant(x->getType(), llvm::APFloat(llvm::APFloat::IEEEdouble(),
+                                                                              llvm::APInt(64, 0x1000000000000000))));
+    auto expTy = getConditionallyVectorizedTy(getInt32Ty(), x->getType());
+    auto scaleUp = CreateSelect(scaling, ConstantInt::get(expTy, 256), ConstantInt::get(expTy, 0));
+    auto scaleDown = CreateSelect(scaling, ConstantInt::get(expTy, 128), ConstantInt::get(expTy, 0));
+    auto half = ConstantFP::get(x->getType(), 0.5);
+
+    x = CreateLdexp(x, scaleUp); // Scale up x if it is too small, make it a normal one
+    auto y = scalarize(x, [this](Value *x) { return CreateUnaryIntrinsic(Intrinsic::amdgcn_rsq, x); });
+    auto g = CreateFMul(x, y);
+    auto h = CreateFMul(half, y);
+
+    auto r = CreateIntrinsic(Intrinsic::fma, x->getType(), {CreateFNeg(h), g, half});
+    g = CreateIntrinsic(Intrinsic::fma, x->getType(), {g, r, g});
+    h = CreateIntrinsic(Intrinsic::fma, x->getType(), {h, r, h});
+
+    r = CreateIntrinsic(Intrinsic::fma, x->getType(), {CreateFNeg(h), g, half});
+    g = CreateIntrinsic(Intrinsic::fma, x->getType(), {g, r, g});
+    h = CreateIntrinsic(Intrinsic::fma, x->getType(), {h, r, h});
+
+    r = CreateIntrinsic(Intrinsic::fma, x->getType(), {CreateFNeg(h), g, half});
+    h = CreateIntrinsic(Intrinsic::fma, x->getType(), {h, r, h});
+
+    h = CreateFMul(ConstantFP::get(x->getType(), 2.0), h);
+
+    h = CreateLdexp(h, scaleDown); // Scale down the result
+
+    // If x is +INF, +0, or -0, use the initial value of reciprocal square root
+    return CreateSelect(
+        createCallAmdgcnClass(x, CmpClass::PositiveInfinity | CmpClass::PositiveZero | CmpClass::NegativeZero), y, h,
+        instName);
+  }
+
+  Value *result = scalarize(x, [this](Value *x) { return CreateUnaryIntrinsic(Intrinsic::amdgcn_rsq, x); });
+  result->setName(instName);
+  return result;
 }
 
 // =====================================================================================================================
@@ -1149,12 +1218,12 @@ Value *ArithBuilder::createCallAmdgcnClass(Value *value, unsigned flags, const T
 
 // =====================================================================================================================
 // Create an "insert bitfield" operation for a (vector of) integer type.
-// Returns a value where the "pCount" bits starting at bit "pOffset" come from the least significant "pCount"
-// bits in "pInsert", and remaining bits come from "pBase". The result is undefined if "pCount"+"pOffset" is
-// more than the number of bits (per vector element) in "pBase" and "pInsert".
-// If "pBase" and "pInsert" are vectors, "pOffset" and "pCount" can be either scalar or vector of the same
-// width. The scalar type of "pOffset" and "pCount" must be integer, but can be different to that of "pBase"
-// and "pInsert" (and different to each other too).
+// Returns a value where the "count" bits starting at bit "offset" come from the least significant "count"
+// bits in "insert", and remaining bits come from "base". The result is undefined if "count"+"offset" is
+// more than the number of bits (per vector element) in "base" and "insert".
+// If "base" and "insert" are vectors, "offset" and "count" can be either scalar or vector of the same
+// width. The scalar type of "offset" and "count" must be integer, but can be different to that of "base"
+// and "insert" (and different to each other too).
 //
 // @param base : Base value
 // @param insert : Value to insert (same type as base)
@@ -1163,7 +1232,7 @@ Value *ArithBuilder::createCallAmdgcnClass(Value *value, unsigned flags, const T
 // @param instName : Name to give instruction(s)
 Value *ArithBuilder::CreateInsertBitField(Value *base, Value *insert, Value *offset, Value *count,
                                           const Twine &instName) {
-  // Make pOffset and pCount vectors of the right integer type if necessary.
+  // Make offset and count vectors of the right integer type if necessary.
   if (auto vecTy = dyn_cast<FixedVectorType>(base->getType())) {
     if (!isa<VectorType>(offset->getType()))
       offset = CreateVectorSplat(vecTy->getNumElements(), offset);
@@ -1184,10 +1253,10 @@ Value *ArithBuilder::CreateInsertBitField(Value *base, Value *insert, Value *off
 
 // =====================================================================================================================
 // Create an "extract bitfield" operation for a (vector of) i32.
-// Returns a value where the least significant "pCount" bits come from the "pCount" bits starting at bit
-// "pOffset" in "pBase", and that is zero- or sign-extended (depending on "isSigned") to the rest of the value.
-// If "pBase" and "pInsert" are vectors, "pOffset" and "pCount" can be either scalar or vector of the same
-// width. The scalar type of "pOffset" and "pCount" must be integer, but can be different to that of "pBase"
+// Returns a value where the least significant "count" bits come from the "count" bits starting at bit
+// "offset" in "base", and that is zero- or sign-extended (depending on "isSigned") to the rest of the value.
+// If "base" and "insert" are vectors, "offset" and "count" can be either scalar or vector of the same
+// width. The scalar type of "offset" and "count" must be integer, but can be different to that of "base"
 // (and different to each other too).
 //
 // @param base : Base value
@@ -1197,7 +1266,7 @@ Value *ArithBuilder::CreateInsertBitField(Value *base, Value *insert, Value *off
 // @param instName : Name to give instruction(s)
 Value *ArithBuilder::CreateExtractBitField(Value *base, Value *offset, Value *count, bool isSigned,
                                            const Twine &instName) {
-  // Make pOffset and pCount vectors of the right integer type if necessary.
+  // Make offset and count vectors of the right integer type if necessary.
   if (auto vecTy = dyn_cast<FixedVectorType>(base->getType())) {
     if (!isa<VectorType>(offset->getType()))
       offset = CreateVectorSplat(vecTy->getNumElements(), offset);
@@ -1268,7 +1337,7 @@ Value *ArithBuilder::CreateFindSMsb(Value *value, const Twine &instName) {
 Value *ArithBuilder::createFMix(Value *x, Value *y, Value *a, const Twine &instName) {
   Value *ySubX = CreateFSub(y, x);
   if (auto vectorResultTy = dyn_cast<FixedVectorType>(ySubX->getType())) {
-    // pX, pY => vector, but pA => scalar
+    // x, y => vector, but a => scalar
     if (!isa<VectorType>(a->getType()))
       a = CreateVectorSplat(vectorResultTy->getNumElements(), a);
   }

@@ -70,6 +70,14 @@ const char *getShaderStageAbbreviation(ShaderStage shaderStage, bool upper) {
         "GS",
         "FS",
         "CS",
+#if VKI_RAY_TRACING
+        "RGEN",
+        "SECT",
+        "AHIT",
+        "CHIT",
+        "MISS",
+        "CALL"
+#endif
       };
 
       abbr = ShaderStageAbbrs[static_cast<unsigned>(shaderStage)];
@@ -81,6 +89,14 @@ const char *getShaderStageAbbreviation(ShaderStage shaderStage, bool upper) {
         "Gs",
         "Fs",
         "Cs",
+#if VKI_RAY_TRACING
+        "rgen",
+        "sect",
+        "ahit",
+        "chit",
+        "miss",
+        "call"
+#endif
       };
 
       abbr = ShaderStageAbbrs[static_cast<unsigned>(shaderStage)];
@@ -136,11 +152,7 @@ const char *getResourceMappingNodeTypeName(ResourceMappingNodeType type) {
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, PushConst)
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, DescriptorBufferCompact)
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, StreamOutTableVaPtr)
-// clang-format off
-#if  (LLPC_CLIENT_INTERFACE_MAJOR_VERSION>= 50)
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, InlineBuffer)
-#endif
-    // clang-format on
     break;
   default:
     llvm_unreachable("Should never be called!");

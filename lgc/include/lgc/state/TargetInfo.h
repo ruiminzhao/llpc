@@ -42,7 +42,7 @@ struct GfxIpVersion {
   unsigned stepping; // Stepping info
 
   // GFX IP checkers
-  bool operator==(const GfxIpVersion& rhs) const {
+  bool operator==(const GfxIpVersion &rhs) const {
     return std::tie(major, minor, stepping) == std::tie(rhs.major, rhs.minor, rhs.stepping);
   }
   bool operator>=(const GfxIpVersion &rhs) const {
@@ -77,6 +77,9 @@ struct GpuProperty {
     unsigned diffSignedness : 1; // Whether the components of two vectors have the diff signedness
   } supportIntegerDotFlag;       // The flag indicates the HW supports integer dot product
   unsigned supportsXnack;        // GPU supports XNACK
+  bool supportsDpp;              // GPU supports DPP
+  bool supportsDppRowXmask;      // GPU supports DPP ROW_XMASK
+  bool supportsPermLane16;       // GPU supports perm lane 16
 };
 
 // Contains flags for all of the hardware workarounds which affect pipeline compilation.

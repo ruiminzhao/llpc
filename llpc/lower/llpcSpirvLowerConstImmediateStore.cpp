@@ -176,12 +176,17 @@ StoreInst *SpirvLowerConstImmediateStore::findSingleStore(AllocaInst *allocaInst
 void SpirvLowerConstImmediateStore::convertAllocaToReadOnlyGlobal(StoreInst *storeInst) {
   auto allocaInst = cast<AllocaInst>(storeInst->getPointerOperand());
   auto globalType = allocaInst->getAllocatedType();
+  auto initVal = cast<Constant>(storeInst->getValueOperand());
+
+  if (globalType != initVal->getType())
+    return;
+
   auto global = new GlobalVariable(*m_module, globalType,
                                    true, // isConstant
-                                   GlobalValue::InternalLinkage, cast<Constant>(storeInst->getValueOperand()), "",
-                                   nullptr, GlobalValue::NotThreadLocal, SPIRAS_Constant);
+                                   GlobalValue::InternalLinkage, initVal, "", nullptr, GlobalValue::NotThreadLocal,
+                                   SPIRAS_Constant);
   global->takeName(allocaInst);
-  // Change all uses of pAllocaInst to use pGlobal. We need to do it manually, as there is a change
+  // Change all uses of allocaInst to use global. We need to do it manually, as there is a change
   // of address space, and we also need to recreate "getelementptr"s.
   std::vector<std::pair<Instruction *, Value *>> allocaToGlobalMap;
   allocaToGlobalMap.push_back(std::pair<Instruction *, Value *>(allocaInst, global));

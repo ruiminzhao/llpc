@@ -354,8 +354,9 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
       for (User *user : func.users()) {
         CallInst *call = cast<CallInst>(user);
         ResourceNodeType resType = ResourceNodeType(cast<ConstantInt>(call->getArgOperand(0))->getZExtValue());
-        unsigned set = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
-        unsigned binding = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
+        ResourceNodeType searchType = ResourceNodeType(cast<ConstantInt>(call->getArgOperand(1))->getZExtValue());
+        unsigned set = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
+        unsigned binding = cast<ConstantInt>(call->getArgOperand(3))->getZExtValue();
         ShaderStage stage = getShaderStage(call->getFunction());
         assert(stage != ShaderStageCopyShader);
         auto &descriptorTable = getUserDataUsage(stage)->descriptorTables;
@@ -379,7 +380,7 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
           // The user data nodes are available, so we use the offset of the node as the
           // index.
           const ResourceNode *node;
-          node = m_pipelineState->findResourceNode(resType, set, binding).first;
+          node = m_pipelineState->findResourceNode(searchType, set, binding).first;
           assert(node && "Could not find resource node");
           uint32_t descTableIndex = node - &m_pipelineState->getUserDataNodes().front();
           descriptorTable.resize(std::max(descriptorTable.size(), size_t(descTableIndex + 1)));
@@ -578,7 +579,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 
           // The address extension code only depends on descriptorTable (which is constant for the lifetime of the map)
           // and highHalf. Use map with highHalf keys to avoid creating redundant nodes for the extensions.
-          Value *highHalf = call->getArgOperand(3);
+          Value *highHalf = call->getArgOperand(4);
           auto it = addrExtMap[isDescTableSpilled].find(highHalf);
           if (it != addrExtMap[isDescTableSpilled].end()) {
             descTableVal = it->second;
@@ -927,6 +928,9 @@ void PatchEntryPointMutate::setFuncAttrs(Function *entryPoint) {
       builder.addAttribute("amdgpu-lds-spill-limit-dwords", std::to_string(shaderOptions->ldsSpillLimitDwords));
   }
 
+  if (shaderOptions->nsaThreshold != 0)
+    builder.addAttribute("amdgpu-nsa-threshold", std::to_string(shaderOptions->nsaThreshold));
+
 #if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396807
   // Old version of the code
   AttributeList::AttrIndex attribIdx = AttributeList::AttrIndex(AttributeList::FunctionIndex);
@@ -1197,9 +1201,11 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
     specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshTaskRingIndex",
                                               UserDataMapping::MeshTaskRingIndex,
                                               &intfData->entryArgIdxs.task.baseRingEntryIndex));
-    specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshPipeStatsBuf",
-                                              UserDataMapping::MeshPipeStatsBuf,
-                                              &intfData->entryArgIdxs.task.pipeStatsBuf));
+    if (m_pipelineState->needSwMeshPipelineStats()) {
+      specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshPipeStatsBuf",
+                                                UserDataMapping::MeshPipeStatsBuf,
+                                                &intfData->entryArgIdxs.task.pipeStatsBuf));
+    }
   } else if (m_shaderStage == ShaderStageMesh) {
     if (m_pipelineState->getShaderResourceUsage(ShaderStageMesh)->builtInUsage.mesh.drawIndex) {
       specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "drawIndex", UserDataMapping::DrawIndex,
@@ -1215,9 +1221,11 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
     specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshTaskRingIndex",
                                               UserDataMapping::MeshTaskRingIndex,
                                               &intfData->entryArgIdxs.mesh.baseRingEntryIndex));
-    specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshPipeStatsBuf",
-                                              UserDataMapping::MeshPipeStatsBuf,
-                                              &intfData->entryArgIdxs.mesh.pipeStatsBuf));
+    if (m_pipelineState->needSwMeshPipelineStats()) {
+      specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "meshPipeStatsBuf",
+                                                UserDataMapping::MeshPipeStatsBuf,
+                                                &intfData->entryArgIdxs.mesh.pipeStatsBuf));
+    }
   }
 
   // Allocate register for stream-out buffer table, to go before the user data node args (unlike all the ones
@@ -1502,7 +1510,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
   // table pointer, even if it is not needed, because library code does not know whether a spill table pointer is
   // needed in the pipeline. Thus we cannot use s15 for anything else. Using the single-arg UserDataArg
   // constructor like this means that the arg is not used, so it will not be set up in PAL metadata.
-  if (m_computeWithCalls && !spillTableArg.hasValue())
+  if (m_computeWithCalls && !spillTableArg.has_value())
     spillTableArg = UserDataArg(builder.getInt32Ty(), "spillTable", UserDataMapping::SpillTable,
                                 &userDataUsage->spillTable.entryArgIdx);
 
@@ -1520,7 +1528,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
   for (auto &userDataArg : specialUserDataArgs)
     userDataEnd -= userDataArg.argDwordSize;
   // ... and the one used by the spill table if already added.
-  if (spillTableArg.hasValue())
+  if (spillTableArg.has_value())
     userDataEnd -= 1;
 
   // See if we need to spill any user data nodes in userDataArgs, copying the unspilled ones across to unspilledArgs.
@@ -1530,7 +1538,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
     unsigned afterUserDataIdx = userDataIdx + userDataArg.argDwordSize;
     if (afterUserDataIdx > userDataEnd) {
       // Spill this node. Allocate the spill table arg.
-      if (!spillTableArg.hasValue()) {
+      if (!spillTableArg.has_value()) {
         spillTableArg = UserDataArg(builder.getInt32Ty(), "spillTable", UserDataMapping::SpillTable,
                                     &userDataUsage->spillTable.entryArgIdx);
         --userDataEnd;
@@ -1576,7 +1584,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
   // Add the special args and the spill table pointer (if any) to unspilledArgs.
   // (specialUserDataArgs is empty for compute, and thus for compute-with-calls.)
   unspilledArgs.insert(unspilledArgs.end(), specialUserDataArgs.begin(), specialUserDataArgs.end());
-  if (spillTableArg.hasValue())
+  if (spillTableArg.has_value())
     unspilledArgs.insert(unspilledArgs.end(), *spillTableArg);
 }
 

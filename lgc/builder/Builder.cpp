@@ -144,7 +144,7 @@ const ComputeShaderMode &Builder::getComputeShaderMode() {
 }
 
 // =====================================================================================================================
-// Get the type pElementTy, turned into a vector of the same vector width as pMaybeVecTy if the latter
+// Get the type elementTy, turned into a vector of the same vector width as maybeVecTy if the latter
 // is a vector type.
 //
 // @param elementTy : Element type
@@ -188,10 +188,12 @@ VectorType *Builder::getDescTy(ResourceNodeType descType) {
   unsigned byteSize = 0;
   switch (descType) {
   case ResourceNodeType::DescriptorBuffer:
+  case ResourceNodeType::DescriptorConstBuffer:
   case ResourceNodeType::DescriptorTexelBuffer:
     byteSize = DescriptorSizeBuffer;
     break;
   case ResourceNodeType::DescriptorBufferCompact:
+  case ResourceNodeType::DescriptorConstBufferCompact:
     byteSize = DescriptorSizeBufferCompact;
     break;
   case ResourceNodeType::DescriptorSampler:
@@ -375,7 +377,7 @@ Constant *Builder::getOneOverPower2MinusOne(Type *ty, unsigned n) {
 // =====================================================================================================================
 // Create a call to the specified intrinsic with one operand, mangled on its type.
 // This is an override of the same method in IRBuilder<>; the difference is that this one sets fast math
-// flags from the Builder if none are specified by pFmfSource.
+// flags from the Builder if none are specified by fmfSource.
 //
 // @param id : Intrinsic ID
 // @param value : Input value
@@ -400,7 +402,7 @@ CallInst *Builder::CreateUnaryIntrinsic(Intrinsic::ID id, Value *value, Instruct
 // =====================================================================================================================
 // Create a call to the specified intrinsic with two operands of the same type, mangled on that type.
 // This is an override of the same method in IRBuilder<>; the difference is that this one sets fast math
-// flags from the Builder if none are specified by pFmfSource.
+// flags from the Builder if none are specified by fmfSource.
 //
 // @param id : Intrinsic ID
 // @param value1 : Input value 1
@@ -418,7 +420,7 @@ CallInst *Builder::CreateBinaryIntrinsic(Intrinsic::ID id, Value *value1, Value 
 // =====================================================================================================================
 // Create a call to the specified intrinsic with the specified operands, mangled on the specified types.
 // This is an override of the same method in IRBuilder<>; the difference is that this one sets fast math
-// flags from the Builder if none are specified by pFmfSource.
+// flags from the Builder if none are specified by fmfSource.
 //
 // @param id : Intrinsic ID
 // @param types : Types
@@ -433,3 +435,25 @@ CallInst *Builder::CreateIntrinsic(Intrinsic::ID id, ArrayRef<Type *> types, Arr
   return result;
 }
 
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Create a ray intersect result with specified node in BVH buffer.
+// nodePtr is the combination of BVH node offset type.
+//
+// @param nodePtr : BVH node pointer
+// @param extent : The valid range on which intersections can occur
+// @param origin : Intersect ray origin
+// @param direction : Intersect ray direction
+// @param invDirection : The inverse of direction
+// @param imageDesc : Image descriptor
+// @param instName : Name to give instruction(s)
+Value *Builder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, Value *origin, Value *direction,
+                                           Value *invDirection, Value *imageDesc, const Twine &instName) {
+  if (m_isBuilderRecorder) {
+    return static_cast<BuilderRecorder *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
+                                                                            invDirection, imageDesc, instName);
+  }
+  return static_cast<BuilderImplBase *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
+                                                                          invDirection, imageDesc, instName);
+}
+#endif

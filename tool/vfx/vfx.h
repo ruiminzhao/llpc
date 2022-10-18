@@ -41,7 +41,7 @@
 #define VFX_REVISION 1
 
 // Enable VFX_SUPPORT_VK_PIPELINE in default
-#if !defined(VFX_SUPPORT_VK_PIPELINE) && !defined(VFX_SUPPORT_RENDER_DOCOUMENT)
+#if !defined(VFX_SUPPORT_VK_PIPELINE)
 #define VFX_SUPPORT_VK_PIPELINE 1
 #endif
 
@@ -519,7 +519,11 @@ struct GraphicsPipelineState {
   Vkgc::NggState nggState; // NGG state
 
   ColorBuffer colorBuffer[Vkgc::MaxColorTargets]; // Color target state.
-  bool dynamicVertexStride; // Dynamic Vertex input Stride is enabled.
+#if VKI_RAY_TRACING
+  Vkgc::BinaryData shaderLibrary; // Shader library SPIR-V binary
+  Vkgc::RtState rtState;          // Ray tracing state
+#endif
+  bool dynamicVertexStride;   // Dynamic Vertex input Stride is enabled.
   bool enableUberFetchShader; // Use uber fetch shader
   bool enableEarlyCompile;    // Enable early compile
 };
@@ -529,32 +533,34 @@ struct GraphicsPipelineState {
 struct ComputePipelineState {
   unsigned deviceIndex;          // Device index for device group
   Vkgc::PipelineOptions options; // Pipeline options
+#if VKI_RAY_TRACING
+  Vkgc::BinaryData shaderLibrary; // Shader library SPIR-V binary
+  Vkgc::RtState rtState;          // Ray tracing state
+#endif
 };
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Represents RayTracingPipelineState section.
+struct RayTracingPipelineState {
+  unsigned deviceIndex;                                // Device index for device group
+  Vkgc::PipelineOptions options;                       // Pipeline options
+  unsigned shaderGroupCount;                           // Count of shader groups
+  VkRayTracingShaderGroupCreateInfoKHR *pShaderGroups; // An array of shader groups
+  Vkgc::BinaryData shaderTraceRay;                     // Trace-ray SPIR-V binary
+  unsigned maxRecursionDepth;                          // Ray tracing max recursion depth
+  unsigned indirectStageMask;                          // Trace-ray indirect stage mask
+  Vkgc::RtState rtState;                               // Ray tracing state
+  unsigned payloadSizeMaxInLib;                        // Pipeline library maxPayloadSize
+  unsigned attributeSizeMaxInLib;                      // Pipeline library maxAttributeSize
+  bool hasPipelineLibrary;                             // Whether has pipeline library
+  unsigned pipelineLibStageMask;                       // Pipeline library stage mask
+};
+#endif
 
 #endif
 
 }; // namespace Vfx
-
-#if VFX_SUPPORT_RENDER_DOCOUMENT
-// =====================================================================================================================
-// Represents the content of RenderDocument.
-struct VfxRenderState {
-  unsigned version;                                             // Render state version
-  Vfx::TestResult result;                                       // Section "Result"
-  unsigned numBufferView;                                       // Number of section "BufferView"
-  Vfx::BufferView bufferView[Vfx::MaxRenderSectionCount];       // Section "BufferView"
-  Vfx::VertexState vertexState;                                 // Section "VertexState"
-  Vfx::DrawState drawState;                                     // Section "DrawState"
-  unsigned numImageView;                                        // Number of section "ImageView"
-  Vfx::ImageView imageView[Vfx::MaxRenderSectionCount];         // Section "ImageView"
-  unsigned numSampler;                                          // Number of section "Sampler"
-  Vfx::Sampler sampler[Vfx::MaxRenderSectionCount];             // Section "Sampler"
-  Vfx::ShaderSource stages[Vfx::ShaderStage::ShaderStageCount]; // Shader source sections
-};
-typedef struct VfxRenderState *VfxRenderStatePtr;
-#else
-typedef void *VfxRenderStatePtr;
-#endif
 
 #if VFX_SUPPORT_VK_PIPELINE
 // =====================================================================================================================
@@ -562,6 +568,9 @@ typedef void *VfxRenderStatePtr;
 enum VfxPipelineType : unsigned {
   VfxPipelineTypeGraphics = 0,
   VfxPipelineTypeCompute,
+#if VKI_RAY_TRACING
+  VfxPipelineTypeRayTracing,
+#endif
 };
 
 // =====================================================================================================================
@@ -571,6 +580,9 @@ struct VfxPipelineState {
   VfxPipelineType pipelineType;                    // Pipeline type
   Vkgc::GraphicsPipelineBuildInfo gfxPipelineInfo; // Vkgc graphics pipeline build info
   Vkgc::ComputePipelineBuildInfo compPipelineInfo; // Vkgc compute pipeline build info
+#if VKI_RAY_TRACING
+  Vkgc::RayTracingPipelineBuildInfo rayPipelineInfo; // Vkgc ray tracing pipeline build info
+#endif
   unsigned numStages;        // Number of shader source sections
   Vfx::ShaderSource *stages; // Shader source sections
 };
@@ -592,10 +604,6 @@ bool VFXAPI vfxParseFile(const char *pFilename, unsigned int numMacro, const cha
                          void **ppDoc, const char **ppErrorMsg);
 
 void VFXAPI vfxCloseDoc(void *pDoc);
-
-#if VFX_SUPPORT_RENDER_DOCOUMENT
-void VFXAPI vfxGetRenderDoc(void *pDoc, VfxRenderStatePtr *pRenderState);
-#endif
 
 #if VFX_SUPPORT_VK_PIPELINE
 void VFXAPI vfxGetPipelineDoc(void *pDoc, VfxPipelineStatePtr *pPipelineState);

@@ -41,8 +41,8 @@ struct CompileInfo; // Defined in llpcCompilationUtils.h.
 
 struct ResourceNodeSet {
   std::vector<Llpc::ResourceMappingNode> nodes; // Vector of resource mapping nodes
-  std::map<unsigned, unsigned> bindingMap; // Map from binding to index in nodes vector
-  unsigned visibility = 0;                 // Mask of shader stages which this set is visible to
+  std::map<unsigned, unsigned> bindingMap;      // Map from binding to index in nodes vector
+  unsigned visibility = 0;                      // Mask of shader stages which this set is visible to
 };
 
 using ResourceMappingNodeMap = std::map<unsigned, ResourceNodeSet>;
@@ -52,7 +52,7 @@ using ResourceMappingNodeMap = std::map<unsigned, ResourceNodeSet>;
 // leaked, but that does not matter because we are running a short-lived command-line utility.
 void doAutoLayoutDesc(ShaderStage shaderStage, BinaryData spirvBin, GraphicsPipelineBuildInfo *pipelineInfo,
                       PipelineShaderInfo *shaderInfo, ResourceMappingNodeMap &resNodeSets, unsigned &pushConstSize,
-                      bool autoLayoutDesc);
+                      bool autoLayoutDesc, bool reverseThreadGroup);
 
 // Lay out dummy top-level descriptors and populate ResourceMappingData. This is used when running standalone compiler
 // on a single SPIR-V or GLSL shader, rather than on a .pipe file.

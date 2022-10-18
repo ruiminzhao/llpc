@@ -90,7 +90,7 @@ Value *InOutBuilder::CreateReadPerVertexInput(Type *resultTy, unsigned location,
   assert(inputInfo.getInterpMode() == InOutInfo::InterpModeCustom);
   assert(m_shaderStage == ShaderStageFragment);
 
-  // Fold constant pLocationOffset into location.
+  // Fold constant locationOffset into location.
   if (auto constLocOffset = dyn_cast<ConstantInt>(locationOffset)) {
     location += constLocOffset->getZExtValue();
     locationOffset = getInt32(0);
@@ -107,7 +107,7 @@ Value *InOutBuilder::CreateReadPerVertexInput(Type *resultTy, unsigned location,
         getInt32(location),
         locationOffset,
         elemIdx,
-        getInt32(inputInfo.getInterpMode()),
+        getInt32(InOutInfo::InterpModeCustom),
         vertexIndex,
     });
     addTypeMangling(resultTy, args, callName);
@@ -179,7 +179,7 @@ Value *InOutBuilder::CreateReadPerVertexInput(Type *resultTy, unsigned location,
 // @param locationOffset : Location offset; must be within locationCount if variable
 // @param elemIdx : Element index in vector. (This is the SPIR-V "component", except that it is half the component for
 // 64-bit elements.)
-// @param locationCount : Count of locations taken by the output. Ignored if pLocationOffset is const
+// @param locationCount : Count of locations taken by the output. Ignored if locationOffset is const
 // @param outputInfo : Extra output info
 // @param vertexIndex : For TCS per-vertex output: vertex index; else nullptr
 // @param instName : Name to give instruction(s)
@@ -210,7 +210,7 @@ Value *InOutBuilder::readGenericInputOutput(bool isOutput, Type *resultTy, unsig
   assert(resultTy->isAggregateType() == false);
   assert(isOutput == false || m_shaderStage == ShaderStageTessControl);
 
-  // Fold constant pLocationOffset into location. (Currently a variable pLocationOffset is only supported in
+  // Fold constant locationOffset into location. (Currently a variable locationOffset is only supported in
   // TCS, TES, and FS custom interpolation.)
   if (auto constLocOffset = dyn_cast<ConstantInt>(locationOffset)) {
     location += constLocOffset->getZExtValue();
@@ -238,6 +238,7 @@ Value *InOutBuilder::readGenericInputOutput(bool isOutput, Type *resultTy, unsig
   case ShaderStageTessEval: {
     // TCS: @lgc.{input|output}.import.generic.%Type%(i32 location, i32 locOffset, i32 elemIdx, i32 vertexIdx)
     // TES: @lgc.input.import.generic.%Type%(i32 location, i32 locOffset, i32 elemIdx, i32 vertexIdx)
+    assert(!isOutput || m_shaderStage == ShaderStageTessControl);
     args.push_back(getInt32(location));
     args.push_back(locationOffset);
     args.push_back(elemIdx);
@@ -257,25 +258,27 @@ Value *InOutBuilder::readGenericInputOutput(bool isOutput, Type *resultTy, unsig
   }
 
   case ShaderStageFragment: {
-    // FS:  @lgc.input.import.generic.%Type%(i32 location, i32 elemIdx, i32 perPrimitive, i32 interpMode, i32 interpLoc)
+    // FS:  @lgc.input.import.generic.%Type%(i32 location, i32 elemIdx) -- for per-primitive
     //      @lgc.input.import.interpolant.%Type%(i32 location, i32 locOffset, i32 elemIdx,
-    //                                           i32 interpMode, <2 x float> | i32 auxInterpValue)
-    if (inOutInfo.hasInterpAux()) {
-      // Prepare arguments for import interpolant call
-      Value *auxInterpValue = modifyAuxInterpValue(vertexIndex, inOutInfo);
-      baseCallName = lgcName::InputImportInterpolant;
-      args.push_back(getInt32(location));
-      args.push_back(locationOffset);
-      args.push_back(elemIdx);
-      args.push_back(getInt32(inOutInfo.getInterpMode()));
-      args.push_back(auxInterpValue);
-    } else {
+    //                                           i32 interpMode, <2 x float> | i32 interpValue) -- for per-vertex
+    //        interpMode is one of:
+    //         - InterpModeSmooth: interpValue is I,J
+    //         - InterpModeCustom: interpValue is vertex index
+    //         - InterpModeFlat: interpValue is ignored
+    if (inOutInfo.isPerPrimitive()) {
       assert(locationOffset == getInt32(0));
       args.push_back(getInt32(location));
       args.push_back(elemIdx);
-      args.push_back(getInt1(inOutInfo.isPerPrimitive()));
-      args.push_back(getInt32(inOutInfo.getInterpMode()));
-      args.push_back(getInt32(inOutInfo.getInterpLoc()));
+    } else {
+      baseCallName = lgcName::InputImportInterpolant;
+
+      args.push_back(getInt32(location));
+      args.push_back(locationOffset);
+      args.push_back(elemIdx);
+
+      auto [interpMode, interpValue] = getInterpModeAndValue(inOutInfo, vertexIndex);
+      args.push_back(getInt32(interpMode));
+      args.push_back(interpValue);
     }
     break;
   }
@@ -298,14 +301,14 @@ Value *InOutBuilder::readGenericInputOutput(bool isOutput, Type *resultTy, unsig
 // The value to write must be a scalar or vector type with no more than four elements.
 // A "location" can contain up to a 4-vector of 16- or 32-bit components, or up to a 2-vector of
 // 64-bit components. Two locations together can contain up to a 4-vector of 64-bit components.
-// A non-constant pLocationOffset is currently only supported for TCS.
+// A non-constant locationOffset is currently only supported for TCS.
 //
 // @param valueToWrite : Value to write
 // @param location : Base location (row) of output
 // @param locationOffset : Location offset; must be within locationCount if variable
 // @param elemIdx : Element index in vector. (This is the SPIR-V "component", except that it is half the component for
 // 64-bit elements.)
-// @param locationCount : Count of locations taken by the output. Ignored if pLocationOffset is const
+// @param locationCount : Count of locations taken by the output. Ignored if locationOffset is const
 // @param outputInfo : Extra output info (GS stream ID, FS integer signedness)
 // @param vertexOrPrimitiveIndex : For TCS/mesh shader per-vertex output: vertex index; for mesh shader per-primitive
 //                                 output: primitive index; else nullptr
@@ -314,7 +317,7 @@ Instruction *InOutBuilder::CreateWriteGenericOutput(Value *valueToWrite, unsigne
                                                     Value *vertexOrPrimitiveIndex) {
   assert(valueToWrite->getType()->isAggregateType() == false);
 
-  // Fold constant pLocationOffset into location. (Currently a variable pLocationOffset is only supported in
+  // Fold constant locationOffset into location. (Currently a variable locationOffset is only supported in
   // TCS.)
   if (auto constLocOffset = dyn_cast<ConstantInt>(locationOffset)) {
     location += constLocOffset->getZExtValue();
@@ -570,56 +573,88 @@ void InOutBuilder::markFsOutputType(Type *outputTy, unsigned location, InOutInfo
 }
 
 // =====================================================================================================================
-// Modify auxiliary interp value according to custom interp mode
+// Get the mode and interp value for an FS "interpolated" (per-vertex attribute) read.
 //
-// @param auxInterpValue : Aux interp value from CreateReadInput (ignored for centroid location)
 // @param inputInfo : InOutInfo containing interp mode and location
-Value *InOutBuilder::modifyAuxInterpValue(Value *auxInterpValue, InOutInfo inputInfo) {
-  if (inputInfo.getInterpLoc() != InOutInfo::InterpLocExplicit) {
-    // Add intrinsic to calculate I/J for interpolation function
-    std::string evalInstName;
-    auto resUsage = getPipelineState()->getShaderResourceUsage(ShaderStageFragment);
-
-    if (inputInfo.getInterpLoc() == InOutInfo::InterpLocCentroid) {
-      Value *evalArg = nullptr;
-
-      evalInstName = lgcName::InputImportBuiltIn;
-      if (inputInfo.getInterpMode() == InOutInfo::InterpModeNoPersp) {
-        evalInstName += "InterpLinearCentroid";
-        evalArg = getInt32(BuiltInInterpLinearCentroid);
-        resUsage->builtInUsage.fs.noperspective = true;
-        resUsage->builtInUsage.fs.centroid = true;
-      } else {
-        evalInstName += "InterpPerspCentroid";
-        evalArg = getInt32(BuiltInInterpPerspCentroid);
-        resUsage->builtInUsage.fs.smooth = true;
-        resUsage->builtInUsage.fs.centroid = true;
-      }
-
-      auxInterpValue =
-          CreateNamedCall(evalInstName, FixedVectorType::get(getFloatTy(), 2), {evalArg}, Attribute::ReadOnly);
-    } else {
-      // Generate code to evaluate the I,J coordinates.
-      if (inputInfo.getInterpLoc() == InOutInfo::InterpLocSample)
-        auxInterpValue = readBuiltIn(false, BuiltInSamplePosOffset, {}, auxInterpValue, nullptr, "");
-      if (inputInfo.getInterpMode() == InOutInfo::InterpModeNoPersp)
-        auxInterpValue = evalIjOffsetNoPersp(auxInterpValue);
-      else
-        auxInterpValue = evalIjOffsetSmooth(auxInterpValue);
-    }
-  } else {
+// @param auxInterpValue : Optional aux interp value from CreateReadInput (ignored for centroid location)
+std::tuple<unsigned, llvm::Value *> InOutBuilder::getInterpModeAndValue(InOutInfo inputInfo,
+                                                                        llvm::Value *auxInterpValue) {
+  if (inputInfo.getInterpLoc() == InOutInfo::InterpLocExplicit) {
+    // Pass-through explicit HW vertex index.
+    assert(inputInfo.hasInterpAux());
     assert(inputInfo.getInterpMode() == InOutInfo::InterpModeCustom);
+    return {InOutInfo::InterpModeCustom, auxInterpValue};
   }
-  return auxInterpValue;
-}
 
-// =====================================================================================================================
-// Evaluate I,J for interpolation: center offset, linear (no perspective) version
-//
-// @param offset : Offset value, <2 x float> or <2 x half>
-Value *InOutBuilder::evalIjOffsetNoPersp(Value *offset) {
-  Value *center = readBuiltIn(false, BuiltInInterpLinearCenter, {}, nullptr, nullptr, "");
-  return adjustIj(center, offset);
+  if (inputInfo.getInterpMode() == InOutInfo::InterpModeFlat)
+    return {InOutInfo::InterpModeFlat, PoisonValue::get(getInt32Ty())};
+
+  unsigned interpLoc = inputInfo.getInterpLoc();
+
+  if (auxInterpValue && inputInfo.getInterpLoc() == InOutInfo::InterpLocSample) {
+    // auxInterpValue is the explicit sample ID, convert to an offset from the center
+    auxInterpValue = readBuiltIn(false, BuiltInSamplePosOffset, {}, auxInterpValue, nullptr, "");
+    interpLoc = InOutInfo::InterpLocCenter;
+  }
+
+  auto resUsage = getPipelineState()->getShaderResourceUsage(ShaderStageFragment);
+
+  if (inputInfo.getInterpMode() == InOutInfo::InterpModeSmooth) {
+    if (auxInterpValue) {
+      assert(interpLoc == InOutInfo::InterpLocCenter);
+      return {InOutInfo::InterpModeSmooth, evalIjOffsetSmooth(auxInterpValue)};
+    }
+
+    BuiltInKind builtInId;
+    switch (interpLoc) {
+    case InOutInfo::InterpLocCentroid:
+      builtInId = BuiltInInterpPerspCentroid;
+      resUsage->builtInUsage.fs.centroid = true;
+      break;
+    case InOutInfo::InterpLocSample:
+      builtInId = BuiltInInterpPerspSample;
+      resUsage->builtInUsage.fs.sample = true;
+      break;
+    case InOutInfo::InterpLocCenter:
+      builtInId = BuiltInInterpPerspCenter;
+      resUsage->builtInUsage.fs.center = true;
+      break;
+    default:
+      llvm_unreachable("unexpected interpLoc");
+    }
+    resUsage->builtInUsage.fs.smooth = true;
+
+    return {InOutInfo::InterpModeSmooth, readBuiltIn(false, builtInId, {}, nullptr, nullptr, "")};
+  }
+
+  assert(inputInfo.getInterpMode() == InOutInfo::InterpModeNoPersp);
+
+  BuiltInKind builtInId;
+
+  switch (interpLoc) {
+  case InOutInfo::InterpLocCentroid:
+    assert(!auxInterpValue);
+    builtInId = BuiltInInterpLinearCentroid;
+    resUsage->builtInUsage.fs.centroid = true;
+    break;
+  case InOutInfo::InterpLocSample:
+    assert(!auxInterpValue);
+    builtInId = BuiltInInterpLinearSample;
+    resUsage->builtInUsage.fs.sample = true;
+    break;
+  case InOutInfo::InterpLocCenter:
+    builtInId = BuiltInInterpLinearCenter;
+    resUsage->builtInUsage.fs.center = true;
+    break;
+  default:
+    llvm_unreachable("unexpected interpLoc");
+  }
+  resUsage->builtInUsage.fs.noperspective = true;
+
+  Value *interpValue = readBuiltIn(false, builtInId, {}, nullptr, nullptr, "");
+  if (auxInterpValue)
+    interpValue = adjustIj(interpValue, auxInterpValue);
+  return {InOutInfo::InterpModeSmooth, interpValue};
 }
 
 // =====================================================================================================================
@@ -642,8 +677,8 @@ Value *InOutBuilder::evalIjOffsetSmooth(Value *offset) {
 
 // =====================================================================================================================
 // Adjust I,J values by offset.
-// This adjusts pValue by its X and Y derivatives times the X and Y components of pOffset.
-// If pValue is a vector, this is done component-wise.
+// This adjusts value by its X and Y derivatives times the X and Y components of offset.
+// If value is a vector, this is done component-wise.
 //
 // @param value : Value to adjust, float or vector of float
 // @param offset : Offset to adjust by, <2 x float> or <2 x half>
@@ -665,7 +700,7 @@ Value *InOutBuilder::adjustIj(Value *value, Value *offset) {
 // =====================================================================================================================
 // Create a write to an XFB (transform feedback / streamout) buffer.
 // The value to write must be a scalar or vector type with no more than four elements.
-// A non-constant pXfbOffset is not currently supported.
+// A non-constant xfbOffset is not currently supported.
 // The value is written to the XFB only if this is in the last-vertex-stage shader, i.e. VS (if no TCS/TES/GS),
 // TES (if no GS) or GS.
 //
@@ -768,9 +803,40 @@ Instruction *InOutBuilder::CreateWriteXfbOutput(Value *valueToWrite, bool isBuil
 }
 
 // =====================================================================================================================
+// Create a read of barycoord input value.
+// The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
+//
+// @param builtIn : Built-in kind, BuiltInBaryCoord or BuiltInBaryCoordNoPerspKHR
+// @param inputInfo : Extra input info
+// @param auxInterpValue : Auxiliary value of interpolation
+// @param instName : Name to give instruction(s)
+Value *InOutBuilder::CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
+                                         const llvm::Twine &instName) {
+  assert(builtIn == lgc::BuiltInBaryCoord || builtIn == lgc::BuiltInBaryCoordNoPerspKHR);
+
+  markBuiltInInputUsage(builtIn, 0);
+
+  // Force override to per-sample interpolation.
+  if (getPipelineState()->getOptions().enableInterpModePatch && !auxInterpValue &&
+      inputInfo.getInterpLoc() != InOutInfo::InterpLocCentroid) {
+    auxInterpValue = readBuiltIn(false, BuiltInSampleId, {}, nullptr, nullptr, "");
+    inputInfo.setInterpLoc(InOutInfo::InterpLocSample);
+  }
+
+  inputInfo.setInterpMode(builtIn == lgc::BuiltInBaryCoord ? InOutInfo::InterpModeSmooth
+                                                           : InOutInfo::InterpModeNoPersp);
+
+  auto [interpMode, interpValue] = getInterpModeAndValue(inputInfo, auxInterpValue);
+  assert(interpMode == InOutInfo::InterpModeSmooth);
+  (void)interpMode;
+
+  return normalizeBaryCoord(interpValue);
+}
+
+// =====================================================================================================================
 // Create a read of (part of) a built-in input value.
 // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
-// or the element type if pIndex is not nullptr. For ClipDistance or CullDistance when pIndex is nullptr,
+// or the element type if index is not nullptr. For ClipDistance or CullDistance when index is nullptr,
 // the array size is determined by inputInfo.GetArraySize().
 //
 // @param builtIn : Built-in kind, one of the BuiltIn* constants
@@ -787,7 +853,7 @@ Value *InOutBuilder::CreateReadBuiltInInput(BuiltInKind builtIn, InOutInfo input
 // =====================================================================================================================
 // Create a read of (part of) a built-in output value.
 // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
-// or the element type if pIndex is not nullptr.
+// or the element type if index is not nullptr.
 //
 // @param builtIn : Built-in kind, one of the BuiltIn* constants
 // @param outputInfo : Extra output info (shader-defined array size)
@@ -872,14 +938,12 @@ Value *InOutBuilder::readBuiltIn(bool isOutput, BuiltInKind builtIn, InOutInfo i
     break;
   case ShaderStageFragment:
     if (builtIn == BuiltInSamplePosOffset) {
-      // Special case for BuiltInSamplePosOffset: pVertexIndex is the sample number.
+      // Special case for BuiltInSamplePosOffset: vertexIndex is the sample number.
       // That special case only happens when ReadBuiltIn is called from ModifyAuxInterpValue.
       Value *sampleNum = vertexIndex;
       vertexIndex = nullptr;
       args.push_back(sampleNum);
-    } else if (builtIn == BuiltInBaryCoord || builtIn == BuiltInBaryCoordNoPerspKHR)
-      // BuiltInBaryCoord requires interpolate mode.
-      args.push_back(getInt32(inOutInfo.getInterpLoc()));
+    }
     assert(!index && !vertexIndex);
     break;
   default:
@@ -898,6 +962,94 @@ Value *InOutBuilder::readBuiltIn(bool isOutput, BuiltInKind builtIn, InOutInfo i
     result->setName(instName);
 
   return result;
+}
+
+// =====================================================================================================================
+// Reorder and normalize the barycoord
+//
+// @param iJCoord : IJ coordinates provided for the HW interpolation view
+// @returns : gl_Barycoord
+Value *InOutBuilder::normalizeBaryCoord(Value *iJCoord) {
+  auto baryType = FixedVectorType::get(getFloatTy(), 3);
+  Value *barycoord = UndefValue::get(baryType);
+  auto one = ConstantFP::get(getFloatTy(), 1.0);
+  auto zero = ConstantFP::get(getFloatTy(), 0.0);
+
+  auto iCoord = CreateExtractElement(iJCoord, uint64_t(0));
+  auto jCoord = CreateExtractElement(iJCoord, 1);
+  auto kCoord = CreateFSub(ConstantFP::get(getFloatTy(), 1.0), iCoord);
+  kCoord = CreateFSub(kCoord, jCoord);
+
+  auto primType = m_pipelineState->getPrimitiveType();
+  auto provokingVertexMode = m_pipelineState->getRasterizerState().provokingVertexMode;
+  switch (primType) {
+  case PrimitiveType::Point: {
+    // Points
+    barycoord = ConstantVector::get({one, zero, zero});
+    break;
+  }
+  case PrimitiveType::LineList:
+  case PrimitiveType::LineStrip: {
+    // Lines
+    // The weight of vertex0 is (1 - i - j), the weight of vertex1 is (i + j).
+    auto yCoord = CreateFAdd(iCoord, jCoord);
+    barycoord = CreateInsertElement(barycoord, kCoord, uint64_t(0));
+    barycoord = CreateInsertElement(barycoord, yCoord, 1);
+    barycoord = CreateInsertElement(barycoord, zero, 2);
+    break;
+  }
+  case PrimitiveType::TriangleList: {
+    // Triangles
+    // V0 ==> Attr_indx2
+    // V1 ==> Attr_indx0
+    // V2 ==> Attr_indx1
+    barycoord = CreateInsertElement(barycoord, iCoord, 2);
+    barycoord = CreateInsertElement(barycoord, jCoord, uint64_t(0));
+    barycoord = CreateInsertElement(barycoord, kCoord, 1);
+    break;
+  }
+  default: {
+    unsigned oddOffset = 0, evenOffset = 0;
+    Value *odd = UndefValue::get(baryType);
+    Value *even = UndefValue::get(baryType);
+    switch (primType) {
+    case PrimitiveType::TriangleFan: {
+      oddOffset = provokingVertexMode == ProvokingVertexLast ? 0 : 2;
+      evenOffset = provokingVertexMode == ProvokingVertexLast ? 2 : 1;
+      break;
+    }
+    case PrimitiveType::TriangleStrip:
+    case PrimitiveType::TriangleStripAdjacency: {
+      oddOffset = provokingVertexMode == ProvokingVertexLast ? 0 : 2;
+      evenOffset = 1;
+      break;
+    }
+    case PrimitiveType::TriangleListAdjacency: {
+      oddOffset = 0;
+      evenOffset = 1;
+      break;
+    }
+    default: {
+      llvm_unreachable("Should never be called!");
+      break;
+    }
+    }
+    odd = CreateInsertElement(odd, iCoord, oddOffset % 3);
+    odd = CreateInsertElement(odd, jCoord, (1 + oddOffset) % 3);
+    odd = CreateInsertElement(odd, kCoord, (2 + oddOffset) % 3);
+
+    even = CreateInsertElement(even, iCoord, evenOffset % 3);
+    even = CreateInsertElement(even, jCoord, (1 + evenOffset) % 3);
+    even = CreateInsertElement(even, kCoord, (2 + evenOffset) % 3);
+
+    // Select between them.
+    Value *primitiveId = readBuiltIn(false, BuiltInPrimitiveId, {}, nullptr, nullptr, "");
+    Value *parity = CreateTrunc(primitiveId, Type::getInt1Ty(getContext()));
+    barycoord = CreateSelect(parity, odd, even);
+    break;
+  }
+  }
+  return barycoord;
 }
 
 // =====================================================================================================================
@@ -994,6 +1146,7 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     }
 
     // For compute shader, NumWorkgroups is a v3i32 loaded from an address pointed to by a special user data item.
+    assert(m_shaderStage == ShaderStageCompute);
     Value *numWorkgroupPtr = ShaderInputs::getSpecialUserData(UserDataMapping::Workgroup, BuilderBase::get(*this));
     LoadInst *load = CreateLoad(FixedVectorType::get(getInt32Ty(), 3), numWorkgroupPtr);
     load->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(getContext(), {}));
@@ -1004,16 +1157,36 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     // WorkgroupId is a v3i32 shader input (three SGPRs set up by hardware).
     Value *workgroupId = ShaderInputs::getInput(ShaderInput::WorkgroupId, BuilderBase::get(*this), *getLgcContext());
 
+    auto options = m_pipelineState->getOptions();
+
     // If thread group swizzle is enabled, we insert a call here and later lower it to code.
-    if (m_pipelineState->getOptions().threadGroupSwizzleMode != ThreadGroupSwizzleMode::Default) {
+    if (options.threadGroupSwizzleMode != ThreadGroupSwizzleMode::Default) {
       // The calculation requires NumWorkgroups and WorkgroupId.
       workgroupId = CreateNamedCall(lgcName::SwizzleWorkgroupId, workgroupId->getType(),
                                     {readCsBuiltIn(BuiltInNumWorkgroups), workgroupId}, {});
     }
+
+    // If the buffer descriptor set and binding are given, it means that we will do the reverse thread group
+    // optimization.
+    if (options.reverseThreadGroupBufferBinding && options.reverseThreadGroupBufferDescSet) {
+      Value *reversedWorkgroupId = CreateSub(CreateSub(readCsBuiltIn(BuiltInNumWorkgroups), workgroupId),
+                                             ConstantVector::get({getInt32(1), getInt32(1), getInt32(1)}));
+
+      // Load control bit from internal buffer
+      auto bufferDesc = CreateLoadBufferDesc(options.reverseThreadGroupBufferDescSet,
+                                             options.reverseThreadGroupBufferBinding, getInt32(0), 0, getInt8Ty());
+      auto controlBitPtr = CreateInBoundsGEP(getInt8Ty(), bufferDesc, getInt32(0));
+      auto controlBit = CreateTrunc(
+          CreateLoad(getInt32Ty(), CreateBitCast(controlBitPtr, getBufferDescTy(getInt32Ty()))), getInt1Ty());
+
+      workgroupId = CreateSelect(controlBit, reversedWorkgroupId, workgroupId);
+    }
+
     return workgroupId;
   }
 
-  case BuiltInLocalInvocationId: {
+  case BuiltInLocalInvocationId:
+  case BuiltInHwLocalInvocationId: {
     // LocalInvocationId is a v3i32 shader input (three VGPRs set up in hardware).
     Value *localInvocationId =
         ShaderInputs::getInput(ShaderInput::LocalInvocationId, BuilderBase::get(*this), *getLgcContext());
@@ -1025,26 +1198,29 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
       localInvocationId = CreateInsertElement(localInvocationId, getInt32(0), 2);
     }
 
-    // If the option is enabled, we might want to reconfigure the workgroup layout later, which
-    // means the value of LocalInvocationId needs modifying. We can't do that now, as we need to
-    // know whether the shader uses images. Detect here that we can't do that optimization in
-    // a compute library. We don't detect here that we can't do the optimization in a compute shader
-    // with calls, as that detection is slightly more expensive.
-    if (m_pipelineState->getOptions().reconfigWorkgroupLayout && !getPipelineState()->isComputeLibrary()) {
-      // Insert a call that later on might get lowered to code to reconfigure the workgroup.
-      localInvocationId = CreateNamedCall(lgcName::ReconfigureLocalInvocationId, localInvocationId->getType(),
-                                          localInvocationId, Attribute::ReadNone);
-    }
+    if (builtIn == BuiltInLocalInvocationId) {
+      // If the option is enabled, we might want to reconfigure the workgroup layout later, which
+      // means the value of LocalInvocationId needs modifying. We can't do that now, as we need to
+      // know whether the shader uses images. Detect here that we can't do that optimization in
+      // a compute library. We don't detect here that we can't do the optimization in a compute shader
+      // with calls, as that detection is slightly more expensive.
+      if (m_pipelineState->getOptions().reconfigWorkgroupLayout && !getPipelineState()->isComputeLibrary()) {
+        // Insert a call that later on might get lowered to code to reconfigure the workgroup.
+        localInvocationId = CreateNamedCall(lgcName::ReconfigureLocalInvocationId, localInvocationId->getType(),
+                                            localInvocationId, Attribute::ReadNone);
+      }
 
-    // In the case of 16x16 thread group size, wave32 SIMD will be created in eight 16x2 regions.
-    // This function maps the eight 16x2 regions into eight 8x4 regions.
-    //
-    // Originally SIMDs cover 16x2 regions, after swizzling they cover 8x4 regions.
-
-    if (m_pipelineState->getOptions().forceCsThreadIdSwizzling && !getPipelineState()->isComputeLibrary()) {
-      // Insert a call that later on might get lowered to code to reconfigure the workgroup.
-      localInvocationId = CreateNamedCall(lgcName::SwizzleLocalInvocationId, localInvocationId->getType(),
-                                          localInvocationId, Attribute::ReadNone);
+      // In the case of 16x16 thread group size, wave32 SIMD will be created in eight 16x2 regions.
+      // This function maps the eight 16x2 regions into eight 8x4 regions.
+      //
+      // Originally SIMDs cover 16x2 regions, after swizzling they cover 8x4 regions.
+      bool pipelineThreadIdSwizzling =
+          m_pipelineState->getOptions().forceCsThreadIdSwizzling && !getPipelineState()->isComputeLibrary();
+      if (pipelineThreadIdSwizzling) {
+        // Insert a call that later on might get lowered to code to reconfigure the workgroup.
+        localInvocationId = CreateNamedCall(lgcName::SwizzleLocalInvocationId, localInvocationId->getType(),
+                                            localInvocationId, Attribute::ReadNone);
+      }
     }
 
     return localInvocationId;
@@ -1066,11 +1242,17 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     return CreateAdd(result, readCsBuiltIn(BuiltInLocalInvocationId));
   }
 
-  case BuiltInLocalInvocationIndex: {
+  case BuiltInLocalInvocationIndex:
+  case BuiltInHwLocalInvocationIndex: {
     // LocalInvocationIndex is
     // (WorkgroupSize.Y * LocalInvocationId.Z + LocalInvocationId.Y) * WorkGroupSize.X + LocalInvocationId.X
     Value *workgroupSize = readCsBuiltIn(BuiltInWorkgroupSize);
-    Value *localInvocationId = readCsBuiltIn(BuiltInLocalInvocationId);
+    Value *localInvocationId = nullptr;
+    if (builtIn == BuiltInLocalInvocationIndex) {
+      localInvocationId = readCsBuiltIn(BuiltInLocalInvocationId, "readLocalInvocationId");
+    } else {
+      localInvocationId = readCsBuiltIn(BuiltInHwLocalInvocationId, "readHWLocalInvocationId");
+    }
     Value *input = CreateMul(CreateExtractElement(workgroupSize, 1), CreateExtractElement(localInvocationId, 2));
     input = CreateAdd(input, CreateExtractElement(localInvocationId, 1));
     input = CreateMul(CreateExtractElement(workgroupSize, uint64_t(0)), input);
@@ -1079,13 +1261,24 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
   }
 
   case BuiltInSubgroupId: {
-    // gl_SubgroupID = gl_LocationInvocationIndex / gl_SubgroupSize
-    Value *localInvocationIndex = readCsBuiltIn(BuiltInLocalInvocationIndex);
-    unsigned subgroupSize = getPipelineState()->getShaderSubgroupSize(m_shaderStage);
-    return CreateLShr(localInvocationIndex, getInt32(Log2_32(subgroupSize)));
+    // From Navi21, it should load the subgroupid from sgpr initialized at wave launch.
+    if (getPipelineState()->getTargetInfo().getGfxIpVersion() >= GfxIpVersion({10, 3})) {
+      Value *multiDispatchInfo =
+          ShaderInputs::getInput(ShaderInput::MultiDispatchInfo, BuilderBase::get(*this), *getLgcContext());
+
+      // waveId = dispatchInfo[24:20]
+      Value *waveIdInSubgroup = CreateAnd(CreateLShr(multiDispatchInfo, 20), 0x1F, "waveIdInSubgroup");
+      return waveIdInSubgroup;
+    } else {
+      // Before Navi21, it should read the value before swizzling which is correct to calculate subgroup id.
+      Value *localInvocationIndex = readCsBuiltIn(BuiltInHwLocalInvocationIndex);
+      unsigned subgroupSize = getPipelineState()->getShaderSubgroupSize(m_shaderStage);
+      return CreateLShr(localInvocationIndex, getInt32(Log2_32(subgroupSize)));
+    }
   }
 
   case BuiltInDrawIndex: {
+    assert(m_shaderStage == ShaderStageTask); // Task shader only
     return ShaderInputs::getSpecialUserData(UserDataMapping::DrawIndex, BuilderBase::get(*this));
   }
 
@@ -1126,7 +1319,7 @@ Value *InOutBuilder::readVsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
 // =====================================================================================================================
 // Create a write of (part of) a built-in output value.
 // The type of the value to write must be the fixed type of the specified built-in (see BuiltInDefs.h),
-// or the element type if pIndex is not nullptr.
+// or the element type if index is not nullptr.
 //
 // @param valueToWrite : Value to write
 // @param builtIn : Built-in kind, one of the BuiltIn* constants
@@ -1210,7 +1403,7 @@ Instruction *InOutBuilder::CreateWriteBuiltInOutput(Value *valueToWrite, BuiltIn
 // @param resultTy : Type of value to read
 // @param byteOffset : Byte offset within the payload structure
 // @param instName : Name to give instruction(s)
-// @returns Value read from the task payload
+// @returns : Value read from the task payload
 Value *InOutBuilder::CreateReadTaskPayload(Type *resultTy, Value *byteOffset, const Twine &instName) {
   assert(m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh); // Only valid for task/mesh shader
 
@@ -1225,13 +1418,53 @@ Value *InOutBuilder::CreateReadTaskPayload(Type *resultTy, Value *byteOffset, co
 // @param valueToWrite : Value to write
 // @param byteOffset : Byte offset within the payload structure
 // @param instName : Name to give instruction(s)
-// @returns Instruction to write value to task payload
+// @returns : Instruction to write value to task payload
 Instruction *InOutBuilder::CreateWriteTaskPayload(Value *valueToWrite, Value *byteOffset, const Twine &instName) {
   assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
 
   std::string callName = lgcName::MeshTaskWriteTaskPayload;
   addTypeMangling(nullptr, {byteOffset, valueToWrite}, callName);
   return CreateNamedCall(callName, getVoidTy(), {byteOffset, valueToWrite}, {});
+}
+
+// =====================================================================================================================
+// Create a task payload atomic operation other than compare-and-swap. An add of +1 or -1, or a sub
+// of -1 or +1, is generated as inc or dec. Result type is the same as the input value type.
+//
+// @param atomicOp : Atomic op to create
+// @param ordering : Atomic ordering
+// @param inputValue : Input value
+// @param byteOffset : Byte offset within the payload structure
+// @param instName : Name to give instruction(s)
+// @returns : Original value read from the task payload
+Value *InOutBuilder::CreateTaskPayloadAtomic(unsigned atomicOp, AtomicOrdering ordering, Value *inputValue,
+                                             Value *byteOffset, const Twine &instName) {
+  assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
+
+  std::string callName = lgcName::MeshTaskAtomicTaskPayload;
+  addTypeMangling(nullptr, inputValue, callName);
+  return CreateNamedCall(callName, inputValue->getType(),
+                         {getInt32(atomicOp), getInt32(static_cast<unsigned>(ordering)), inputValue, byteOffset}, {});
+}
+
+// =====================================================================================================================
+// Create a task payload atomic compare-and-swap.
+//
+// @param ordering : Atomic ordering
+// @param inputValue : Input value
+// @param comparatorValue : Value to compare against
+// @param byteOffset : Byte offset within the payload structure
+// @param instName : Name to give instruction(s)
+// @returns : Original value read from the task payload
+Value *InOutBuilder::CreateTaskPayloadAtomicCompareSwap(AtomicOrdering ordering, Value *inputValue,
+                                                        Value *comparatorValue, Value *byteOffset,
+                                                        const Twine &instName) {
+  assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
+
+  std::string callName = lgcName::MeshTaskAtomicCompareSwapTaskPayload;
+  addTypeMangling(nullptr, inputValue, callName);
+  return CreateNamedCall(callName, inputValue->getType(),
+                         {getInt32(static_cast<unsigned>(ordering)), inputValue, comparatorValue, byteOffset}, {});
 }
 
 // =====================================================================================================================
@@ -1242,7 +1475,12 @@ Instruction *InOutBuilder::CreateWriteTaskPayload(Value *valueToWrite, Value *by
 Type *InOutBuilder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo) {
   switch (static_cast<unsigned>(builtIn)) {
   case BuiltInSamplePosOffset:
+  case BuiltInInterpPerspCenter:
   case BuiltInInterpLinearCenter:
+  case BuiltInInterpPerspCentroid:
+  case BuiltInInterpLinearCentroid:
+  case BuiltInInterpPerspSample:
+  case BuiltInInterpLinearSample:
     return FixedVectorType::get(getFloatTy(), 2);
   case BuiltInInterpPullMode:
     return FixedVectorType::get(getFloatTy(), 3);
@@ -1687,6 +1925,7 @@ void InOutBuilder::markBuiltInOutputUsage(BuiltInKind builtIn, unsigned arraySiz
     default:
       break;
     }
+    break;
   }
 
   case ShaderStageFragment: {

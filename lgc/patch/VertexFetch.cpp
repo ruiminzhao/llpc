@@ -551,7 +551,7 @@ Value *VertexFetchImpl::fetchVertex(Type *inputTy, const VertexInputDescription 
     // Use vertex index
     if (!m_vertexIndex) {
       auto savedInsertPoint = builder.saveIP();
-      builder.SetInsertPoint(&*insertPos->getFunction()->front().getFirstInsertionPt());
+      builder.SetInsertPointPastAllocas(insertPos->getFunction());
       m_vertexIndex = ShaderInputs::getVertexIndex(builder, *m_lgcContext);
       builder.restoreIP(savedInsertPoint);
     }
@@ -563,7 +563,7 @@ Value *VertexFetchImpl::fetchVertex(Type *inputTy, const VertexInputDescription 
       // Use instance index
       if (!m_instanceIndex) {
         auto savedInsertPoint = builder.saveIP();
-        builder.SetInsertPoint(&*insertPos->getFunction()->front().getFirstInsertionPt());
+        builder.SetInsertPointPastAllocas(insertPos->getFunction());
         m_instanceIndex = ShaderInputs::getInstanceIndex(builder, *m_lgcContext);
         builder.restoreIP(savedInsertPoint);
       }
@@ -632,7 +632,7 @@ Value *VertexFetchImpl::fetchVertex(Type *inputTy, const VertexInputDescription 
         auto cond =
             new FCmpInst(insertPos, FCmpInst::FCMP_UGT, alpha, ConstantFP::get(Type::getFloatTy(*m_context), 1.5f), "");
 
-        // %a = select %cond, -1.0f, pAlpha
+        // %a = select %cond, -1.0f, alpha
         alpha = SelectInst::Create(cond, ConstantFP::get(Type::getFloatTy(*m_context), -1.0f), alpha, "", insertPos);
 
         // %a = bitcast %a to i32
@@ -927,7 +927,7 @@ Value *VertexFetchImpl::loadVertexBufferDescriptor(unsigned binding, BuilderBase
   Type *vbDescTy = FixedVectorType::get(Type::getInt32Ty(*m_context), 4);
   if (!m_vertexBufTablePtr) {
     auto savedInsertPoint = builder.saveIP();
-    builder.SetInsertPoint(&*builder.GetInsertPoint()->getFunction()->front().getFirstInsertionPt());
+    builder.SetInsertPointPastAllocas(builder.GetInsertPoint()->getFunction());
     m_vertexBufTablePtr =
         ShaderInputs::getSpecialUserDataAsPointer(UserDataMapping::VertexBufferTable, vbDescTy, builder);
     builder.restoreIP(savedInsertPoint);

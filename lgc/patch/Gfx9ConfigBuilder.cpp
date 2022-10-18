@@ -56,7 +56,7 @@ void ConfigBuilder::buildPalMetadata() {
     const bool enableNgg = m_pipelineState->getNggControl()->enableNgg;
 
     if (!m_pipelineState->isWholePipeline() && m_pipelineState->hasShaderStage(ShaderStageFragment)) {
-      // FS-only shader or part-pipeline compilation
+      // FS-only shader (part-pipeline compilation)
       buildPipelineVsFsRegConfig();
     } else if (m_hasTask) {
       // Task-Mesh-FS pipeline
@@ -98,7 +98,9 @@ void ConfigBuilder::buildPalMetadata() {
 // Builds register configuration for graphics pipeline (VS-FS), or FS-only shader compilation
 void ConfigBuilder::buildPipelineVsFsRegConfig() {
   GfxIpVersion gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
-  assert(gfxIp.major <= 10);
+  const bool partPipeline = !m_pipelineState->isWholePipeline() && m_pipelineState->hasShaderStage(ShaderStageFragment);
+  assert(gfxIp.major <= 10 || partPipeline); // Must be GFX10 or below, or part-pipeline compilation
+  (void(partPipeline));                      // Unused
 
   PipelineVsFsRegConfig config(gfxIp);
 
@@ -892,51 +894,13 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
     SET_REG_GFX10_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, MEM_ORDERED, true);
   }
 
-  bool disableVertexReuse = m_pipelineState->getInputAssemblyState().disableVertexReuse;
-
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_X_SCALE_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_X_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_Y_SCALE_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_Y_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_Z_SCALE_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VPORT_Z_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->vsRegs, PA_CL_VTE_CNTL, VTX_W0_FMT, true);
-
-  SET_REG_FIELD(&config->vsRegs, PA_SU_VTX_CNTL, PIX_CENTER, 1);
-  SET_REG_FIELD(&config->vsRegs, PA_SU_VTX_CNTL, ROUND_MODE, 2); // Round to even
-  SET_REG_FIELD(&config->vsRegs, PA_SU_VTX_CNTL, QUANT_MODE, 5); // Use 8-bit fractions
-
-  // Stage-specific processing
-  bool usePointSize = false;
-  bool usePrimitiveId = false;
-  bool useLayer = false;
-  bool useViewportIndex = false;
-  bool useShadingRate = false;
-  unsigned clipDistanceCount = 0;
-  unsigned cullDistanceCount = 0;
-
   if (shaderStage == ShaderStageVertex) {
-    usePointSize = builtInUsage.vs.pointSize;
-    usePrimitiveId = builtInUsage.vs.primitiveId;
-    useLayer = builtInUsage.vs.layer;
-    useViewportIndex = builtInUsage.vs.viewportIndex;
-    useShadingRate = builtInUsage.vs.primitiveShadingRate;
-    clipDistanceCount = builtInUsage.vs.clipDistance;
-    cullDistanceCount = builtInUsage.vs.cullDistance;
-
     if (builtInUsage.vs.instanceIndex) {
       SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT, 3); // 3: Enable instance ID
     } else if (builtInUsage.vs.primitiveId) {
       SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT, 2);
     }
   } else if (shaderStage == ShaderStageTessEval) {
-    usePointSize = builtInUsage.tes.pointSize;
-    usePrimitiveId = builtInUsage.tes.primitiveId;
-    useLayer = builtInUsage.tes.layer;
-    useViewportIndex = builtInUsage.tes.viewportIndex;
-    clipDistanceCount = builtInUsage.tes.clipDistance;
-    cullDistanceCount = builtInUsage.tes.cullDistance;
-
     if (builtInUsage.tes.primitiveId) {
       // NOTE: when primitive ID is used, set vgtCompCnt to 3 directly because primitive ID is the last VGPR.
       SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT, 3); // 3: Enable primitive ID
@@ -947,106 +911,9 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
     if (m_pipelineState->isTessOffChip()) {
       SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN, true);
     }
-  } else {
-    assert(shaderStage == ShaderStageCopyShader);
-
-    usePointSize = builtInUsage.gs.pointSize;
-    usePrimitiveId = builtInUsage.gs.primitiveIdIn;
-    useLayer = builtInUsage.gs.layer;
-    useViewportIndex = builtInUsage.gs.viewportIndex;
-    useShadingRate = builtInUsage.gs.primitiveShadingRate;
-    clipDistanceCount = builtInUsage.gs.clipDistance;
-    cullDistanceCount = builtInUsage.gs.cullDistance;
-
-    // NOTE: For ES-GS merged shader, the actual use of primitive ID should take both ES and GS into consideration.
-    const bool hasTs =
-        m_pipelineState->hasShaderStage(ShaderStageTessControl) || m_pipelineState->hasShaderStage(ShaderStageTessEval);
-    if (hasTs) {
-      const auto &tesBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval)->builtInUsage.tes;
-      usePrimitiveId = usePrimitiveId || tesBuiltInUsage.primitiveId;
-    } else {
-      const auto &vsBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex)->builtInUsage.vs;
-      usePrimitiveId = usePrimitiveId || vsBuiltInUsage.primitiveId;
-    }
   }
 
-  SET_REG_FIELD(&config->vsRegs, VGT_PRIMITIVEID_EN, PRIMITIVEID_EN, usePrimitiveId);
-
-  if (gfxIp.major == 10 && resUsage->inOutUsage.expCount == 0) {
-    SET_REG_GFX10_PLUS_FIELD(&config->vsRegs, SPI_VS_OUT_CONFIG, NO_PC_EXPORT, true);
-  } else {
-    SET_REG_FIELD(&config->vsRegs, SPI_VS_OUT_CONFIG, VS_EXPORT_COUNT, resUsage->inOutUsage.expCount - 1);
-  }
-
-  setUsesViewportArrayIndex(useViewportIndex);
-
-  // According to the IA_VGT_Spec, it is only legal to enable vertex reuse when we're using viewport array
-  // index if each GS, TES, or VS invocation emits the same viewport array index for each vertex and we set
-  // VTE_VPORT_PROVOKE_DISABLE.
-  if (useViewportIndex) {
-    // TODO: In the future, we can only disable vertex reuse only if viewport array index is emitted divergently
-    // for each vertex.
-    disableVertexReuse = true;
-    SET_REG_FIELD(&config->vsRegs, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, true);
-  } else {
-    SET_REG_FIELD(&config->vsRegs, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, false);
-  }
-
-  SET_REG_FIELD(&config->vsRegs, VGT_REUSE_OFF, REUSE_OFF, disableVertexReuse);
-
-  useLayer = useLayer || m_pipelineState->getInputAssemblyState().enableMultiView;
-
-  bool miscExport = usePointSize || useLayer || useViewportIndex;
-  miscExport |= useShadingRate;
-  if (miscExport) {
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, USE_VTX_POINT_SIZE, usePointSize);
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, USE_VTX_RENDER_TARGET_INDX, useLayer);
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, USE_VTX_VIEWPORT_INDX, useViewportIndex);
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_VEC_ENA, true);
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_SIDE_BUS_ENA, true);
-
-    if (gfxIp >= GfxIpVersion{10, 3}) {
-      SET_REG_GFX10_3_PLUS_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, USE_VTX_VRS_RATE, useShadingRate);
-      SET_REG_GFX10_3_PLUS_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, BYPASS_PRIM_RATE_COMBINER, true);
-    }
-  }
-
-  if (clipDistanceCount > 0 || cullDistanceCount > 0) {
-    SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST0_VEC_ENA, true);
-    if (clipDistanceCount + cullDistanceCount > 4) {
-      SET_REG_FIELD(&config->vsRegs, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST1_VEC_ENA, true);
-    }
-
-    unsigned clipDistanceMask = (1 << clipDistanceCount) - 1;
-    unsigned cullDistanceMask = (1 << cullDistanceCount) - 1;
-
-    // Set fields CLIP_DIST_ENA_0 ~ CLIP_DIST_ENA_7 and CULL_DIST_ENA_0 ~ CULL_DIST_ENA_7
-    unsigned paClVsOutCntl = GET_REG(&config->vsRegs, PA_CL_VS_OUT_CNTL);
-    paClVsOutCntl |= clipDistanceMask;
-    paClVsOutCntl |= (cullDistanceMask << 8);
-    SET_REG(&config->vsRegs, PA_CL_VS_OUT_CNTL, paClVsOutCntl);
-  }
-
-  unsigned posCount = 1; // gl_Position is always exported
-  if (miscExport)
-    ++posCount;
-
-  if (clipDistanceCount + cullDistanceCount > 0) {
-    ++posCount;
-    if (clipDistanceCount + cullDistanceCount > 4)
-      ++posCount;
-  }
-
-  SET_REG_FIELD(&config->vsRegs, SPI_SHADER_POS_FORMAT, POS0_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  if (posCount > 1) {
-    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_POS_FORMAT, POS1_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
-  if (posCount > 2) {
-    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_POS_FORMAT, POS2_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
-  if (posCount > 3) {
-    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_POS_FORMAT, POS3_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
+  setupPaSpecificRegisters(&config->vsRegs);
 }
 
 // =====================================================================================================================
@@ -1103,6 +970,9 @@ void ConfigBuilder::buildLsHsRegConfig(ShaderStage shaderStage1, ShaderStage sha
   const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
 
   unsigned ldsSizeInDwords = calcFactor.tessOnChipLdsSize;
+#if VKI_RAY_TRACING
+  ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
+#endif
   ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
 
   const unsigned ldsSize = ldsSizeInDwords >> ldsSizeDwordGranularityShift;
@@ -1226,6 +1096,9 @@ void ConfigBuilder::buildEsGsRegConfig(ShaderStage shaderStage1, ShaderStage sha
   const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
 
   unsigned ldsSizeInDwords = calcFactor.gsOnChipLdsSize;
+#if VKI_RAY_TRACING
+  ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
+#endif
   ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
 
   const unsigned ldsSize = ldsSizeInDwords >> ldsSizeDwordGranularityShift;
@@ -1436,6 +1309,9 @@ void ConfigBuilder::buildPrimShaderRegConfig(ShaderStage shaderStage1, ShaderSta
   const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
 
   unsigned ldsSizeInDwords = calcFactor.gsOnChipLdsSize;
+#if VKI_RAY_TRACING
+  ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
+#endif
   ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
 
   const unsigned ldsSize = ldsSizeInDwords >> ldsSizeDwordGranularityShift;
@@ -1547,165 +1423,7 @@ void ConfigBuilder::buildPrimShaderRegConfig(ShaderStage shaderStage1, ShaderSta
   //
   // Build VS specific configuration
   //
-  uint8_t usrClipPlaneMask = m_pipelineState->getRasterizerState().usrClipPlaneMask;
-  bool rasterizerDiscardEnable = m_pipelineState->getRasterizerState().rasterizerDiscardEnable;
-  bool disableVertexReuse = m_pipelineState->getInputAssemblyState().disableVertexReuse;
-
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_0, (usrClipPlaneMask >> 0) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_1, (usrClipPlaneMask >> 1) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_2, (usrClipPlaneMask >> 2) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_3, (usrClipPlaneMask >> 3) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_4, (usrClipPlaneMask >> 4) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, UCP_ENA_5, (usrClipPlaneMask >> 5) & 0x1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, DX_LINEAR_ATTR_CLIP_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, DX_RASTERIZATION_KILL, rasterizerDiscardEnable);
-
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_X_SCALE_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_X_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_Y_SCALE_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_Y_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_Z_SCALE_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VPORT_Z_OFFSET_ENA, true);
-  SET_REG_FIELD(&config->primShaderRegs, PA_CL_VTE_CNTL, VTX_W0_FMT, true);
-
-  SET_REG_FIELD(&config->primShaderRegs, PA_SU_VTX_CNTL, PIX_CENTER, 1);
-  SET_REG_FIELD(&config->primShaderRegs, PA_SU_VTX_CNTL, ROUND_MODE, 2); // Round to even
-  SET_REG_FIELD(&config->primShaderRegs, PA_SU_VTX_CNTL, QUANT_MODE, 5); // Use 8-bit fractions
-
-  // Stage-specific processing
-  bool usePointSize = false;
-  bool usePrimitiveId = false;
-  bool useLayer = false;
-  bool useViewportIndex = false;
-  bool useShadingRate = false;
-  unsigned clipDistanceCount = 0;
-  unsigned cullDistanceCount = 0;
-
-  unsigned expCount = 0;
-
-  if (hasGs) {
-    usePointSize = gsBuiltInUsage.pointSize;
-    usePrimitiveId = gsBuiltInUsage.primitiveIdIn;
-    useLayer = gsBuiltInUsage.layer;
-    useViewportIndex = gsBuiltInUsage.viewportIndex;
-    useShadingRate = gsBuiltInUsage.primitiveShadingRate;
-    clipDistanceCount = gsBuiltInUsage.clipDistance;
-    cullDistanceCount = gsBuiltInUsage.cullDistance;
-
-    expCount = gsResUsage->inOutUsage.expCount;
-
-    // NOTE: For ES-GS merged shader, the actual use of primitive ID should take both ES and GS into consideration.
-    if (hasTs)
-      usePrimitiveId = usePrimitiveId || tesBuiltInUsage.primitiveId;
-    else
-      usePrimitiveId = usePrimitiveId || vsBuiltInUsage.primitiveId;
-  } else {
-    if (hasTs) {
-      usePointSize = tesBuiltInUsage.pointSize;
-      useLayer = tesBuiltInUsage.layer;
-      useViewportIndex = tesBuiltInUsage.viewportIndex;
-      clipDistanceCount = tesBuiltInUsage.clipDistance;
-      cullDistanceCount = tesBuiltInUsage.cullDistance;
-
-      expCount = tesResUsage->inOutUsage.expCount;
-    } else {
-      usePointSize = vsBuiltInUsage.pointSize;
-      usePrimitiveId = vsBuiltInUsage.primitiveId;
-      useLayer = vsBuiltInUsage.layer;
-      useViewportIndex = vsBuiltInUsage.viewportIndex;
-      useShadingRate = vsBuiltInUsage.primitiveShadingRate;
-      clipDistanceCount = vsBuiltInUsage.clipDistance;
-      cullDistanceCount = vsBuiltInUsage.cullDistance;
-
-      expCount = vsResUsage->inOutUsage.expCount;
-    }
-  }
-
-  if (usePrimitiveId) {
-    SET_REG_FIELD(&config->primShaderRegs, VGT_PRIMITIVEID_EN, PRIMITIVEID_EN, true);
-
-    // NOTE: If primitive ID is used and there is no GS present, the field NGG_DISABLE_PROVOK_REUSE must be
-    // set to ensure provoking vertex reuse is disabled in the GE.
-    if (!m_hasGs) {
-      SET_REG_FIELD(&config->primShaderRegs, VGT_PRIMITIVEID_EN, NGG_DISABLE_PROVOK_REUSE, true);
-    }
-  }
-
-  if (expCount == 0) {
-    // No generic output is present
-    SET_REG_GFX10_PLUS_FIELD(&config->primShaderRegs, SPI_VS_OUT_CONFIG, NO_PC_EXPORT, true);
-  } else {
-    SET_REG_FIELD(&config->primShaderRegs, SPI_VS_OUT_CONFIG, VS_EXPORT_COUNT, expCount - 1);
-  }
-
-  setUsesViewportArrayIndex(useViewportIndex);
-
-  // According to the IA_VGT_Spec, it is only legal to enable vertex reuse when we're using viewport array
-  // index if each GS, TES, or VS invocation emits the same viewport array index for each vertex and we set
-  // VTE_VPORT_PROVOKE_DISABLE.
-  if (useViewportIndex) {
-    // TODO: In the future, we can only disable vertex reuse only if viewport array index is emitted divergently
-    // for each vertex.
-    disableVertexReuse = true;
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, true);
-  } else {
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, false);
-  }
-
-  SET_REG_FIELD(&config->primShaderRegs, VGT_REUSE_OFF, REUSE_OFF, disableVertexReuse);
-
-  useLayer = useLayer || m_pipelineState->getInputAssemblyState().enableMultiView;
-
-  bool miscExport = usePointSize || useLayer || useViewportIndex;
-  miscExport |= useShadingRate;
-  if (miscExport) {
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, USE_VTX_POINT_SIZE, usePointSize);
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, USE_VTX_RENDER_TARGET_INDX, useLayer);
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, USE_VTX_VIEWPORT_INDX, useViewportIndex);
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_VEC_ENA, true);
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_SIDE_BUS_ENA, true);
-    if (gfxIp >= GfxIpVersion{10, 3}) {
-      SET_REG_GFX10_3_PLUS_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, USE_VTX_VRS_RATE, useShadingRate);
-      SET_REG_GFX10_3_PLUS_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, BYPASS_PRIM_RATE_COMBINER, true);
-    }
-  }
-
-  if (clipDistanceCount > 0 || cullDistanceCount > 0) {
-    SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST0_VEC_ENA, true);
-    if (clipDistanceCount + cullDistanceCount > 4) {
-      SET_REG_FIELD(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST1_VEC_ENA, true);
-    }
-
-    unsigned clipDistanceMask = (1 << clipDistanceCount) - 1;
-    unsigned cullDistanceMask = (1 << cullDistanceCount) - 1;
-
-    // Set fields CLIP_DIST_ENA_0 ~ CLIP_DIST_ENA_7 and CULL_DIST_ENA_0 ~ CULL_DIST_ENA_7
-    unsigned paClVsOutCntl = GET_REG(&config->primShaderRegs, PA_CL_VS_OUT_CNTL);
-    paClVsOutCntl |= clipDistanceMask;
-    paClVsOutCntl |= (cullDistanceMask << 8);
-    SET_REG(&config->primShaderRegs, PA_CL_VS_OUT_CNTL, paClVsOutCntl);
-  }
-
-  unsigned posCount = 1; // gl_Position is always exported
-  if (miscExport)
-    ++posCount;
-
-  if (clipDistanceCount + cullDistanceCount > 0) {
-    ++posCount;
-    if (clipDistanceCount + cullDistanceCount > 4)
-      ++posCount;
-  }
-
-  SET_REG_FIELD(&config->primShaderRegs, SPI_SHADER_POS_FORMAT, POS0_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  if (posCount > 1) {
-    SET_REG_FIELD(&config->primShaderRegs, SPI_SHADER_POS_FORMAT, POS1_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
-  if (posCount > 2) {
-    SET_REG_FIELD(&config->primShaderRegs, SPI_SHADER_POS_FORMAT, POS2_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
-  if (posCount > 3) {
-    SET_REG_FIELD(&config->primShaderRegs, SPI_SHADER_POS_FORMAT, POS3_EXPORT_FORMAT, SPI_SHADER_4COMP);
-  }
+  setupPaSpecificRegisters(&config->primShaderRegs);
 
   //
   // Build NGG configuration
@@ -1786,7 +1504,9 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
 
   ZOrder zOrder = LATE_Z;
   bool execOnHeirFail = false;
-  if (fragmentMode.earlyFragmentTests)
+  if (shaderOptions.forceLateZ)
+    zOrder = LATE_Z;
+  else if (fragmentMode.earlyFragmentTests)
     zOrder = EARLY_Z_THEN_LATE_Z;
   else if (resUsage->resourceWrite) {
     zOrder = LATE_Z;
@@ -1831,7 +1551,6 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
   unsigned cbShaderMask = resUsage->inOutUsage.fs.cbShaderMask;
   cbShaderMask = resUsage->inOutUsage.fs.isNullFs ? 0 : cbShaderMask;
   SET_REG(&config->psRegs, CB_SHADER_MASK, cbShaderMask);
-  SET_REG_FIELD(&config->psRegs, SPI_PS_IN_CONTROL, NUM_INTERP, resUsage->inOutUsage.fs.interpInfo.size());
 
   auto waveFrontSize = m_pipelineState->getShaderWaveSize(shaderStage);
   if (waveFrontSize == 32) {
@@ -1851,12 +1570,16 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
 
   // NOTE: PAL expects at least one mmSPI_PS_INPUT_CNTL_0 register set, so we always patch it at least one if none
   // were identified in the shader.
-  const std::vector<FsInterpInfo> dummyInterpInfo{{0, false, false, false, false, false}};
+  const std::vector<FsInterpInfo> dummyInterpInfo{{0, false, false, false, false, false, false}};
   const auto &fsInterpInfo = resUsage->inOutUsage.fs.interpInfo;
   const auto *interpInfo = fsInterpInfo.size() == 0 ? &dummyInterpInfo : &fsInterpInfo;
 
+  unsigned numPrimInterp = 0;
   for (unsigned i = 0; i < interpInfo->size(); ++i) {
     auto interpInfoElem = (*interpInfo)[i];
+
+    if (interpInfoElem.isPerPrimitive)
+      ++numPrimInterp;
 
     if (!m_pipelineState->isWholePipeline() && interpInfoElem.loc == InvalidFsInterpInfo.loc) {
       appendConfig(mmSPI_PS_INPUT_CNTL_0 + i, i);
@@ -1867,7 +1590,8 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
       interpInfoElem.loc = i;
 
     regSPI_PS_INPUT_CNTL_0 spiPsInputCntl = {};
-    spiPsInputCntl.bits.FLAT_SHADE = interpInfoElem.flat;
+    // NOTE: Flat shading flag is only set for per-vertex parameter.
+    spiPsInputCntl.bits.FLAT_SHADE = interpInfoElem.flat && !interpInfoElem.isPerPrimitive;
     spiPsInputCntl.bits.OFFSET = interpInfoElem.loc;
 
     if (interpInfoElem.custom) {
@@ -1894,6 +1618,11 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
     // can be amended.
     appendConfig(mmSPI_PS_INPUT_CNTL_0 + i, spiPsInputCntl.u32All);
   }
+
+  const unsigned numInterp = resUsage->inOutUsage.fs.interpInfo.size() - numPrimInterp;
+  SET_REG_FIELD(&config->psRegs, SPI_PS_IN_CONTROL, NUM_INTERP, numInterp);
+  if (gfxIp >= GfxIpVersion{10, 3})
+    SET_REG_GFX10_3_PLUS_FIELD(&config->psRegs, SPI_PS_IN_CONTROL, NUM_PRIM_INTERP, numPrimInterp);
 
   if (pointCoordLoc != InvalidValue) {
     SET_REG_FIELD(&config->psRegs, SPI_INTERP_CONTROL_0, PNT_SPRITE_ENA, true);
@@ -1934,22 +1663,125 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
 // @param [out] config : Register configuration for mesh-shader-specific pipeline
 template <typename T> void ConfigBuilder::buildMeshRegConfig(ShaderStage shaderStage, T *config) {
   assert(shaderStage == ShaderStageMesh);
-  assert(m_pipelineState->getTargetInfo().getGfxIpVersion() >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+
+  const auto gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
+  assert(gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+  (void(gfxIp));                          // Unused
 
   const auto resUsage = m_pipelineState->getShaderResourceUsage(shaderStage);
+  const auto intfData = m_pipelineState->getShaderInterfaceData(shaderStage);
+
+  const auto &builtInUsage = resUsage->builtInUsage.mesh;
+
+  const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
+  const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage.gs.calcFactor;
 
   SET_REG_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, MAX_PRIMGRP_IN_WAVE, 2);
 
   SET_REG_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, PRIMGEN_EN, true);
   SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, PRIMGEN_PASSTHRU_EN, false);
 
-  const unsigned waveSize = m_pipelineState->getShaderWaveSize(ShaderStageMesh);
+  const unsigned waveSize = m_pipelineState->getShaderWaveSize(shaderStage);
   if (waveSize == 32)
     SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, GS_W32_EN, true);
 
   SET_REG_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, ES_EN, ES_STAGE_REAL);
   SET_REG_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, GS_EN, GS_STAGE_ON);
   SET_REG_GFX09_1X_PLUS_FIELD(&config->meshRegs, VGT_SHADER_STAGES_EN, GS_FAST_LAUNCH, true);
+
+  //
+  // Build ES-GS specific configuration
+  //
+  unsigned gsVgprCompCnt = 0;
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, GS_VGPR_COMP_CNT, gsVgprCompCnt);
+
+  unsigned floatMode = setupFloatingPointMode(shaderStage);
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, FLOAT_MODE, floatMode);
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, DX10_CLAMP, true); // Follow PAL setting
+
+  unsigned userDataCount = intfData->userDataCount;
+
+  const auto &shaderOptions = m_pipelineState->getShaderOptions(shaderStage);
+  bool wgpMode = getShaderWgpMode(shaderStage);
+
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, DEBUG_MODE, shaderOptions.debugMode);
+  SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, MEM_ORDERED, true);
+  SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE, wgpMode);
+
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC2_GS, TRAP_PRESENT, shaderOptions.trapPresent);
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC2_GS, USER_SGPR, userDataCount);
+
+  const bool userSgprMsb = (userDataCount > 31);
+  SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC2_GS, USER_SGPR_MSB, userSgprMsb);
+
+  unsigned esVgprCompCnt = 0;
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC2_GS, ES_VGPR_COMP_CNT, esVgprCompCnt);
+
+  const unsigned ldsSizeDwordGranularityShift =
+      m_pipelineState->getTargetInfo().getGpuProperty().ldsSizeDwordGranularityShift;
+  const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
+
+  unsigned ldsSizeInDwords = calcFactor.gsOnChipLdsSize;
+  ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
+
+  const unsigned ldsSize = ldsSizeInDwords >> ldsSizeDwordGranularityShift;
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_RSRC2_GS, LDS_SIZE, ldsSize);
+  setLdsSizeByteSize(Util::Abi::HardwareStage::Gs, ldsSizeInDwords * 4);
+
+  unsigned maxVertOut = std::max(1u, static_cast<unsigned>(meshMode.outputVertices));
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_MAX_VERT_OUT, MAX_VERT_OUT, maxVertOut);
+
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_MODE, MODE, GS_SCENARIO_G);
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_MODE, ONCHIP, VGT_GS_MODE_ONCHIP_OFF);
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_MODE, ES_WRITE_OPTIMIZE, false);
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_MODE, GS_WRITE_OPTIMIZE, true);
+
+  assert(calcFactor.esVertsPerSubgroup == 1 && calcFactor.gsPrimsPerSubgroup == 1);
+  SET_REG_MOST_FIELD(&config->meshRegs, VGT_GS_ONCHIP_CNTL, ES_VERTS_PER_SUBGRP, 1);
+  SET_REG_MOST_FIELD(&config->meshRegs, VGT_GS_ONCHIP_CNTL, GS_PRIMS_PER_SUBGRP, 1);
+  SET_REG_MOST_FIELD(&config->meshRegs, VGT_GS_ONCHIP_CNTL, GS_INST_PRIMS_IN_SUBGRP, 1);
+  setNggSubgroupSize(1);
+
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_PER_VS, GS_PER_VS, GsThreadsPerVsThread);
+
+  VGT_GS_OUTPRIM_TYPE gsOutputPrimitiveType = POINTLIST;
+  switch (meshMode.outputPrimitive) {
+  case OutputPrimitives::Points:
+    gsOutputPrimitiveType = POINTLIST;
+    break;
+  case OutputPrimitives::Lines:
+    gsOutputPrimitiveType = LINESTRIP;
+    break;
+  case OutputPrimitives::Triangles:
+    gsOutputPrimitiveType = TRISTRIP;
+    break;
+  default:
+    llvm_unreachable("Unknown primitive type!");
+    break;
+  }
+  SET_REG_FIELD(&config->meshRegs, VGT_GS_OUT_PRIM_TYPE, OUTPRIM_TYPE, gsOutputPrimitiveType);
+
+  const unsigned maxVertsPerSubgroup = std::min(meshMode.outputVertices, NggMaxThreadsPerSubgroup);
+  SET_REG_FIELD(&config->meshRegs, GE_MAX_OUTPUT_PER_SUBGROUP, MAX_VERTS_PER_SUBGROUP, maxVertsPerSubgroup);
+
+  //
+  // Build VS specific configuration
+  //
+  setupPaSpecificRegisters(&config->meshRegs);
+
+  //
+  // Build NGG specific configuration
+  //
+  assert(calcFactor.primAmpFactor >= 1);
+  SET_REG_FIELD(&config->meshRegs, GE_NGG_SUBGRP_CNTL, PRIM_AMP_FACTOR, calcFactor.primAmpFactor);
+  SET_REG_FIELD(&config->meshRegs, GE_NGG_SUBGRP_CNTL, THDS_PER_SUBGRP, calcFactor.primAmpFactor);
+
+  const bool enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
+  const bool hasPrimitivePayload = builtInUsage.primitiveId || builtInUsage.layer || builtInUsage.viewportIndex ||
+                                   builtInUsage.primitiveShadingRate || enableMultiView;
+  SET_REG_FIELD(&config->meshRegs, SPI_SHADER_IDX_FORMAT, IDX0_EXPORT_FORMAT,
+                hasPrimitivePayload ? SPI_SHADER_2COMP : SPI_SHADER_1COMP);
+  SET_REG_GFX10_PLUS_FIELD(&config->meshRegs, VGT_DRAW_PAYLOAD_CNTL, EN_PRIM_PAYLOAD, hasPrimitivePayload);
 
   setWaveFrontSize(Util::Abi::HardwareStage::Gs, waveSize);
 
@@ -1960,7 +1792,9 @@ template <typename T> void ConfigBuilder::buildMeshRegConfig(ShaderStage shaderS
   if (m_pipelineState->getTargetInfo().getGpuProperty().supportShaderPowerProfiling)
     SET_REG_FIELD(&config->meshRegs, SPI_SHADER_PGM_CHKSUM_GS, CHECKSUM, checksum);
 
+  //
   // Set up IA_MULTI_VGT_PARAM
+  //
   regIA_MULTI_VGT_PARAM iaMultiVgtParam = {};
 
   static constexpr unsigned PrimGroupSize = 128;
@@ -2043,6 +1877,8 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   SET_REG_FIELD(config, COMPUTE_NUM_THREAD_Y, NUM_THREAD_FULL, workgroupSizes[1]);
   SET_REG_FIELD(config, COMPUTE_NUM_THREAD_Z, NUM_THREAD_FULL, workgroupSizes[2]);
 
+  setThreadgroupDimensions(workgroupSizes);
+
   setNumAvailSgprs(Util::Abi::HardwareStage::Cs, resUsage->numSgprsAvailable);
   setNumAvailVgprs(Util::Abi::HardwareStage::Cs, resUsage->numVgprsAvailable);
 
@@ -2105,6 +1941,242 @@ void ConfigBuilder::setupVgtTfParam(LsHsRegConfig *config) {
 
   if (m_pipelineState->isTessOffChip()) {
     SET_REG_FIELD(config, VGT_TF_PARAM, DISTRIBUTION_MODE, TRAPEZOIDS);
+  }
+}
+
+// =====================================================================================================================
+// Set up PA-specific (primitive assembler) registers.
+//
+// @param [out] config : Register configuration
+template <typename T> void ConfigBuilder::setupPaSpecificRegisters(T *config) {
+  const auto &gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
+  (void(gfxIp)); // Unused
+
+  const bool hasTs =
+      m_pipelineState->hasShaderStage(ShaderStageTessControl) || m_pipelineState->hasShaderStage(ShaderStageTessEval);
+  const bool hasGs = m_pipelineState->hasShaderStage(ShaderStageGeometry);
+  const bool meshPipeline =
+      m_pipelineState->hasShaderStage(ShaderStageTask) || m_pipelineState->hasShaderStage(ShaderStageMesh);
+
+  uint8_t usrClipPlaneMask = m_pipelineState->getRasterizerState().usrClipPlaneMask;
+  bool rasterizerDiscardEnable = m_pipelineState->getRasterizerState().rasterizerDiscardEnable;
+
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_0, (usrClipPlaneMask >> 0) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_1, (usrClipPlaneMask >> 1) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_2, (usrClipPlaneMask >> 2) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_3, (usrClipPlaneMask >> 3) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_4, (usrClipPlaneMask >> 4) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, UCP_ENA_5, (usrClipPlaneMask >> 5) & 0x1);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, DX_LINEAR_ATTR_CLIP_ENA, true);
+  SET_REG_FIELD(config, PA_CL_CLIP_CNTL, DX_RASTERIZATION_KILL, rasterizerDiscardEnable);
+
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_X_SCALE_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_X_OFFSET_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_Y_SCALE_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_Y_OFFSET_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_Z_SCALE_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VPORT_Z_OFFSET_ENA, true);
+  SET_REG_FIELD(config, PA_CL_VTE_CNTL, VTX_W0_FMT, true);
+
+  SET_REG_FIELD(config, PA_SU_VTX_CNTL, PIX_CENTER, 1);
+  SET_REG_FIELD(config, PA_SU_VTX_CNTL, ROUND_MODE, 2); // Round to even
+  SET_REG_FIELD(config, PA_SU_VTX_CNTL, QUANT_MODE, 5); // Use 8-bit fractions
+
+  // Stage-specific processing
+  bool usePointSize = false;
+  bool useLayer = false;
+  bool useViewportIndex = false;
+  bool useShadingRate = false;
+  unsigned clipDistanceCount = 0;
+  unsigned cullDistanceCount = 0;
+
+  unsigned expCount = 0;
+  unsigned primExpCount = 0;
+
+  if (meshPipeline) {
+    // Mesh pipeline
+    assert(gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+
+    const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageMesh);
+    const auto &builtInUsage = resUsage->builtInUsage.mesh;
+
+    usePointSize = builtInUsage.pointSize;
+    useLayer = builtInUsage.layer;
+    useViewportIndex = builtInUsage.viewportIndex;
+    useShadingRate = builtInUsage.primitiveShadingRate;
+    clipDistanceCount = builtInUsage.clipDistance;
+    cullDistanceCount = builtInUsage.cullDistance;
+
+    expCount = resUsage->inOutUsage.expCount;
+    primExpCount = resUsage->inOutUsage.primExpCount;
+  } else {
+    bool usePrimitiveId = false;
+
+    if (hasGs) {
+      const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
+      const auto &builtInUsage = resUsage->builtInUsage.gs;
+
+      usePointSize = builtInUsage.pointSize;
+      usePrimitiveId = builtInUsage.primitiveIdIn;
+      useLayer = builtInUsage.layer;
+      useViewportIndex = builtInUsage.viewportIndex;
+      useShadingRate = builtInUsage.primitiveShadingRate;
+      clipDistanceCount = builtInUsage.clipDistance;
+      cullDistanceCount = builtInUsage.cullDistance;
+
+      expCount = resUsage->inOutUsage.expCount;
+
+      // NOTE: For ES-GS merged shader, the actual use of primitive ID should take both ES and GS into consideration.
+      if (hasTs) {
+        const auto &tesBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval)->builtInUsage.tes;
+        usePrimitiveId = usePrimitiveId || tesBuiltInUsage.primitiveId;
+      } else {
+        const auto &vsBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex)->builtInUsage.vs;
+        usePrimitiveId = usePrimitiveId || vsBuiltInUsage.primitiveId;
+      }
+    } else if (hasTs) {
+      const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval);
+      const auto &builtInUsage = resUsage->builtInUsage.tes;
+
+      usePointSize = builtInUsage.pointSize;
+      useLayer = builtInUsage.layer;
+      useViewportIndex = builtInUsage.viewportIndex;
+      clipDistanceCount = builtInUsage.clipDistance;
+      cullDistanceCount = builtInUsage.cullDistance;
+
+      expCount = resUsage->inOutUsage.expCount;
+    } else {
+      const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex);
+      const auto &builtInUsage = resUsage->builtInUsage.vs;
+
+      usePointSize = builtInUsage.pointSize;
+      usePrimitiveId = builtInUsage.primitiveId;
+      useLayer = builtInUsage.layer;
+      useViewportIndex = builtInUsage.viewportIndex;
+      useShadingRate = builtInUsage.primitiveShadingRate;
+      clipDistanceCount = builtInUsage.clipDistance;
+      cullDistanceCount = builtInUsage.cullDistance;
+
+      expCount = resUsage->inOutUsage.expCount;
+    }
+
+    useLayer = useLayer || m_pipelineState->getInputAssemblyState().enableMultiView;
+
+    if (usePrimitiveId) {
+      SET_REG_FIELD(config, VGT_PRIMITIVEID_EN, PRIMITIVEID_EN, true);
+
+      if (m_pipelineState->getNggControl()->enableNgg) {
+        // NOTE: If primitive ID is used and there is no GS present, the field NGG_DISABLE_PROVOK_REUSE must be
+        // set to ensure provoking vertex reuse is disabled in the GE.
+        if (!m_hasGs) {
+          SET_REG_FIELD(config, VGT_PRIMITIVEID_EN, NGG_DISABLE_PROVOK_REUSE, true);
+        }
+      }
+    }
+  }
+
+  if (expCount == 0 && primExpCount == 0) {
+    // No generic output is present
+    SET_REG_GFX10_PLUS_FIELD(config, SPI_VS_OUT_CONFIG, NO_PC_EXPORT, true);
+  } else {
+    if (expCount > 0)
+      SET_REG_FIELD(config, SPI_VS_OUT_CONFIG, VS_EXPORT_COUNT, expCount - 1);
+
+    if (primExpCount > 0) {
+      assert(gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+      SET_REG_GFX10_3_PLUS_FIELD(config, SPI_VS_OUT_CONFIG, PRIM_EXPORT_COUNT, primExpCount);
+    }
+  }
+
+  setUsesViewportArrayIndex(useViewportIndex);
+
+  bool disableVertexReuse = m_pipelineState->getInputAssemblyState().disableVertexReuse;
+  disableVertexReuse |= meshPipeline; // Mesh pipeline always disable vertex reuse
+
+  // According to the IA_VGT_Spec, it is only legal to enable vertex reuse when we're using viewport array
+  // index if each GS, TES, or VS invocation emits the same viewport array index for each vertex and we set
+  // VTE_VPORT_PROVOKE_DISABLE.
+  if (useViewportIndex) {
+    // TODO: In the future, we can only disable vertex reuse only if viewport array index is emitted divergently
+    // for each vertex.
+    disableVertexReuse = true;
+    SET_REG_FIELD(config, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, true);
+  } else {
+    SET_REG_FIELD(config, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE, false);
+  }
+
+  SET_REG_FIELD(config, VGT_REUSE_OFF, REUSE_OFF, disableVertexReuse);
+
+  bool miscExport = usePointSize;
+  if (!meshPipeline) {
+    // NOTE: Those built-ins are exported through primitive payload for mesh pipeline rather than vertex position data.
+    miscExport |= useLayer || useViewportIndex || useShadingRate;
+  }
+
+  if (miscExport) {
+    SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, USE_VTX_POINT_SIZE, usePointSize);
+
+    if (meshPipeline) {
+      if (useShadingRate) {
+        assert(gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+        SET_REG_GFX10_3_PLUS_FIELD(config, PA_CL_VS_OUT_CNTL, BYPASS_VTX_RATE_COMBINER, true);
+      }
+    } else {
+      // NOTE: Those built-ins are exported through primitive payload for mesh pipeline rather than vertex position
+      // data.
+      SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, USE_VTX_RENDER_TARGET_INDX, useLayer);
+      SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, USE_VTX_VIEWPORT_INDX, useViewportIndex);
+
+      if (useShadingRate) {
+        assert(gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
+        SET_REG_GFX10_3_PLUS_FIELD(config, PA_CL_VS_OUT_CNTL, USE_VTX_VRS_RATE, true);
+        SET_REG_GFX10_3_PLUS_FIELD(config, PA_CL_VS_OUT_CNTL, BYPASS_PRIM_RATE_COMBINER, true);
+      }
+    }
+
+    SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_VEC_ENA, true);
+    SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_SIDE_BUS_ENA, true);
+  }
+
+  if (clipDistanceCount > 0 || cullDistanceCount > 0) {
+    SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST0_VEC_ENA, true);
+    if (clipDistanceCount + cullDistanceCount > 4) {
+      SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, VS_OUT_CCDIST1_VEC_ENA, true);
+    }
+
+    unsigned clipDistanceMask = (1 << clipDistanceCount) - 1;
+    unsigned cullDistanceMask = (1 << cullDistanceCount) - 1;
+
+    // Set fields CLIP_DIST_ENA_0 ~ CLIP_DIST_ENA_7 and CULL_DIST_ENA_0 ~ CULL_DIST_ENA_7
+    unsigned paClVsOutCntl = GET_REG(config, PA_CL_VS_OUT_CNTL);
+    paClVsOutCntl |= clipDistanceMask;
+    paClVsOutCntl |= (cullDistanceMask << 8);
+    SET_REG(config, PA_CL_VS_OUT_CNTL, paClVsOutCntl);
+
+    // On 10.3+ all auxiliary position exports are optimized, not just the misc exports.
+    if (gfxIp >= GfxIpVersion{10, 3})
+      SET_REG_FIELD(config, PA_CL_VS_OUT_CNTL, VS_OUT_MISC_SIDE_BUS_ENA, true);
+  }
+
+  unsigned posCount = 1; // gl_Position is always exported
+  if (miscExport)
+    ++posCount;
+
+  if (clipDistanceCount + cullDistanceCount > 0) {
+    ++posCount;
+    if (clipDistanceCount + cullDistanceCount > 4)
+      ++posCount;
+  }
+
+  SET_REG_FIELD(config, SPI_SHADER_POS_FORMAT, POS0_EXPORT_FORMAT, SPI_SHADER_4COMP);
+  if (posCount > 1) {
+    SET_REG_FIELD(config, SPI_SHADER_POS_FORMAT, POS1_EXPORT_FORMAT, SPI_SHADER_4COMP);
+  }
+  if (posCount > 2) {
+    SET_REG_FIELD(config, SPI_SHADER_POS_FORMAT, POS2_EXPORT_FORMAT, SPI_SHADER_4COMP);
+  }
+  if (posCount > 3) {
+    SET_REG_FIELD(config, SPI_SHADER_POS_FORMAT, POS3_EXPORT_FORMAT, SPI_SHADER_4COMP);
   }
 }
 

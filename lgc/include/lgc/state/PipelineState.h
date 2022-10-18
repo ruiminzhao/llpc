@@ -74,6 +74,9 @@ inline static void initializeStatePasses(llvm::PassRegistry &passRegistry) {
   initializeLegacyPipelineStateWrapperPass(passRegistry);
 }
 
+// Resource node type used to ask to find any buffer node, whether constant or not.
+static constexpr ResourceNodeType DescriptorAnyBuffer = ResourceNodeType::Count;
+
 // =====================================================================================================================
 // Represents NGG (implicit primitive shader) control settings (valid for GFX10+)
 
@@ -119,7 +122,7 @@ struct NggControl {
 // The middle-end implementation of PipelineState, a subclass of Pipeline.
 class PipelineState final : public Pipeline {
 public:
-  PipelineState(LgcContext *builderContext, bool emitLgc = false) : Pipeline(builderContext), m_emitLgc(emitLgc) {}
+  PipelineState(LgcContext *builderContext, bool emitLgc = false);
 
   ~PipelineState() override final;
 
@@ -252,10 +255,6 @@ public:
   // Find the single root resource node of the given type
   const ResourceNode *findSingleRootResourceNode(ResourceNodeType nodeType) const;
 
-  // Set "no replayer" flag, saying that this pipeline is being compiled with a BuilderImpl so does not
-  // need a BuilderReplayer pass.
-  void setNoReplayer() { m_noReplayer = true; }
-
   // Accessors for vertex input descriptions.
   llvm::ArrayRef<VertexInputDescription> getVertexInputDescriptions() const { return m_vertexInputDescriptions; }
   const VertexInputDescription *findVertexInputDescription(unsigned location) const;
@@ -301,6 +300,12 @@ public:
 
   // Get NGG control settings
   NggControl *getNggControl() { return &m_nggControl; }
+
+  // Checks if SW-emulated mesh pipeline statistics is needed
+  bool needSwMeshPipelineStats() const;
+
+  // Checks if row export for mesh shader is enabled or not
+  bool enableMeshRowExport() const;
 
   // Gets resource usage of the specified shader stage
   ResourceUsage *getShaderResourceUsage(ShaderStage shaderStage);
@@ -474,9 +479,8 @@ private:
   void recordGraphicsState(llvm::Module *module);
   void readGraphicsState(llvm::Module *module);
 
-  std::string m_lastError;                              // Error to be reported by getLastError()
-  bool m_noReplayer = false;                            // True if no BuilderReplayer needed
-  bool m_emitLgc = false;                               // Whether -emit-lgc is on
+  std::string m_lastError;   // Error to be reported by getLastError()
+  bool m_emitLgc = false;    // Whether -emit-lgc is on
   // Whether generating pipeline or unlinked part-pipeline
   PipelineLink m_pipelineLink = PipelineLink::WholePipeline;
   unsigned m_stageMask = 0;                             // Mask of active shader stages
@@ -493,6 +497,7 @@ private:
   llvm::SmallVector<std::unique_ptr<uint32_t[]>, 4> m_immutableValueAllocs;
 
   bool m_gsOnChip = false;                                                     // Whether to use GS on-chip mode
+  bool m_meshRowExport = false;                                                // Enable mesh shader row export or not
   NggControl m_nggControl = {};                                                // NGG control settings
   ShaderModes m_shaderModes;                                                   // Shader modes for this pipeline
   unsigned m_deviceIndex = 0;                                                  // Device index
@@ -559,7 +564,7 @@ public:
   static char ID; // ID of this pass
 
 private:
-  LgcContext *m_builderContext = nullptr;              // LgcContext for allocating PipelineState
+  LgcContext *m_builderContext = nullptr;                  // LgcContext for allocating PipelineState
   PipelineState *m_pipelineState = nullptr;                // Cached pipeline state
   std::unique_ptr<PipelineState> m_allocatedPipelineState; // Pipeline state allocated by this pass
 };

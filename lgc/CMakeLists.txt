@@ -53,9 +53,6 @@ add_llvm_library(LLVMlgc LINK_COMPONENTS
 
 ### Cached Project Options #############################################################################################
 option(LLPC_BUILD_NAVI12 "LLPC support for NAVI12?" OFF)
-option(LLPC_BUILD_NAVI22 "LLPC support for NAVI22?" OFF)
-option(LLPC_BUILD_NAVI23 "LLPC support for NAVI23?" OFF)
-option(LLPC_BUILD_NAVI24 "LLPC support for NAVI24?" OFF)
 option(LLPC_ENABLE_WERROR "Build LLPC with more errors" OFF)
 
 ### Compiler Options ###################################################################################################
@@ -71,6 +68,9 @@ target_compile_definitions(LLVMlgc PRIVATE
         LITTLEENDIAN_CPU
         CHIP_HDR_NAVI14
         CHIP_HDR_NAVI21
+        CHIP_HDR_NAVI22
+        CHIP_HDR_NAVI23
+        CHIP_HDR_NAVI24
         )
 
 target_compile_definitions(LLVMlgc PRIVATE CHIP_HDR_RENOIR)
@@ -79,24 +79,6 @@ target_compile_definitions(LLVMlgc PRIVATE CHIP_HDR_RENOIR)
     target_compile_definitions(LLVMlgc PRIVATE
         LLPC_BUILD_NAVI12
         CHIP_HDR_NAVI12
-    )
-  endif()
-  if(LLPC_BUILD_NAVI22)
-    target_compile_definitions(LLVMlgc PRIVATE
-        LLPC_BUILD_NAVI22
-        CHIP_HDR_NAVI22
-    )
-  endif()
-  if(LLPC_BUILD_NAVI23)
-    target_compile_definitions(LLVMlgc PRIVATE
-        LLPC_BUILD_NAVI23
-        CHIP_HDR_NAVI23
-    )
-  endif()
-  if(LLPC_BUILD_NAVI24)
-    target_compile_definitions(LLVMlgc PRIVATE
-        LLPC_BUILD_NAVI24
-        CHIP_HDR_NAVI24
     )
   endif()
 
@@ -116,6 +98,12 @@ PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/imported
 )
+
+#if VKI_RAY_TRACING
+if(VKI_RAY_TRACING)
+  target_compile_definitions(LLVMlgc PRIVATE VKI_RAY_TRACING=1)
+endif()
+#endif
 
 # lgc/builder
 target_sources(LLVMlgc PRIVATE
@@ -161,7 +149,9 @@ target_sources(LLVMlgc PRIVATE
     patch/PatchCheckShaderCache.cpp
     patch/PatchCopyShader.cpp
     patch/PatchEntryPointMutate.cpp
+    patch/PatchImageDerivatives.cpp
     patch/PatchInOutImportExport.cpp
+    patch/PatchInvariantLoads.cpp
     patch/PatchLlvmIrInclusion.cpp
     patch/PatchLoadScalarizer.cpp
     patch/PatchLoopMetadata.cpp
@@ -208,4 +198,7 @@ target_sources(LLVMlgc PRIVATE
 add_subdirectory(disassembler)
 add_subdirectory(tool/lgc)
 add_subdirectory(test)
-add_subdirectory(unittests)
+
+if (LLPC_BUILD_TESTS)
+  add_subdirectory(unittests)
+endif()

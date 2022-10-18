@@ -88,8 +88,13 @@ struct CompileInfo {
   Llpc::GraphicsPipelineBuildOut gfxPipelineOut;                             // Output of building graphics pipeline
   Llpc::ComputePipelineBuildInfo compPipelineInfo;                           // Info to build compute pipeline
   Llpc::ComputePipelineBuildOut compPipelineOut;                             // Output of building compute pipeline
-  void *pipelineBuf;                                                         // Allocation buffer of building pipeline
-  void *pipelineInfoFile;                                                    // VFX-style file containing pipeline info
+#if VKI_RAY_TRACING
+  RayTracingPipelineBuildInfo rayTracePipelineInfo; // Info to build ray tracing pipeline
+  RayTracingPipelineBuildOut rayTracingPipelineOut; // Output of building ray tracing pipeline
+  unsigned bvhNodeStride;
+#endif
+  void *pipelineBuf;              // Allocation buffer of building pipeline
+  void *pipelineInfoFile;         // VFX-style file containing pipeline info
   bool unlinked;                  // Whether to generate unlinked shader/part-pipeline ELF
   bool relocatableShaderElf;      // Whether to enable relocatable shader compilation
   bool scalarBlockLayout;         // Whether to enable scalar block layout
@@ -99,6 +104,9 @@ struct CompileInfo {
   bool scratchAccessBoundsChecks; // Whether to enable scratch access bounds checks
   VfxPipelineType pipelineType;   // Pipeline type
   llvm::Optional<llvm::CodeGenOpt::Level> optimizationLevel; // The optimization level to pass the compiler
+#if VKI_RAY_TRACING
+  bool internalRtShaders; // Whether to enable intrinsics for internal RT shaders
+#endif
 };
 
 // Callback function to allocate buffer for building shader module and building pipeline.

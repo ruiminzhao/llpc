@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -24,35 +24,51 @@
  **********************************************************************************************************************/
 /**
 ***********************************************************************************************************************
-* @file  vfxRenderDocument.h
-* @brief Contains declaration of class RenderDocument
+* @file  gpurt.h
+* @brief Main header for the GPU raytracing shared code component
 ***********************************************************************************************************************
 */
 
-#include "vfxParser.h"
+#pragma once
 
-namespace Vfx {
+#include "gpurt/gpurtLib.h"
+#define MAKE_GPURT_VERSION(MAJOR, MINOR) ((MAJOR << 16) | MINOR)
 
-extern void initRenderSections();
+namespace GpuRt {
 
-// =====================================================================================================================
-// Represents the render state result of Vfx parser
-class RenderDocument : public Document {
-public:
-  RenderDocument() {
-    initRenderSections();
-    memset(&m_renderState, 0, sizeof(m_renderState));
-  };
+#pragma pack(push, 4)
+struct DispatchRaysInfoData {
+  uint64_t rayGenerationTable; ///< Shader record table for raygeneration shaders
+  unsigned rayDispatchWidth;   ///< Width of the ray dispatch
+  unsigned rayDispatchHeight;  ///< Height of the ray dispatch
+  unsigned rayDispatchDepth;   ///< Depth of the ray dispatch
 
-  virtual unsigned getMaxSectionCount(SectionType type);
+  struct {
+    uint64_t baseAddress;
+    unsigned strideInBytes;
+  } missTable; ///< Miss shader record table
 
-  virtual VfxRenderStatePtr getDocument();
-  bool getPtrOfSubSection(Section *section, unsigned lineNum, const char *memberName, MemberType memberType,
-                          bool isWriteAccess, unsigned arrayIndex, Section **ptrOut, std::string *errorMsg);
-  Section *createSection(const char *sectionName);
+  unsigned maxRecursionDepth; ///< Maximum recursion depth
 
-private:
-  VfxRenderState m_renderState; // Contains the render state
+  struct {
+    uint64_t baseAddress;
+    unsigned strideInBytes;
+  } hitGroupTable; ///< Hit group shader record table
+
+  unsigned maxAttributeSize; ///< Maximum attribute size
+
+  struct {
+    uint64_t baseAddress;
+    unsigned strideInBytes;
+  } callableTable; ///< Callable shader table record
+
+  struct {
+    unsigned rayFlags;      ///< Ray flags applied when profiling is enabled
+    unsigned maxIterations; ///< Maximum trace ray loop iteration limit
+  } profile;
+
+  uint64_t traceRayGpuVa; ///< Internal TraceRays indirect function GPU VA
 };
+#pragma pack(pop)
 
-} // namespace Vfx
+}; // namespace GpuRt

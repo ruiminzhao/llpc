@@ -128,6 +128,10 @@ cl::opt<bool> ValidateSpirv("validate-spirv", cl::desc("Validate input SPIR-V bi
 cl::opt<bool> IgnoreColorAttachmentFormats("ignore-color-attachment-formats",
                                            cl::desc("Ignore color attachment formats"), cl::init(false));
 
+#if VKI_RAY_TRACING
+cl::opt<unsigned> BvhNodeStride("bvh-node-stride", cl::desc("Ray tracing BVH node stride"), cl::init(64u));
+#endif
+
 // -num-threads: number of CPU threads to use when compiling the inputs
 cl::opt<unsigned> NumThreads("num-threads",
                              cl::desc("Number of CPU threads to use when compiling the inputs:\n"
@@ -243,6 +247,7 @@ cl::opt<ThreadGroupSwizzleMode> ThreadGroupSwizzleModeSetting("thread-group-swiz
                                                                      clEnumValN(ThreadGroupSwizzleMode::_4x4, "4x4", "tile size is 4x4 in x and y dimension"),
                                                                      clEnumValN(ThreadGroupSwizzleMode::_8x8, "8x8", "tile size is 8x8 in x and y dimension"),
                                                                      clEnumValN(ThreadGroupSwizzleMode::_16x16, "16x16", "tile size is 16x16   in x and y dimension")));
+
 // -override-threadGroupSizeX
 cl::opt<unsigned> OverrideThreadGroupSizeX("override-threadGroupSizeX",
                                               cl::desc("override threadGroupSize X\n"
@@ -265,6 +270,9 @@ cl::opt<unsigned> OverrideThreadGroupSizeZ("override-threadGroupSizeZ",
                                                        "0x00 - No override\n"
                                                        "0x01 - Override threadGroupSizeZ with Value:1 in wave32 or wave64\n"),
                                               cl::init(0));
+
+// -reverse-thread-group
+cl::opt<bool> ReverseThreadGroup("reverse-thread-group", cl::desc("Reverse thread group ID\n"), cl::init(false));
 
 // -filter-pipeline-dump-by-type: filter which kinds of pipeline should be disabled.
 cl::opt<unsigned> FilterPipelineDumpByType("filter-pipeline-dump-by-type",
@@ -306,6 +314,13 @@ cl::opt<ResourceLayoutScheme> LayoutScheme("resource-layout-scheme", cl::desc("T
 #ifdef WIN_OS
 // -assert-to-msgbox: pop message box when an assert is hit, only valid in Windows
 cl::opt<bool> AssertToMsgBox("assert-to-msgbox", cl::desc("Pop message box when assert is hit"));
+#endif
+
+#if VKI_RAY_TRACING
+// -enable-internal-rt-shaders: enable intrinsics for internal RT shaders
+cl::opt<bool> EnableInternalRtShaders("enable-internal-rt-shaders",
+                                      cl::desc("Enable intrinsics for internal RT shaders"),
+                                      cl::init(false));
 #endif
 
 } // namespace
@@ -452,6 +467,9 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
   compileInfo->robustBufferAccess = RobustBufferAccess;
   compileInfo->scalarBlockLayout = ScalarBlockLayout;
   compileInfo->scratchAccessBoundsChecks = EnableScratchAccessBoundsChecks;
+#if VKI_RAY_TRACING
+  compileInfo->bvhNodeStride = BvhNodeStride;
+#endif
 
   if (LlpcOptLevel.getPosition() != 0) {
     compileInfo->optimizationLevel = LlpcOptLevel;
@@ -468,6 +486,7 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
   compileInfo->compPipelineInfo.options.overrideThreadGroupSizeY = OverrideThreadGroupSizeY;
   compileInfo->compPipelineInfo.options.overrideThreadGroupSizeZ = OverrideThreadGroupSizeZ;
   compileInfo->compPipelineInfo.options.threadGroupSwizzleMode = ThreadGroupSwizzleModeSetting;
+  compileInfo->compPipelineInfo.options.reverseThreadGroup = ReverseThreadGroup;
 
   // Set NGG control settings
   if (ParsedGfxIp.major >= 10) {
@@ -490,6 +509,10 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
     nggState.primsPerSubgroup = NggPrimsPerSubgroup;
     nggState.vertsPerSubgroup = NggVertsPerSubgroup;
   }
+
+#if VKI_RAY_TRACING
+  compileInfo->internalRtShaders = EnableInternalRtShaders;
+#endif
 
   return Result::Success;
 }
@@ -521,6 +544,10 @@ static Error processInputs(ICompiler *compiler, InputSpecGroup &inputSpecs) {
       return err;
     compileInfo.pipelineType =
         isComputePipeline(compileInfo.stageMask) ? VfxPipelineTypeCompute : VfxPipelineTypeGraphics;
+#if VKI_RAY_TRACING
+    if (isRayTracingPipeline(compileInfo.stageMask))
+      compileInfo.pipelineType = VfxPipelineTypeRayTracing;
+#endif
   }
 
   //

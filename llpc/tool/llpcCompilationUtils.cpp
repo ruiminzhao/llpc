@@ -66,6 +66,8 @@
 #include "llpcSpirvLowerUtil.h"
 #include "llpcThreading.h"
 #include "llpcUtil.h"
+#include "spvgen.h"
+#include "vfx.h"
 #include "vkgcElfReader.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/AsmParser/Parser.h"
@@ -74,9 +76,6 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
-
-#include "spvgen.h"
-#include "vfx.h"
 #include <cassert>
 #include <mutex>
 
@@ -142,6 +141,20 @@ static ShaderStage sourceLangToShaderStage(SpvGenStage sourceLang) {
     return ShaderStage::ShaderStageFragment;
   case SpvGenStageCompute:
     return ShaderStage::ShaderStageCompute;
+#if VKI_RAY_TRACING
+  case SpvGenStageRayTracingRayGen:
+    return ShaderStage::ShaderStageRayTracingRayGen;
+  case SpvGenStageRayTracingIntersect:
+    return ShaderStage::ShaderStageRayTracingIntersect;
+  case SpvGenStageRayTracingAnyHit:
+    return ShaderStage::ShaderStageRayTracingAnyHit;
+  case SpvGenStageRayTracingClosestHit:
+    return ShaderStage::ShaderStageRayTracingClosestHit;
+  case SpvGenStageRayTracingMiss:
+    return ShaderStage::ShaderStageRayTracingMiss;
+  case SpvGenStageRayTracingCallable:
+    return ShaderStage::ShaderStageRayTracingCallable;
+#endif
   default:
     llvm_unreachable("Unexpected shading language type!");
     return ShaderStage::ShaderStageInvalid;
@@ -295,7 +308,7 @@ Expected<BinaryData> assembleSpirv(const std::string &inFilename) {
 // @param [in/out] compileInfo : Compilation info of LLPC standalone tool
 // @returns : Always returns Result::Success
 Result decodePipelineBinary(const BinaryData *pipelineBin, CompileInfo *compileInfo) {
-  // Ignore failure from ElfReader. It fails if pPipelineBin is not ELF, as happens with
+  // Ignore failure from ElfReader. It fails if pipelineBin is not ELF, as happens with
   // -filetype=asm.
   ElfReader<Elf64> reader(compileInfo->gfxIp);
   size_t readSize = 0;
@@ -368,6 +381,9 @@ Error processInputPipeline(ICompiler *compiler, CompileInfo &compileInfo, const 
 
   compileInfo.compPipelineInfo = pipelineState->compPipelineInfo;
   compileInfo.gfxPipelineInfo = pipelineState->gfxPipelineInfo;
+#if VKI_RAY_TRACING
+  compileInfo.rayTracePipelineInfo = pipelineState->rayPipelineInfo;
+#endif
   compileInfo.pipelineType = pipelineState->pipelineType;
 
   if (ignoreColorAttachmentFormats) {
@@ -397,6 +413,21 @@ Error processInputPipeline(ICompiler *compiler, CompileInfo &compileInfo, const 
                          Twine(getShaderStageName(pipelineState->stages[stage].stage)) + " shader module");
     }
   }
+#if VKI_RAY_TRACING
+  const BinaryData *shaderLibrary = nullptr;
+  if (pipelineState->pipelineType == VfxPipelineTypeRayTracing)
+    shaderLibrary = &pipelineState->rayPipelineInfo.shaderTraceRay;
+  else if (pipelineState->pipelineType == VfxPipelineTypeCompute)
+    shaderLibrary = &pipelineState->compPipelineInfo.shaderLibrary;
+#endif
+#if VKI_RAY_TRACING
+  else {
+    assert(pipelineState->pipelineType == VfxPipelineTypeGraphics);
+    shaderLibrary = &pipelineState->gfxPipelineInfo.shaderLibrary;
+  }
+  if (shaderLibrary->codeSize > 0 && EnableOuts())
+    disassembleSpirv(shaderLibrary->codeSize, shaderLibrary->pCode, "Ray tracing library");
+#endif
 
   const bool isGraphics = compileInfo.pipelineType == VfxPipelineTypeGraphics;
   assert(!(isGraphics && isComputePipeline(compileInfo.stageMask)) && "Bad stage mask");

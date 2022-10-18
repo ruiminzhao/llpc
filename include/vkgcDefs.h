@@ -44,10 +44,10 @@
 #endif
 
 /// LLPC major interface version.
-#define LLPC_INTERFACE_MAJOR_VERSION 54
+#define LLPC_INTERFACE_MAJOR_VERSION 55
 
 /// LLPC minor interface version.
-#define LLPC_INTERFACE_MINOR_VERSION 3
+#define LLPC_INTERFACE_MINOR_VERSION 2
 
 #ifndef LLPC_CLIENT_INTERFACE_MAJOR_VERSION
 #error LLPC client version is not defined
@@ -81,7 +81,16 @@
 //  @page VersionHistory
 //  %Version History
 //  | %Version | Change Description                                                                                    |
-//  | -------- | ------------------------------------------------------------------------------------------------------|
+//  | -------- | ----------------------------------------------------------------------------------------------------- |
+//  |     55.2 | Add aggressiveInvariantLoads and disableInvariantLoads to PipelineShaderOptions                       |
+//  |     55.1 | Add nsaThreshold to PipelineShaderOptions                                                             |
+//  |     55.0 | Remove isInternalRtShader from module options                                                         |
+//  |     54.9 | Add internalRtShaders to PipelineOptions to allow for dumping this data                               |
+//  |     54.6 | Add reverseThreadGroup to PipelineOptions                                                             |
+//  |     54.5 | Add forceLateZ to PipelineShaderOptions                                                               |
+#if VKI_RAY_TRACING
+//  |     54.4 | Add isReplay to RayTracingPipelineBuildInfo for ray tracing capture replay feature                    |
+#endif
 //  |     54.3 | Add usePointSize to ShaderModuleUsage                                                                 |
 //  |     54.2 | Add subgroupSize to PipelineShaderOptions                                                             |
 //  |     54.1 | Add overrideForceThreadIdSwizzling overrideShaderThreadGroupSizeX, overrideShaderThreadGroupSizeY     |
@@ -165,6 +174,10 @@ static const unsigned InternalDescriptorSetId = static_cast<unsigned>(-1);
 static const unsigned MaxVertexAttribs = 64;
 static const unsigned MaxColorTargets = 8;
 static const unsigned FetchShaderInternalBufferBinding = 5;
+static const unsigned ReverseThreadGroupControlBinding = 7;
+#if VKI_RAY_TRACING
+static const unsigned RtCaptureReplayInternalBufferBinding = 8;
+#endif
 static const unsigned MaxFetchShaderInternalBufferSize = 16 * MaxVertexAttribs;
 
 // Forward declarations
@@ -216,12 +229,20 @@ enum class BasicType : unsigned {
 
 /// Enumerates LLPC shader stages.
 enum ShaderStage : unsigned {
-  ShaderStageVertex = 0,                                ///< Vertex shader
-  ShaderStageTessControl,                               ///< Tessellation control shader
-  ShaderStageTessEval,                                  ///< Tessellation evaluation shader
-  ShaderStageGeometry,                                  ///< Geometry shader
-  ShaderStageFragment,                                  ///< Fragment shader
-  ShaderStageCompute,                                   ///< Compute shader
+  ShaderStageVertex = 0,  ///< Vertex shader
+  ShaderStageTessControl, ///< Tessellation control shader
+  ShaderStageTessEval,    ///< Tessellation evaluation shader
+  ShaderStageGeometry,    ///< Geometry shader
+  ShaderStageFragment,    ///< Fragment shader
+  ShaderStageCompute,     ///< Compute shader
+#if VKI_RAY_TRACING
+  ShaderStageRayTracingRayGen,     ///< Ray generation shader (for ray tracing)
+  ShaderStageRayTracingIntersect,  ///< Intersection shader (for ray tracing)
+  ShaderStageRayTracingAnyHit,     ///< Any-Hit shader (for ray tracing)
+  ShaderStageRayTracingClosestHit, ///< Closest Hit shader (for ray tracing)
+  ShaderStageRayTracingMiss,       ///< Miss shader (for ray tracing)
+  ShaderStageRayTracingCallable,   ///< Callable shader (for ray tracing)
+#endif
   ShaderStageCount,                                     ///< Count of shader stages
   ShaderStageInvalid = ~0u,                             ///< Invalid shader stage
   ShaderStageNativeStageCount = ShaderStageCompute + 1, ///< Native supported shader stage count
@@ -239,8 +260,22 @@ enum ShaderStageBit : unsigned {
   ShaderStageGeometryBit = (1 << ShaderStageGeometry),       ///< Geometry shader bit
   ShaderStageFragmentBit = (1 << ShaderStageFragment),       ///< Fragment shader bit
   ShaderStageComputeBit = (1 << ShaderStageCompute),         ///< Compute shader bit
+#if VKI_RAY_TRACING
+  ShaderStageRayTracingRayGenBit = (1 << ShaderStageRayTracingRayGen),         ///< Ray generation shader bit
+  ShaderStageRayTracingIntersectBit = (1 << ShaderStageRayTracingIntersect),   ///< Intersection shader bit
+  ShaderStageRayTracingAnyHitBit = (1 << ShaderStageRayTracingAnyHit),         ///< Any-Hit shader bit
+  ShaderStageRayTracingClosestHitBit = (1 << ShaderStageRayTracingClosestHit), ///< Closest Hit shader bit
+  ShaderStageRayTracingMissBit = (1 << ShaderStageRayTracingMiss),             ///< Miss shader bit
+  ShaderStageRayTracingCallableBit = (1 << ShaderStageRayTracingCallable),     ///< Callable shader bit
+#endif
   ShaderStageAllGraphicsBit = ShaderStageVertexBit | ShaderStageTessControlBit | ShaderStageTessEvalBit |
                               ShaderStageGeometryBit | ShaderStageFragmentBit, ///< All graphics bits
+#if VKI_RAY_TRACING
+  ShaderStageAllRayTracingBit = ShaderStageRayTracingRayGenBit | ShaderStageRayTracingIntersectBit |
+                                ShaderStageRayTracingAnyHitBit | ShaderStageRayTracingClosestHitBit |
+                                ShaderStageRayTracingMissBit |
+                                ShaderStageRayTracingCallableBit, ///< All ray tracing bits
+#endif
 };
 
 /// Enumerates LLPC types of unlinked shader elf.
@@ -248,11 +283,19 @@ enum UnlinkedShaderStage : unsigned {
   UnlinkedStageVertexProcess,
   UnlinkedStageFragment,
   UnlinkedStageCompute,
+#if VKI_RAY_TRACING
+  UnlinkedStageRayTracing,
+#endif
   UnlinkedStageCount
 };
 
+#if VKI_RAY_TRACING
+static_assert((1 << (ShaderStageCount - 1)) == ShaderStageRayTracingCallableBit,
+              "Vkgc::ShaderStage has been updated. Please update Vkgc::ShaderStageBit as well.");
+#else
 static_assert((1 << (ShaderStageCount - 1)) == ShaderStageComputeBit,
               "Vkgc::ShaderStage has been updated. Please update Vkgc::ShaderStageBit as well.");
+#endif
 
 /// Enumerates the function of a particular node in a shader's resource mapping graph.
 enum class ResourceMappingNodeType : unsigned {
@@ -275,12 +318,7 @@ enum class ResourceMappingNodeType : unsigned {
   DescriptorConstBufferCompact, ///< Generic descriptor: constBuffer,including dynamic storage buffer
   DescriptorImage,              ///< Generic descriptor: storageImage, including image, input attachment
   DescriptorConstTexelBuffer,   ///< Generic descriptor: constTexelBuffer, including uniform texel buffer
-                                // clang-format off
-#if  (LLPC_CLIENT_INTERFACE_MAJOR_VERSION>= 50)
   InlineBuffer,                 ///< Push constant with binding
-                                // clang-format on
-#endif
-
   Count, ///< Count of resource mapping node types.
 };
 
@@ -307,6 +345,7 @@ struct ResourceMappingNode {
       unsigned binding; ///< Descriptor binding
       unsigned reserv0;
       unsigned reserv1;
+      unsigned reserv2;
     } srdRange;
     /// Info for hierarchical nodes (DescriptorTableVaPtr)
     struct {
@@ -333,9 +372,10 @@ struct StaticDescriptorValue {
   unsigned binding;             ///< ID of descriptor binding
   unsigned reserv0;
   unsigned reserv1;
-  unsigned arraySize;           ///< Element count for arrayed binding
-  const unsigned *pValue;       ///< Static SRDs
-  unsigned visibility;          ///< Mask composed of ShaderStageBit values
+  unsigned reserv2;
+  unsigned arraySize;     ///< Element count for arrayed binding
+  const unsigned *pValue; ///< Static SRDs
+  unsigned visibility;    ///< Mask composed of ShaderStageBit values
 };
 
 /// Represents the resource mapping data provided during pipeline creation
@@ -431,7 +471,11 @@ struct PipelineOptions {
   unsigned shadowDescriptorTablePtrHigh;                 ///< Sets high part of VA ptr for shadow descriptor table.
   ExtendedRobustness extendedRobustness;                 ///< ExtendedRobustness is intended to correspond to the
                                                          ///  features of VK_EXT_robustness2.
-  bool reserved1f;                                       /// Reserved for future functionality
+#if VKI_RAY_TRACING
+  bool enableRayQuery;  ///< If set, ray query is enabled
+  float rtMaxRayLength; ///< Overrides the rayTMax value
+#endif
+  bool reserved1f;            /// Reserved for future functionality
   bool enableInterpModePatch; ///< If set, per-sample interpolation for nonperspective and smooth input is enabled
   bool pageMigrationEnabled;  ///< If set, page migration is enabled
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
@@ -443,6 +487,13 @@ struct PipelineOptions {
   unsigned overrideThreadGroupSizeZ;             ///< Override value for ThreadGroupSizeZ
   ResourceLayoutScheme resourceLayoutScheme;     ///< Resource layout scheme
   ThreadGroupSwizzleMode threadGroupSwizzleMode; ///< Controls thread group swizzle mode for compute shader.
+  bool reverseThreadGroup;                       ///< If set, enable thread group reversing
+
+#if VKI_RAY_TRACING
+  bool internalRtShaders; ///< Whether this pipeline has internal raytracing shaders
+#else
+  bool reserved15;
+#endif
 };
 
 /// Prototype of allocator for output data buffer, used in shader-specific operations.
@@ -482,9 +533,15 @@ struct ShaderModuleUsage {
   bool useSubgroupSize;        ///< Whether gl_SubgroupSize is used
   bool useSpecConstant;        ///< Whether specialization constant is used
   bool keepUnusedFunctions;    ///< Whether to keep unused function
-  bool useIsNan;               ///< Whether IsNan is used
-  bool useInvariant;           ///< Whether invariant variable is used
-  bool usePointSize;           ///< Whether gl_PointSize is used in output
+#if VKI_RAY_TRACING
+  bool enableRayQuery;     ///< Whether to enable "RayQueryProvisionalKHR" capability
+  bool rayQueryLibrary;    ///< Whether the shaderModule is rayQueryLibrary
+  bool isInternalRtShader; ///< Whether the shaderModule is a ray tracing internal shader
+  bool hasTraceRay;        ///< Whether the shaderModule has OpTraceRayKHR;
+#endif
+  bool useIsNan;     ///< Whether IsNan is used
+  bool useInvariant; ///< Whether invariant variable is used
+  bool usePointSize; ///< Whether gl_PointSize is used in output
 };
 
 /// Represents common part of shader module data
@@ -595,10 +652,10 @@ inline unsigned compact32(ShaderHash hash) {
 
 /// Represents per shader stage options.
 struct PipelineShaderOptions {
-  ShaderHash clientHash; ///< Client-supplied unique shader hash. A value of zero indicates that LLPC should
-                         ///  calculate its own hash. This hash is used for dumping, shader replacement, SPP, etc.
-                         ///  If the client provides this hash, they are responsible for ensuring it is as stable
-                         ///  as possible.
+  ShaderHash clientHash;      ///< Client-supplied unique shader hash. A value of zero indicates that LLPC should
+                              ///  calculate its own hash. This hash is used for dumping, shader replacement, SPP, etc.
+                              ///  If the client provides this hash, they are responsible for ensuring it is as stable
+                              ///  as possible.
   bool trapPresent;           ///< Indicates a trap handler will be present when this pipeline is executed,
                               ///  and any trap conditions encountered in this shader should call the trap
                               ///  handler. This could include an arithmetic exception, an explicit trap
@@ -697,6 +754,24 @@ struct PipelineShaderOptions {
 
   /// Override value for ThreadGroupSizeZ
   unsigned overrideShaderThreadGroupSizeZ;
+
+  /// When there is a valid "feedback loop" in renderpass, lateZ needs to be enabled
+  /// In Vulkan a "feedback loop" is described as a subpass where there is at least
+  /// one input attachment that is also a color or depth/stencil attachment
+  /// Feedback loops are allowed and their behavior is well defined under certain conditions.
+  /// When there is a feedback loop it is possible for the shaders to read
+  /// the contents of the color and depth/stencil attachments
+  /// from the shader during draw. Because of that possibility you have to use late-z
+  bool forceLateZ;
+
+  /// Minimum number of addresses to use NSA encoding on GFX10+ (0 = backend decides).
+  unsigned nsaThreshold;
+
+  /// Aggressively mark shader loads as invariant (where it is safe to do so).
+  bool aggressiveInvariantLoads;
+
+  /// Strip invariant load metadata.
+  bool disableInvariantLoads;
 };
 
 /// Represents YCbCr sampler meta data in resource descriptor
@@ -784,7 +859,7 @@ struct PipelineShaderInfo {
   const VkSpecializationInfo *pSpecializationInfo; ///< Specialization constant info
   const char *pEntryTarget;                        ///< Name of the target entry point (for multi-entry)
   ShaderStage entryStage;                          ///< Shader stage of the target entry point
-  PipelineShaderOptions options; ///< Per shader stage tuning/debugging options
+  PipelineShaderOptions options;                   ///< Per shader stage tuning/debugging options
 };
 
 /// Represents color target info
@@ -795,6 +870,158 @@ struct ColorTarget {
   uint8_t channelWriteMask;  ///< Write mask to specify destination channels
   VkFormat format;           ///< Color attachment format
 };
+
+#if VKI_RAY_TRACING
+// Maximum size of descriptor in dwords
+static const unsigned MaxDescriptorSize = 8;
+
+/// Represents BVH shader resource descriptor
+struct BvhShaderResourceDescriptor {
+  unsigned descriptorData[MaxDescriptorSize]; ///< BVH descriptor data
+  unsigned dataSizeInDwords;                  ///< BVH buffer descriptor size in dword
+};
+
+// Corresponds to gl_RayFlags* in GLSL_EXT_ray_tracing.txt
+enum RayTracingRayFlag : uint32_t {
+  RayTracingRayFlagNone = 0x00,                       // gl_RayFlagsNoneEXT
+  RayTracingRayFlagForceOpaque = 0x01,                // gl_RayFlagsOpaqueEXT
+  RayTracingRayFlagForceNonOpaque = 0x02,             // gl_RayFlagsNoOpaqueEXT
+  RayTracingRayFlagAcceptFirstHitAndEndSearch = 0x04, // gl_RayFlagsTerminateOnFirstHitEXT
+  RayTracingRayFlagSkipClosestHitShader = 0x08,       // gl_RayFlagsSkipClosestHitShaderEXT
+  RayTracingRayFlagCullBackFacingTriangles = 0x10,    // gl_RayFlagsCullBackFacingTrianglesEXT
+  RayTracingRayFlagCullFrontFacingTriangles = 0x20,   // gl_RayFlagsCullFrontFacingTrianglesEXT
+  RayTracingRayFlagCullOpaque = 0x40,                 // gl_RayFlagsCullOpaqueEXT
+  RayTracingRayFlagCullNonOpaque = 0x80,              // gl_RayFlagsCullNoOpaqueEXT
+  RayTracingRayFlagSkipTriangles = 0x100,             // gl_RayFlagsSkipTrianglesEXT
+  RayTracingRayFlagSkipAabb = 0x200,                  // gl_RayFlagsSkipAABBEXT
+};
+
+// =====================================================================================================================
+// Raytracing entry function indices
+enum RAYTRACING_ENTRY_FUNC : unsigned {
+  RT_ENTRY_TRACE_RAY,
+  RT_ENTRY_TRACE_RAY_INLINE,
+  RT_ENTRY_TRACE_RAY_HIT_TOKEN,
+  RT_ENTRY_RAY_QUERY_PROCEED,
+  RT_ENTRY_INSTANCE_INDEX,
+  RT_ENTRY_INSTANCE_ID,
+  RT_ENTRY_OBJECT_TO_WORLD_TRANSFORM,
+  RT_ENTRY_WORLD_TO_OBJECT_TRANSFORM,
+  RT_ENTRY_RESERVE1,
+  RT_ENTRY_RESERVE2,
+  RT_ENTRY_RESERVE3,
+  RT_ENTRY_FUNC_COUNT,
+};
+
+// =====================================================================================================================
+// raytracing system value usage flags
+union RayTracingSystemValueUsage {
+  struct {
+    union {
+      struct {
+        uint16_t flags : 1;             // Shader calls gl_IncomingRayFlagsEXT
+        uint16_t worldRayOrigin : 1;    // Shader calls gl_WorldRayOriginEXT
+        uint16_t tMin : 1;              // Shader calls gl_RayTminEXT
+        uint16_t worldRayDirection : 1; // Shader calls gl_WorldRayDirectionEXT
+        uint16_t tCurrent : 1;          // Shader calls gl_HitTEXT
+        uint16_t launchId : 1;          // Shader calls gl_LaunchIDEXT
+        uint16_t launchSize : 1;        // Shader calls gl_LaunchSizeEXT
+        uint16_t reserved : 9;          // Reserved
+      };
+      uint16_t u16All;
+    } ray;
+
+    union {
+      struct {
+        uint16_t hitKind : 1;            // Shader calls gl_HitKindEXT
+        uint16_t instanceIndex : 1;      // Shader calls gl_InstanceCustomIndexEXT
+        uint16_t instanceID : 1;         // Shader calls gl_InstanceID
+        uint16_t primitiveIndex : 1;     // Shader calls gl_PrimitiveID
+        uint16_t geometryIndex : 1;      // Shader calls gl_GeometryIndexEXT
+        uint16_t objectToWorld : 1;      // Shader calls gl_ObjectToWorldEXT
+        uint16_t objectRayOrigin : 1;    // Shader calls gl_ObjectRayOriginEXT
+        uint16_t objectRayDirection : 1; // Shader calls gl_ObjectRayDirectionEXT
+        uint16_t worldToObject : 1;      // Shader calls gl_WorldToObjectEXT
+        uint16_t reservedBit : 1;
+        uint16_t reserved : 6; // Reserved
+      };
+      uint16_t u16All;
+    } primitive;
+  };
+  uint32_t u32All;
+};
+
+/// Represents ray-tracing shader export configuration
+struct RayTracingShaderExportConfig {
+  float maxRayLength; // Raytracing rayDesc.tMax override
+
+  unsigned indirectCallingConvention; ///< Indirect calling convention
+  struct {
+    unsigned raygen;         ///< Ray generation shader saved register
+    unsigned miss;           ///< Miss shader saved register
+    unsigned closestHit;     ///< Closest hit shader saved register
+    unsigned anyHit;         ///< Any hit shader saved register
+    unsigned intersection;   ///< Intersection shader saved register
+    unsigned callable;       ///< Callable shader saved register
+    unsigned traceRays;      ///< Trace ray shader saved register
+  } indirectCalleeSavedRegs; ///< Indirect callee saved register
+
+  bool enableUniformNoReturn;         // Enable flag indirect call as uniform-noreturn
+  bool enableTraceRayArgsInLds;       // Enable TraceRay() call arguments in LDS
+  bool enableReducedLinkageOpt;       // Enable reduced linkage across indirect call sites
+  bool readsDispatchRaysIndex;        // Shader reads dispatchRaysIndex
+  bool enableDynamicLaunch;           // Enable dynamic launch
+  bool emitRaytracingShaderDataToken; // Emitting Raytracing ShaderData SQTT Token
+};
+
+/// Represents GPURT function table
+struct GpurtFuncTable {
+  char pFunc[RT_ENTRY_FUNC_COUNT][256]; ///< Function names
+};
+
+/// Enumerates the method of mapping from ray tracing launch ID to native thread ID
+enum DispatchDimSwizzleMode : unsigned {
+  Native,             ///< Native mapping (width -> x, height -> y, depth -> z)
+  FlattenWidthHeight, ///< Flatten width and height to x, and depth to y
+};
+
+/// RayTracing state
+struct RtState {
+  unsigned nodeStrideShift;               ///< Ray tracing BVH node stride
+  BvhShaderResourceDescriptor bvhResDesc; ///< Ray tracing BVH shader resource descriptor
+  unsigned staticPipelineFlags;           ///< GPURT static pipeline flags constant
+  unsigned triCompressMode;               ///< GPURT triangle compression mode constant
+  unsigned boxSortHeuristicMode;          ///< GPURT box sort heuristic mode constant
+  unsigned pipelineFlags;                 ///< Ray tracing pipeline flags
+  unsigned counterMode;                   ///< Counter mode
+  unsigned counterMask;                   ///< Traversal counter mask
+  unsigned threadGroupSizeX;              ///< Thread group size for ray tracing shader
+  unsigned threadGroupSizeY;
+  unsigned threadGroupSizeZ;
+  unsigned rayQueryCsSwizzle;                    ///< Swizzle for compute shader using ray query
+  unsigned ldsStackSize;                         ///< LDS stack size
+  unsigned dispatchRaysThreadGroupSize;          ///< Dispatch thread group size
+  unsigned ldsSizePerThreadGroup;                ///< LDS size per thread group
+  unsigned outerTileSize;                        ///< Size of outer tile about ray tracing shader thread group swizzling
+  DispatchDimSwizzleMode dispatchDimSwizzleMode; ///< The method of mapping from ray tracing launch ID to native thread
+                                                 ///  ID. Thread group size would be 1D and threadGroupSizeX would be
+                                                 ///  the size of thread group in x-dim in FlattenWidthHeight mode.
+                                                 ///  Shader may need to inverse the mapping if launch ID is used.
+  RayTracingShaderExportConfig exportConfig;     ///< Ray tracing shader export config
+  bool enableRayQueryCsSwizzle;                  ///< Determine if performs thread group swizzling
+                                                 ///  for computer shaders use ray query feature
+  bool enableDispatchRaysInnerSwizzle;           ///< Perform swizzling logic on the thread indices inside ray tracing
+                                                 ///  thread groups
+  bool enableDispatchRaysOuterSwizzle;           ///< Perform swizzling logic on the thread group indices used for ray
+                                                 ///  tracing shaders
+  bool forceInvalidAccelStruct;                  ///< Force ray tracing invalid acceleration structure
+  bool enableRayTracingCounters;                 ///< Enable using ray tracing counters
+  bool enableOptimalLdsStackSizeForIndirect;     ///< Enable optimal LDS stack size for indirect shaders
+  bool enableOptimalLdsStackSizeForUnified;      ///< Enable optimal LDS stack size for unified shaders
+
+  GpurtFuncTable gpurtFuncTable; ///< GPURT function table
+};
+#endif
 
 /// Represents info to build a graphics pipeline.
 struct GraphicsPipelineBuildInfo {
@@ -809,7 +1036,7 @@ struct GraphicsPipelineBuildInfo {
   PipelineShaderInfo tcs; ///< Tessellation control shader
   PipelineShaderInfo tes; ///< Tessellation evaluation shader
   PipelineShaderInfo gs;  ///< Geometry shader
-  PipelineShaderInfo fs; ///< Fragment shader
+  PipelineShaderInfo fs;  ///< Fragment shader
 
   ResourceMappingData resourceMapping; ///< Resource mapping graph and static descriptor values
 
@@ -850,7 +1077,7 @@ struct GraphicsPipelineBuildInfo {
     VkProvokingVertexModeEXT provokingVertexMode; ///< Specifies which vertex of a primitive is the _provoking
                                                   ///  vertex_, this impacts which vertex's "flat" VS outputs
                                                   ///  are passed to the PS.
-  } rsState; ///< Rasterizer State
+  } rsState;                                      ///< Rasterizer State
   struct {
     bool alphaToCoverageEnable; ///< Enable alpha to coverage
     bool dualSourceBlendEnable; ///< Blend state bound at draw time will use a dual source blend mode
@@ -858,12 +1085,16 @@ struct GraphicsPipelineBuildInfo {
     ColorTarget target[MaxColorTargets]; ///< Per-MRT color target info
   } cbState;                             ///< Color target state
 
-  NggState nggState;        ///< NGG state used for tuning and debugging
-  PipelineOptions options;  ///< Per pipeline tuning/debugging options
-  bool unlinked;            ///< True to build an "unlinked" half-pipeline ELF
-  bool dynamicVertexStride; ///< Dynamic Vertex input Stride is enabled.
+  NggState nggState;          ///< NGG state used for tuning and debugging
+  PipelineOptions options;    ///< Per pipeline tuning/debugging options
+  bool unlinked;              ///< True to build an "unlinked" half-pipeline ELF
+  bool dynamicVertexStride;   ///< Dynamic Vertex input Stride is enabled.
   bool enableUberFetchShader; ///< Use uber fetch shader
-  bool enableEarlyCompile;  ///< Whether enable early compile
+  bool enableEarlyCompile;    ///< Whether enable early compile
+#if VKI_RAY_TRACING
+  BinaryData shaderLibrary; ///< SPIR-V library binary data
+  RtState rtState;          ///< Ray tracing state
+#endif
 };
 
 /// Represents info to build a compute pipeline.
@@ -875,18 +1106,92 @@ struct ComputePipelineBuildInfo {
 #if LLPC_ENABLE_SHADER_CACHE
   IShaderCache *pShaderCache; ///< Shader cache, used to search for the compiled shader data
 #endif
-  unsigned deviceIndex;  ///< Device index for device group
-  PipelineShaderInfo cs; ///< Compute shader
+  unsigned deviceIndex;                ///< Device index for device group
+  PipelineShaderInfo cs;               ///< Compute shader
   ResourceMappingData resourceMapping; ///< Resource mapping graph and static descriptor values
-  PipelineOptions options; ///< Per pipeline tuning options
-  bool unlinked;           ///< True to build an "unlinked" half-pipeline ELF
+  PipelineOptions options;             ///< Per pipeline tuning options
+  bool unlinked;                       ///< True to build an "unlinked" half-pipeline ELF
+#if VKI_RAY_TRACING
+  BinaryData shaderLibrary; ///< SPIR-V library binary data
+  RtState rtState;          ///< Ray tracing state
+#endif
 };
+
+#if VKI_RAY_TRACING
+/// Represents output of building a ray tracing pipeline.
+struct RayTracingPipelineBuildInfo {
+  void *pInstance;                                           ///< Vulkan instance object
+  void *pUserData;                                           ///< User data
+  OutputAllocFunc pfnOutputAlloc;                            ///< Output buffer allocator
+  ICache *cache;                                             ///< ICache, used to search for the compiled shader data
+  unsigned deviceIndex;                                      ///< Device index for device group
+  unsigned deviceCount;                                      ///< Device count for device group
+  unsigned shaderCount;                                      ///< Count of shader info
+  PipelineShaderInfo *pShaders;                              ///< An array of shader info
+  ResourceMappingData resourceMapping;                       ///< Resource mapping graph and static descriptor values
+  unsigned shaderGroupCount;                                 ///< Count of shader group
+  const VkRayTracingShaderGroupCreateInfoKHR *pShaderGroups; ///< An array of shader group
+  BinaryData shaderTraceRay;                                 ///< Trace-ray SPIR-V binary data
+  PipelineOptions options;                                   ///< Per pipeline tuning options
+  unsigned maxRecursionDepth;                                ///< Ray tracing max recursion depth
+  unsigned indirectStageMask;                                ///< Ray tracing indirect stage mask
+  RtState rtState;                                           ///< Ray tracing state
+  unsigned payloadSizeMaxInLib;                              ///< Pipeline library maxPayloadSize
+  unsigned attributeSizeMaxInLib;                            ///< Pipeline library maxAttributeSize
+  bool hasPipelineLibrary;                                   ///< Whether include pipeline library
+  unsigned pipelineLibStageMask;                             ///< Pipeline library stage mask
+  bool isReplay;                                             ///< Pipeline is created for replaying
+};
+
+/// Ray tracing max shader name length
+static constexpr unsigned RayTracingMaxShaderNameLength = 16;
+
+/// Raytracing invalid shader ID
+static constexpr uint64_t RayTracingInvalidShaderId = 0;
+
+/// Represents the property for a single ray-tracing shader
+struct RayTracingShaderProperty {
+  uint64_t shaderId;                        ///< Ray tracing compiled shader ID
+  char name[RayTracingMaxShaderNameLength]; ///< Ray tracing compiled shader name
+  bool hasTraceRay;                         ///< Whether TraceRay() is used
+};
+
+/// Represents ray-tracing shader identifier, must be the same as RayTracingShaderIdentifier
+struct RayTracingShaderIdentifier {
+  uint64_t shaderId;       ///< Generic shader ID for RayGen, ClosestHit, Miss, and Callable
+  uint64_t anyHitId;       ///< AnyHit ID for hit groups
+  uint64_t intersectionId; ///< Intersection shader ID for hit groups
+  uint64_t padding;        ///< Padding to meet 32-byte api requirement and 8-byte alignment for descriptor table offset
+};
+
+/// Represents ray-tracing capture replay GPU VA remapping table entry
+struct RayTracingCaptureReplayVaMappingEntry {
+  uint64_t capturedGpuVa; ///< GPU VA that is generated when capturing
+  uint64_t replayGpuVa;   ///< GPU VA that is in used when replaying
+};
+
+/// Represents the handles of shader group for ray-tracing pipeline
+struct RayTracingShaderGroupHandle {
+  unsigned shaderHandleCount;                ///< Count of shader group handle array
+  RayTracingShaderIdentifier *shaderHandles; ///< Shader group handle array
+};
+
+/// Represents a set of ray-tracing shaders referenced by a ray-tracing pipeline
+struct RayTracingShaderPropertySet {
+  unsigned shaderCount;                  ///< Shader count
+  unsigned traceRayIndex;                ///< Index of TraceRay() shader in properties array
+  RayTracingShaderProperty *shaderProps; ///< The bunch of shaders in a ray-tracing pipeline
+};
+#endif
 
 // =====================================================================================================================
 /// Represents the unified of a pipeline create info.
 struct PipelineBuildInfo {
   const ComputePipelineBuildInfo *pComputeInfo;   // Compute pipeline create info
   const GraphicsPipelineBuildInfo *pGraphicsInfo; // Graphic pipeline create info
+#if VKI_RAY_TRACING
+  const RayTracingPipelineBuildInfo *pRayTracingInfo; // Ray tracing pipeline create info
+#endif
 };
 
 // =====================================================================================================================
@@ -989,7 +1294,37 @@ public:
   /// @param hashCode64           Precalculated Hash code of pipeline
   static void VKAPI_CALL GetPipelineName(const ComputePipelineBuildInfo *pPipelineInfo, char *pPipeName,
                                          const size_t nameBufSize, uint64_t hashCode64);
+#if VKI_RAY_TRACING
+  /// Calculates ray tracing pipeline hash code.
+  ///
+  /// @param [in]  pPipelineInfo  Info to build this ray tracing pipeline
+  ///
+  /// @returns Hash code associated this ray tracing pipeline.
+  static uint64_t VKAPI_CALL GetPipelineHash(const RayTracingPipelineBuildInfo *pPipelineInfo);
 
+  /// Gets ray tracing pipeline name.
+  ///
+  /// @param [in]  pPipelineInfo  Info to build this ray tracing pipeline
+  /// @param [out] pPipeName      The full name of this ray tracing pipeline
+  /// @param [in]  nameBufSize    Size of the buffer to store pipeline name
+  static void VKAPI_CALL GetPipelineName(const RayTracingPipelineBuildInfo *pPipelineInfo, char *pPipeName,
+                                         const size_t nameBufSize);
+
+  /// Gets ray tracing pipeline name.
+  ///
+  /// @param [in]  pPipelineInfo  Info to build this ray tracing pipeline
+  /// @param [out] pPipeName      The full name of this ray tracing pipeline
+  /// @param [in]  nameBufSize    Size of the buffer to store pipeline name
+  /// @param hashCode64           Precalculated Hash code of pipeline
+  static void VKAPI_CALL GetPipelineName(const RayTracingPipelineBuildInfo *pPipelineInfo, char *pPipeName,
+                                         const size_t nameBufSize, uint64_t hashCode64);
+
+  /// Dumps ray tracing pipeline metadata.
+  ///
+  /// @param [in]  dumpFile      The handle of pipeline dump file
+  /// @param [in]  pipelineMeta   Ray tracing pipeline metadata binary
+  static void VKAPI_CALL DumpRayTracingPipelineMetadata(void *dumpFile, BinaryData *pipelineMeta);
+#endif
 };
 
 // =====================================================================================================================

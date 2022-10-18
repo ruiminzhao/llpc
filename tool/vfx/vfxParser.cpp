@@ -38,10 +38,6 @@
 #include "vfxVkSection.h"
 #endif
 
-#if VFX_SUPPORT_RENDER_DOCOUMENT
-#include "vfxRenderDoc.h"
-#endif
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,10 +148,6 @@ Document::~Document() {
 //
 // @param type : Document type
 Document *Document::createDocument(VfxDocType type) {
-#if VFX_SUPPORT_RENDER_DOCOUMENT
-  if (type == VfxDocTypeRender)
-    return new RenderDocument;
-#endif
 #if VFX_SUPPORT_VK_PIPELINE
   if (type == VfxDocTypePipeline)
     return new PipelineDocument;
@@ -802,7 +794,7 @@ bool parseBool(char *str, unsigned lineNum, IUFValue *output, std::string *error
 
 // =====================================================================================================================
 // Parses a integer vec4 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -839,7 +831,7 @@ bool parseIVec4(char *str, unsigned lineNum, IUFValue *output) {
 
 // =====================================================================================================================
 // Parses a int64 vec2 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -876,7 +868,7 @@ bool parseI64Vec2(char *str, unsigned lineNum, IUFValue *output) {
 
 // =====================================================================================================================
 // Parses a float vec4 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -904,7 +896,7 @@ bool parseFVec4(char *str, unsigned lineNum, IUFValue *output) {
 
 // =====================================================================================================================
 // Parses a float16 vec4 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -937,7 +929,7 @@ bool parseF16Vec4(char *str, unsigned lineNum, IUFValue *output) {
 
 // =====================================================================================================================
 // Parses a double vec2 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -966,7 +958,7 @@ bool parseDVec2(char *str, unsigned lineNum, IUFValue *output) {
 
 // =====================================================================================================================
 // Parses an array of comma separated integer values
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -1005,7 +997,7 @@ bool parseIArray(char *str, unsigned lineNum, bool isSign, std::vector<uint8_t> 
 
 // =====================================================================================================================
 // Parses an array of comma separated int64 values
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -1043,7 +1035,7 @@ bool parseI64Array(char *str, unsigned lineNum, bool isSign, std::vector<uint8_t
 
 // =====================================================================================================================
 // Parses an array of comma separated float values
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -1070,7 +1062,7 @@ bool parseFArray(char *str, unsigned lineNum, std::vector<uint8_t> &bufMem) {
 
 // =====================================================================================================================
 // Parses an array of comma separated float16 values
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -1100,7 +1092,7 @@ bool parseF16Array(char *str, unsigned lineNum, std::vector<uint8_t> &bufMem) {
 
 // =====================================================================================================================
 // Parses an array of comma separated double values
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number
@@ -1127,7 +1119,7 @@ bool parseDArray(char *str, unsigned lineNum, std::vector<uint8_t> &bufMem) {
 
 // =====================================================================================================================
 // Parses binding, it's a integer vec3 from a string.
-// NOTE: content of pStr will be changed.
+// NOTE: content of str will be changed.
 //
 // @param str : Input string
 // @param lineNum : Current line number

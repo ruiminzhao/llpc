@@ -45,7 +45,6 @@ BuilderImpl::BuilderImpl(LgcContext *builderContext, Pipeline *pipeline)
       ImageBuilder(builderContext), InOutBuilder(builderContext), MatrixBuilder(builderContext),
       MiscBuilder(builderContext), SubgroupBuilder(builderContext) {
   m_pipelineState = reinterpret_cast<PipelineState *>(pipeline);
-  m_pipelineState->setNoReplayer();
 }
 
 // =====================================================================================================================
@@ -160,9 +159,7 @@ Value *BuilderImplBase::CreateIntegerDotProduct(Value *vector1, Value *vector2, 
       input1 = CreateBitCast(input1, getInt32Ty());
       input2 = CreateBitCast(input2, getInt32Ty());
       auto intrinsicDot4 = isSigned ? Intrinsic::amdgcn_sdot4 : Intrinsic::amdgcn_udot4;
-      {
-        scalar = CreateIntrinsic(intrinsicDot4, {}, {input1, input2, accumulator, clamp}, nullptr, instName);
-      }
+      { scalar = CreateIntrinsic(intrinsicDot4, {}, {input1, input2, accumulator, clamp}, nullptr, instName); }
     } else {
       auto intrinsicDot2 = isSigned ? Intrinsic::amdgcn_sdot2 : Intrinsic::amdgcn_udot2;
       if (compCount == 2) {
@@ -348,8 +345,36 @@ BranchInst *BuilderImplBase::createIf(Value *condition, bool wantElse, const Twi
 // @return : Value representing the non-uniform index
 static Value *traceNonUniformIndex(Value *nonUniformVal) {
   auto load = dyn_cast<LoadInst>(nonUniformVal);
-  if (!load)
-    return nonUniformVal;
+  if (!load) {
+    // Workarounds that modify image descriptor can be peeped through, i.e.
+    //   %baseValue = load <8 x i32>, <8 x i32> addrspace(4)* %..., align 16
+    //   %rawElement = extractelement <8 x i32> %baseValue, i64 6
+    //   %updatedElement = and i32 %rawElement, -1048577
+    //   %nonUniform = insertelement <8 x i32> %baseValue, i32 %updatedElement, i64 6
+    auto insert = dyn_cast<InsertElementInst>(nonUniformVal);
+    if (!insert)
+      return nonUniformVal;
+
+    load = dyn_cast<LoadInst>(insert->getOperand(0));
+    if (!load)
+      return nonUniformVal;
+
+    // We found the load, but must verify the chain.
+    // Consider updatedElement as a generic instruction or constant.
+    if (auto updatedElement = dyn_cast<Instruction>(insert->getOperand(1))) {
+      for (Value *operand : updatedElement->operands()) {
+        if (auto extract = dyn_cast<ExtractElementInst>(operand)) {
+          // Only dynamic value must be ExtractElementInst based on load.
+          if (dyn_cast<LoadInst>(extract->getOperand(0)) != load)
+            return nonUniformVal;
+        } else if (!isa<Constant>(operand)) {
+          return nonUniformVal;
+        }
+      }
+    } else if (!isa<Constant>(insert->getOperand(1))) {
+      return nonUniformVal;
+    }
+  }
 
   SmallVector<Value *, 2> worklist;
   Value *base = load->getOperand(0);
@@ -469,7 +494,7 @@ static bool instructionsEqual(Instruction *lhs, Instruction *rhs) {
 
 // =====================================================================================================================
 // Create a waterfall loop containing the specified instruction.
-// This does not use the current insert point; new code is inserted before and after pNonUniformInst.
+// This does not use the current insert point; new code is inserted before and after nonUniformInst.
 //
 // @param nonUniformInst : The instruction to put in a waterfall loop
 // @param operandIdxs : The operand index/indices for non-uniform inputs that need to be uniform
@@ -537,15 +562,17 @@ Instruction *BuilderImplBase::createWaterfallLoop(Instruction *nonUniformInst, A
                                   {waterfallBegin, nonUniformVal}, nullptr, instName);
 
     // Replace all references to shared index within the waterfall loop with scalarized index.
+    // (Note: this includes the non-uniform instruction itself.)
     // Loads using scalarized index will become scalar loads.
     for (Value *otherNonUniformVal : nonUniformIndices) {
       otherNonUniformVal->replaceUsesWithIf(desc, [desc, waterfallBegin, nonUniformInst](Use &U) {
         Instruction *userInst = cast<Instruction>(U.getUser());
-        return U.getUser() != waterfallBegin && U.getUser() != desc && userInst->comesBefore(nonUniformInst);
+        return U.getUser() != waterfallBegin && U.getUser() != desc &&
+               (userInst->comesBefore(nonUniformInst) || userInst == nonUniformInst);
       });
     }
   } else {
-    // Insert new code just before pNonUniformInst.
+    // Insert new code just before nonUniformInst.
     SetInsertPoint(nonUniformInst);
 
     // The first begin contains a null token for the previous token argument
@@ -574,7 +601,7 @@ Instruction *BuilderImplBase::createWaterfallLoop(Instruction *nonUniformInst, A
 
   Instruction *resultValue = nonUniformInst;
 
-  // End the waterfall loop (as long as pNonUniformInst is not a store with no result).
+  // End the waterfall loop (as long as nonUniformInst is not a store with no result).
   if (!nonUniformInst->getType()->isVoidTy()) {
     SetInsertPoint(nonUniformInst->getNextNode());
     SetCurrentDebugLocation(nonUniformInst->getDebugLoc());
@@ -599,7 +626,7 @@ Instruction *BuilderImplBase::createWaterfallLoop(Instruction *nonUniformInst, A
     if (waterfallEndTy != nonUniformInst->getType())
       resultValue = cast<Instruction>(CreateBitCast(resultValue, nonUniformInst->getType(), instName));
 
-    // Replace all uses of pNonUniformInst with the result of this code.
+    // Replace all uses of nonUniformInst with the result of this code.
     *useOfNonUniformInst = UndefValue::get(nonUniformInst->getType());
     nonUniformInst->replaceAllUsesWith(resultValue);
     *useOfNonUniformInst = nonUniformInst;

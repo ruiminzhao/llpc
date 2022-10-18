@@ -80,6 +80,8 @@ cl::opt<unsigned> PalAbiVersion("pal-abi-version", cl::init(0xFFFFFFFF), cl::cat
 
 // -v: enable verbose output
 cl::opt<bool> VerboseOutput("v", cl::cat(LgcCategory), cl::desc("Enable verbose output"), cl::init(false));
+
+cl::opt<bool> OpaquePointers("enable-opaque-pointers", cl::desc("Enable opaque-pointers in LGC"), cl::init(false));
 } // anonymous namespace
 
 // =====================================================================================================================
@@ -89,8 +91,8 @@ cl::opt<bool> VerboseOutput("v", cl::cat(LgcCategory), cl::desc("Enable verbose 
 static bool isElfBinary(StringRef data) {
   bool isElfBin = false;
   if (data.size() >= sizeof(ELF::Elf64_Ehdr)) {
-    auto pHeader = reinterpret_cast<const ELF::Elf64_Ehdr *>(data.data());
-    isElfBin = pHeader->checkMagic();
+    auto header = reinterpret_cast<const ELF::Elf64_Ehdr *>(data.data());
+    isElfBin = header->checkMagic();
   }
   return isElfBin;
 }
@@ -115,7 +117,7 @@ int main(int argc, char **argv) {
   LLVMContext context;
   // Temporarily disable opaque pointers (llvm is making opaque the default).
   // TODO: Remove this once work complete on transition to opaque pointers.
-  context.setOpaquePointers(false);
+  context.setOpaquePointers(OpaquePointers);
   LgcContext::initialize();
 
   // Set our category on options that we want to show in -help, and hide other options.

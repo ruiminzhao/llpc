@@ -55,7 +55,7 @@ void ConfigBuilder::buildPalMetadata() {
     const bool hasTs = (m_hasTcs || m_hasTes);
 
     if (!m_pipelineState->isWholePipeline() && m_pipelineState->hasShaderStage(ShaderStageFragment)) {
-      // FS-only shader compilation
+      // FS-only shader compilation (part-pipeline compilation)
       buildPipelineVsFsRegConfig();
     } else if (!hasTs && !m_hasGs) {
       // VS-FS pipeline
@@ -874,7 +874,9 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
 
   ZOrder zOrder = LATE_Z;
   bool execOnHeirFail = false;
-  if (fragmentMode.earlyFragmentTests)
+  if (shaderOptions.forceLateZ)
+    zOrder = LATE_Z;
+  else if (fragmentMode.earlyFragmentTests)
     zOrder = EARLY_Z_THEN_LATE_Z;
   else if (resUsage->resourceWrite) {
     zOrder = LATE_Z;
@@ -993,7 +995,7 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   const auto resUsage = m_pipelineState->getShaderResourceUsage(shaderStage);
   const auto &builtInUsage = resUsage->builtInUsage.cs;
   const auto &computeMode = m_pipelineState->getShaderModes()->getComputeShaderMode();
-  unsigned workgroupSizes[3];
+  unsigned workgroupSizes[3] = {};
 
   switch (static_cast<WorkgroupLayout>(builtInUsage.workgroupLayout)) {
   case WorkgroupLayout::Unknown:
@@ -1033,6 +1035,8 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   SET_REG_FIELD(config, COMPUTE_NUM_THREAD_X, NUM_THREAD_FULL, workgroupSizes[0]);
   SET_REG_FIELD(config, COMPUTE_NUM_THREAD_Y, NUM_THREAD_FULL, workgroupSizes[1]);
   SET_REG_FIELD(config, COMPUTE_NUM_THREAD_Z, NUM_THREAD_FULL, workgroupSizes[2]);
+
+  setThreadgroupDimensions(workgroupSizes);
 
   setNumAvailSgprs(Util::Abi::HardwareStage::Cs, resUsage->numSgprsAvailable);
   setNumAvailVgprs(Util::Abi::HardwareStage::Cs, resUsage->numVgprsAvailable);

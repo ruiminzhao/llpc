@@ -1072,7 +1072,8 @@ void PatchBufferOp::postVisitMemCpyInst(MemCpyInst &memCpyInst) {
     while (stride != 1) {
       // We only care about dword alignment (4 bytes) so clamp the max check here to that.
       const unsigned minStride = std::min(stride, 4u);
-      if (destAlignment.valueOrOne() >= minStride && srcAlignment.valueOrOne() >= minStride && (constantLength % stride) == 0)
+      if (destAlignment.valueOrOne() >= minStride && srcAlignment.valueOrOne() >= minStride &&
+          (constantLength % stride) == 0)
         break;
 
       stride /= 2;
@@ -1563,7 +1564,7 @@ Value *PatchBufferOp::replaceLoadStore(Instruction &inst) {
     }
   }
 
-  // The index in pStoreValue which we use next
+  // The index in storeValue which we use next
   unsigned storeIndex = 0;
 
   unsigned remainingBytes = bytesToHandle;
@@ -1613,8 +1614,10 @@ Value *PatchBufferOp::replaceLoadStore(Instruction &inst) {
         coherent.bits.dlc = isDlc;
       }
       if (isInvariant && accessSize >= 4) {
-        part = m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_buffer_load, intAccessType,
-                                          {bufferDesc, offsetVal, m_builder->getInt32(coherent.u32All)});
+        CallInst *call = m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_buffer_load, intAccessType,
+                                                    {bufferDesc, offsetVal, m_builder->getInt32(coherent.u32All)});
+        call->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(*m_context, None));
+        part = call;
       } else {
         unsigned intrinsicID = Intrinsic::amdgcn_raw_buffer_load;
 #if !defined(LLVM_HAVE_BRANCH_AMD_GFX)

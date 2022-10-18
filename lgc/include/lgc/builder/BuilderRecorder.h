@@ -104,6 +104,7 @@ public:
     Exp,
     Log,
     Sqrt,
+    InverseSqrt,
     SAbs,
     FSign,
     SSign,
@@ -151,7 +152,11 @@ public:
     ImageQuerySamples,
     ImageQuerySize,
     ImageGetLod,
+#if VKI_RAY_TRACING
+    ImageBvhIntersectRayAMD,
+#else
     Reserved1,
+#endif
 
     // Input/output
     ReadGenericInput,
@@ -159,11 +164,14 @@ public:
     ReadPerVertexInput,
     WriteGenericOutput,
     WriteXfbOutput,
+    ReadBaryCoord,
     ReadBuiltInInput,
     ReadBuiltInOutput,
     WriteBuiltInOutput,
     ReadTaskPayload,
     WriteTaskPayload,
+    TaskPayloadAtomic,
+    TaskPayloadAtomicCompareSwap,
 
     // Matrix
     TransposeMatrix,
@@ -291,6 +299,7 @@ public:
   llvm::Value *CreateExp(llvm::Value *x, const llvm::Twine &instName = "") override final;
   llvm::Value *CreateLog(llvm::Value *x, const llvm::Twine &instName = "") override final;
   llvm::Value *CreateSqrt(llvm::Value *x, const llvm::Twine &instName = "") override final;
+  llvm::Value *CreateInverseSqrt(llvm::Value *x, const llvm::Twine &instName = "") override final;
 
   // General arithmetic operations.
   llvm::Value *CreateSAbs(llvm::Value *x, const llvm::Twine &instName = "") override final;
@@ -357,8 +366,8 @@ public:
   llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
                                     llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
 
-  llvm::Value *CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                   const llvm::Twine &instName) override final;
+  llvm::Value *CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                   unsigned binding, const llvm::Twine &instName) override final;
 
   llvm::Value *CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
                                 unsigned binding, const llvm::Twine &instName) override final;
@@ -432,6 +441,13 @@ public:
   llvm::Value *CreateImageGetLod(unsigned dim, unsigned flags, llvm::Value *imageDesc, llvm::Value *samplerDesc,
                                  llvm::Value *coord, const llvm::Twine &instName = "") override final;
 
+#if VKI_RAY_TRACING
+  // Create a ray intersect result with specified node in BVH buffer
+  llvm::Value *CreateImageBvhIntersectRay(llvm::Value *nodePtr, llvm::Value *extent, llvm::Value *origin,
+                                          llvm::Value *direction, llvm::Value *invDirection, llvm::Value *imageDesc,
+                                          const llvm::Twine &instName = "") override final;
+#endif
+
   // -----------------------------------------------------------------------------------------------------------------
   // Shader input/output methods
 
@@ -454,6 +470,10 @@ public:
   llvm::Instruction *CreateWriteXfbOutput(llvm::Value *valueToWrite, bool isBuiltIn, unsigned location,
                                           unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
                                           InOutInfo outputInfo) override final;
+
+  // Create a read of barycoord input value.
+  llvm::Value *CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
+                                   const llvm::Twine &instName = "") override final;
 
   // Create a read of (part of) a built-in input value.
   llvm::Value *CreateReadBuiltInInput(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *vertexIndex,
@@ -479,6 +499,15 @@ public:
   // Create a write of (part of) a task payload.
   llvm::Instruction *CreateWriteTaskPayload(llvm::Value *valueToWrite, llvm::Value *byteOffset,
                                             const llvm::Twine &instName = "") override final;
+
+  // Create a task payload atomic operation other than compare-and-swap.
+  llvm::Value *CreateTaskPayloadAtomic(unsigned atomicOp, llvm::AtomicOrdering ordering, llvm::Value *inputValue,
+                                       llvm::Value *byteOffset, const llvm::Twine &instName = "") override final;
+
+  // Create a task payload atomic compare-and-swap.
+  llvm::Value *CreateTaskPayloadAtomicCompareSwap(llvm::AtomicOrdering ordering, llvm::Value *inputValue,
+                                                  llvm::Value *comparatorValue, llvm::Value *byteOffset,
+                                                  const llvm::Twine &instName = "") override final;
 
   // -----------------------------------------------------------------------------------------------------------------
   // Miscellaneous operations

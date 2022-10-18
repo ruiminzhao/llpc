@@ -165,6 +165,7 @@ public:
   llvm::Value *CreateExp(llvm::Value *x, const llvm::Twine &instName = "") override final;
   llvm::Value *CreateLog(llvm::Value *x, const llvm::Twine &instName = "") override final;
   llvm::Value *CreateSqrt(llvm::Value *x, const llvm::Twine &instName = "") override final;
+  llvm::Value *CreateInverseSqrt(llvm::Value *x, const llvm::Twine &instName = "") override final;
 
   // General arithmetic operations.
   llvm::Value *CreateSAbs(llvm::Value *x, const llvm::Twine &instName = "") override final;
@@ -290,8 +291,8 @@ public:
                                     llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
 
   // Create a get of the stride (in bytes) of a descriptor.
-  llvm::Value *CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                   const llvm::Twine &instName) override final;
+  llvm::Value *CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                   unsigned binding, const llvm::Twine &instName) override final;
 
   // Create a pointer to a descriptor.
   llvm::Value *CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
@@ -321,8 +322,8 @@ private:
   llvm::Value *getStride(ResourceNodeType descType, unsigned descSet, unsigned binding, const ResourceNode *node);
 
   // Get a pointer to a descriptor, as a pointer to i8
-  llvm::Value *getDescPtr(ResourceNodeType resType, unsigned descSet, unsigned binding, const ResourceNode *topNode,
-                          const ResourceNode *node);
+  llvm::Value *getDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                          unsigned binding, const ResourceNode *topNode, const ResourceNode *node);
 
   llvm::Value *scalarizeIfUniform(llvm::Value *value, bool isNonUniform);
 
@@ -403,6 +404,13 @@ public:
   // and implicit LOD.
   llvm::Value *CreateImageGetLod(unsigned dim, unsigned flags, llvm::Value *imageDesc, llvm::Value *samplerDesc,
                                  llvm::Value *coord, const llvm::Twine &instName = "") override final;
+
+#if VKI_RAY_TRACING
+  // Create a ray intersect result with specified node in BVH buffer
+  llvm::Value *CreateImageBvhIntersectRay(llvm::Value *nodePtr, llvm::Value *extent, llvm::Value *origin,
+                                          llvm::Value *direction, llvm::Value *invDirection, llvm::Value *imageDesc,
+                                          const llvm::Twine &instName = "") override final;
+#endif
 
 private:
   ImageBuilder() = delete;
@@ -501,6 +509,10 @@ public:
                                           unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
                                           InOutInfo outputInfo) override final;
 
+  // Create a read of barycoord input value.
+  llvm::Value *CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
+                                   const llvm::Twine &instName = "") override final;
+
   // Create a read of (part of) a built-in input value.
   llvm::Value *CreateReadBuiltInInput(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *vertexIndex,
                                       llvm::Value *index, const llvm::Twine &instName = "") override final;
@@ -520,6 +532,15 @@ public:
   // Create a write to (part of) a task payload.
   llvm::Instruction *CreateWriteTaskPayload(llvm::Value *valueToWrite, llvm::Value *byteOffset,
                                             const llvm::Twine &instName = "") override final;
+
+  // Create a task payload atomic operation other than compare-and-swap.
+  llvm::Value *CreateTaskPayloadAtomic(unsigned atomicOp, llvm::AtomicOrdering ordering, llvm::Value *inputValue,
+                                       llvm::Value *byteOffset, const llvm::Twine &instName = "") override final;
+
+  // Create a task payload atomic compare-and-swap.
+  llvm::Value *CreateTaskPayloadAtomicCompareSwap(llvm::AtomicOrdering ordering, llvm::Value *inputValue,
+                                                  llvm::Value *comparatorValue, llvm::Value *byteOffset,
+                                                  const llvm::Twine &instName = "") override final;
 
 private:
   InOutBuilder() = delete;
@@ -541,15 +562,16 @@ private:
   // Mark fragment output type
   void markFsOutputType(llvm::Type *outputTy, unsigned location, InOutInfo outputInfo);
 
-  // Modify aux interp value according to custom interp mode, and its helper functions.
-  llvm::Value *modifyAuxInterpValue(llvm::Value *auxInterpValue, InOutInfo inputInfo);
-  llvm::Value *evalIjOffsetNoPersp(llvm::Value *offset);
+  std::tuple<unsigned, llvm::Value *> getInterpModeAndValue(InOutInfo inputInfo, llvm::Value *auxInterpValue);
   llvm::Value *evalIjOffsetSmooth(llvm::Value *offset);
   llvm::Value *adjustIj(llvm::Value *value, llvm::Value *offset);
 
   // Read (part of) a built-in value
   llvm::Value *readBuiltIn(bool isOutput, BuiltInKind builtIn, InOutInfo inOutInfo, llvm::Value *vertexIndex,
                            llvm::Value *index, const llvm::Twine &instName);
+
+  // Reorder the barycoord
+  llvm::Value *normalizeBaryCoord(llvm::Value *ijCoord);
 
   // Read and directly handle certain built-ins that are common between shader stages
   llvm::Value *readCommonBuiltIn(BuiltInKind builtIn, llvm::Type *resultTy, const llvm::Twine &instName = "");

@@ -38,9 +38,11 @@
 #include "lgc/patch/PatchCheckShaderCache.h"
 #include "lgc/patch/PatchCopyShader.h"
 #include "lgc/patch/PatchEntryPointMutate.h"
+#include "lgc/patch/PatchImageDerivatives.h"
 #include "lgc/patch/PatchImageOpCollect.h"
 #include "lgc/patch/PatchInOutImportExport.h"
 #include "lgc/patch/PatchInitializeWorkgroupMemory.h"
+#include "lgc/patch/PatchInvariantLoads.h"
 #include "lgc/patch/PatchLlvmIrInclusion.h"
 #include "lgc/patch/PatchLoadScalarizer.h"
 #include "lgc/patch/PatchLoopMetadata.h"
@@ -87,7 +89,6 @@
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
-#include "llvm/Transforms/Scalar/Sink.h"
 #include "llvm/Transforms/Scalar/SpeculativeExecution.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
@@ -108,16 +109,14 @@ namespace lgc {
 // @param checkShaderCacheFunc : Callback function to check shader cache
 // @param optLevel : The optimization level uses to adjust the aggressiveness of
 //                   passes and which passes to add.
-void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, bool addReplayerPass, Timer *patchTimer,
-                      Timer *optTimer, Pipeline::CheckShaderCacheFunc checkShaderCacheFunc,
-                      CodeGenOpt::Level optLevel) {
+void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, Timer *patchTimer, Timer *optTimer,
+                      Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, CodeGenOpt::Level optLevel) {
   // Start timer for patching passes.
   if (patchTimer)
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
 
-  // If using BuilderRecorder rather than BuilderImpl, replay the Builder calls now
-  if (addReplayerPass)
-    passMgr.addPass(BuilderReplayer(pipelineState));
+  // We're using BuilderRecorder; replay the Builder calls now
+  passMgr.addPass(BuilderReplayer(pipelineState));
 
   if (raw_ostream *outs = getLgcOuts()) {
     passMgr.addPass(PrintModulePass(*outs,
@@ -148,6 +147,8 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   passMgr.addPass(AlwaysInlinerPass());
   passMgr.addPass(GlobalDCEPass());
 
+  // Patch invariant load and loop metadata.
+  passMgr.addPass(createModuleToFunctionPassAdaptor(PatchInvariantLoads()));
   passMgr.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(PatchLoopMetadata())));
 
   if (patchTimer) {
@@ -180,7 +181,6 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
     fpm.addPass(PromotePass());
     fpm.addPass(ADCEPass());
     fpm.addPass(PatchBufferOp());
-    fpm.addPass(SinkingPass());
     fpm.addPass(InstCombinePass());
     fpm.addPass(SimplifyCFGPass());
     passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
@@ -192,10 +192,11 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   } else {
     FunctionPassManager fpm;
     fpm.addPass(PatchBufferOp());
-    fpm.addPass(SinkingPass());
     fpm.addPass(InstCombinePass(2));
     passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
   }
+
+  passMgr.addPass(PatchImageDerivatives());
 
   // Set up target features in shader entry-points.
   // NOTE: Needs to be done after post-NGG function inlining, because LLVM refuses to inline something
@@ -285,7 +286,7 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
   // Patch entry-point mutation (should be done before external library link)
   passMgr.add(createLegacyPatchEntryPointMutate());
 
-  // Patch workgroup memory initializaion.
+  // Patch workgroup memory initialization.
   passMgr.add(createLegacyPatchInitializeWorkgroupMemory());
 
   // Patch input import and output export operations
@@ -294,6 +295,9 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
   // Prior to general optimization, do function inlining and dead function removal
   passMgr.add(createAlwaysInlinerLegacyPass());
   passMgr.add(createGlobalDCEPass());
+
+  // Patch invariant load metadata before optimizations.
+  passMgr.add(createLegacyPatchInvariantLoads());
 
   // Patch loop metadata
   passMgr.add(createLegacyPatchLoopMetadata());
@@ -320,7 +324,6 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
 
   // Patch buffer operations (must be after optimizations)
   passMgr.add(createLegacyPatchBufferOp());
-  passMgr.add(createSinkingPass());
   passMgr.add(createInstructionCombiningPass(2));
 
   // Fully prepare the pipeline ABI (must be after optimizations)
@@ -349,6 +352,8 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
       passMgr.add(LgcContext::createStartStopTimer(patchTimer, true));
     }
   }
+
+  passMgr.add(createLegacyPatchImageDerivatives());
 
   // Set up target features in shader entry-points.
   // NOTE: Needs to be done after post-NGG function inlining, because LLVM refuses to inline something

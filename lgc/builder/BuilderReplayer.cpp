@@ -29,6 +29,7 @@
  ***********************************************************************************************************************
  */
 #include "lgc/builder/BuilderReplayer.h"
+#include "BuilderImpl.h"
 #include "lgc/LgcContext.h"
 #include "lgc/builder/BuilderRecorder.h"
 #include "lgc/state/PipelineState.h"
@@ -126,7 +127,7 @@ bool BuilderReplayer::runImpl(Module &module, PipelineState *pipelineState) {
 
   // Create the BuilderImpl to replay into, passing it the PipelineState
   LgcContext *builderContext = pipelineState->getLgcContext();
-  m_builder.reset(builderContext->createBuilder(pipelineState, /*useBuilderRecorder=*/false));
+  m_builder.reset(new BuilderImpl(builderContext, pipelineState));
 
   SmallVector<Function *, 8> funcsToRemove;
 
@@ -191,7 +192,7 @@ void BuilderReplayer::replayCall(unsigned opcode, CallInst *call) {
     m_builder->setShaderStage(stage);
   }
 
-  // Set the insert point on the Builder. Also sets debug location to that of pCall.
+  // Set the insert point on the Builder. Also sets debug location to that of call.
   m_builder->SetInsertPoint(call);
 
   // Process the builder call.
@@ -213,7 +214,7 @@ void BuilderReplayer::replayCall(unsigned opcode, CallInst *call) {
 // =====================================================================================================================
 // Process one recorder builder call.
 // Returns the replacement value, or nullptr in the case that we do not want the caller to replace uses of
-// pCall with the new value.
+// call with the new value.
 //
 // @param opcode : The builder call opcode
 // @param call : The builder call to process
@@ -324,6 +325,10 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
     return m_builder->CreateSqrt(args[0]);
   }
 
+  case BuilderRecorder::InverseSqrt: {
+    return m_builder->CreateInverseSqrt(args[0]);
+  }
+
   case BuilderRecorder::SAbs: {
     return m_builder->CreateSAbs(args[0]);
   }
@@ -377,7 +382,7 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   }
 
   case BuilderRecorder::Opcode::Derivative: {
-    return m_builder->CreateDerivative(args[0],                                     // pInputValue
+    return m_builder->CreateDerivative(args[0],                                     // inputValue
                                        cast<ConstantInt>(args[1])->getZExtValue(),  // isY
                                        cast<ConstantInt>(args[2])->getZExtValue()); // isFine
   }
@@ -435,15 +440,16 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
     assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(call->getType(), m_builder->getInt8Ty()));
     return m_builder->CreateLoadBufferDesc(cast<ConstantInt>(args[0])->getZExtValue(), // descSet
                                            cast<ConstantInt>(args[1])->getZExtValue(), // binding
-                                           args[2],                                    // pDescIndex
+                                           args[2],                                    // descIndex
                                            cast<ConstantInt>(args[3])->getZExtValue(), // flags
-                                           m_builder->getInt8Ty());                    // pPointeeTy
+                                           m_builder->getInt8Ty());                    // pointeeTy
   }
 
   case BuilderRecorder::Opcode::GetDescStride:
     return m_builder->CreateGetDescStride(static_cast<ResourceNodeType>(cast<ConstantInt>(args[0])->getZExtValue()),
-                                          cast<ConstantInt>(args[1])->getZExtValue(),  // descSet
-                                          cast<ConstantInt>(args[2])->getZExtValue()); // binding
+                                          static_cast<ResourceNodeType>(cast<ConstantInt>(args[1])->getZExtValue()),
+                                          cast<ConstantInt>(args[2])->getZExtValue(),  // descSet
+                                          cast<ConstantInt>(args[3])->getZExtValue()); // binding
 
   case BuilderRecorder::Opcode::GetDescPtr:
     return m_builder->CreateGetDescPtr(
@@ -661,6 +667,14 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
                                            outputInfo);
   }
 
+  case BuilderRecorder::Opcode::ReadBaryCoord: {
+    auto builtIn = static_cast<BuiltInKind>(cast<ConstantInt>(args[0])->getZExtValue());
+    InOutInfo inputInfo(cast<ConstantInt>(args[1])->getZExtValue());
+    return m_builder->CreateReadBaryCoord(builtIn,                                         // BuiltIn
+                                          inputInfo,                                       // Input info
+                                          isa<UndefValue>(args[2]) ? nullptr : &*args[2]); // auxInterpValue
+  }
+
   case BuilderRecorder::Opcode::ReadBuiltInInput: {
     auto builtIn = static_cast<BuiltInKind>(cast<ConstantInt>(args[0])->getZExtValue());
     InOutInfo inputInfo(cast<ConstantInt>(args[1])->getZExtValue());
@@ -689,6 +703,18 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
                                                isa<UndefValue>(args[4]) ? nullptr : &*args[4]); // Index
   }
 
+#if VKI_RAY_TRACING
+  case BuilderRecorder::Opcode::ImageBvhIntersectRayAMD: {
+    Value *bvhNodePtr = args[0];
+    Value *extent = args[1];
+    Value *origin = args[2];
+    Value *direction = args[3];
+    Value *invDirection = args[4];
+    Value *imageDesc = args[5];
+    return m_builder->CreateImageBvhIntersectRay(bvhNodePtr, extent, origin, direction, invDirection, imageDesc);
+  }
+
+#endif
   case BuilderRecorder::Opcode::ReadTaskPayload: {
     return m_builder->CreateReadTaskPayload(call->getType(), // Result type
                                             args[0]);        // Byte offset within the payload structure
@@ -697,6 +723,22 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   case BuilderRecorder::Opcode::WriteTaskPayload: {
     return m_builder->CreateWriteTaskPayload(args[0],  // Value to write
                                              args[1]); // Byte offset within the payload structure
+  }
+
+  case BuilderRecorder::Opcode::TaskPayloadAtomic: {
+    unsigned atomicOp = cast<ConstantInt>(args[0])->getZExtValue();
+    auto ordering = static_cast<AtomicOrdering>(cast<ConstantInt>(args[1])->getZExtValue());
+    Value *inputValue = args[2];
+    Value *byteOffset = args[3];
+    return m_builder->CreateTaskPayloadAtomic(atomicOp, ordering, inputValue, byteOffset);
+  }
+
+  case BuilderRecorder::Opcode::TaskPayloadAtomicCompareSwap: {
+    auto ordering = static_cast<AtomicOrdering>(cast<ConstantInt>(args[0])->getZExtValue());
+    Value *inputValue = args[1];
+    Value *comparatorValue = args[2];
+    Value *byteOffset = args[3];
+    return m_builder->CreateTaskPayloadAtomicCompareSwap(ordering, inputValue, comparatorValue, byteOffset);
   }
 
   // Replayer implementations of MiscBuilder methods

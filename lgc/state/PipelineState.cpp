@@ -50,6 +50,10 @@ using namespace llvm;
 static cl::opt<bool> EnableTessOffChip("enable-tess-offchip", cl::desc("Enable tessellation off-chip mode"),
                                        cl::init(false));
 
+// -enable-row-export: enable row export for mesh shader
+static cl::opt<bool> EnableRowExport("enable-row-export", cl::desc("Enable row export for mesh shader"),
+                                     cl::init(false));
+
 // Names for named metadata nodes when storing and reading back pipeline state
 static const char UnlinkedMetadataName[] = "lgc.unlinked";
 static const char PreRasterHasGsMetadataName[] = "lgc.prerast.has.gs";
@@ -213,6 +217,15 @@ namespace lgc {
 // Create BuilderReplayer pass
 ModulePass *createLegacyBuilderReplayer(Pipeline *pipeline);
 } // namespace lgc
+
+// =====================================================================================================================
+// Constructor
+//
+// @param builderContext : LGC builder context
+// @param emitLgc : Whether the option -emit-lgc is on
+PipelineState::PipelineState(LgcContext *builderContext, bool emitLgc)
+    : Pipeline(builderContext), m_emitLgc(emitLgc), m_meshRowExport(EnableRowExport) {
+}
 
 // =====================================================================================================================
 // Destructor
@@ -749,17 +762,20 @@ const ResourceNode *PipelineState::findPushConstantResourceNode() const {
 // Returns true when type nodeType is compatible with candidateType.
 // A node type is compatible with a candidate type iff (nodeType) <= (candidateType) in the ResourceNodeType lattice:
 //
-//                                                        DescriptorCombinedTexture
-//                                                                   +
-// DescriptorBufferCompact   InlineBuffer                            |
-//                   +         +                 +-------------------+--------------------+
-//                   |         |                 |                   |                    |
-//                   v         v                 v                   v                    v
-//                 DescriptorBuffer     DescriptorResource  DescriptorTexelBuffer  DescriptorSampler
-//                         +                     +                   +                    +
-//                         |                     |                   |                    |
-//                         |                     v                   |                    |
-//                         +----------------> Unknown <--------------+--------------------+
+// DescriptorBufferCompact
+//        +                                               DescriptorCombinedTexture
+//        |         DescriptorConstBufferCompact                     +
+//        |             +                                            |
+//        |             |    InlineBuffer                            |
+//        |             |      +                 +-------------------+--------------------+
+//        |             |      |                 |                   |                    |
+//        v             v      v                 v                   v                    v
+// DescriptorBuffer  DescriptorConstBuffer  DescriptorResource  DescriptorTexelBuffer  DescriptorSampler
+//          +            +                       +                   +                    +
+//          |            |                       |                   |                    |
+//          v            v                       |                   |                    |
+//       DescriptorAnyBuffer                     v                   |                    |
+//                +-------------------------> Unknown <--------------+--------------------+
 //
 // @param nodeType : Resource node type
 // @param candidateType : Resource node candidate type
@@ -767,8 +783,14 @@ static bool isNodeTypeCompatible(ResourceNodeType nodeType, ResourceNodeType can
   if (nodeType == ResourceNodeType::Unknown || candidateType == nodeType)
     return true;
 
-  if (nodeType == ResourceNodeType::DescriptorBuffer &&
-      (candidateType == ResourceNodeType::DescriptorBufferCompact || candidateType == ResourceNodeType::InlineBuffer))
+  if ((nodeType == ResourceNodeType::DescriptorConstBuffer || nodeType == DescriptorAnyBuffer) &&
+      (candidateType == ResourceNodeType::DescriptorConstBufferCompact ||
+       candidateType == ResourceNodeType::DescriptorConstBuffer || candidateType == ResourceNodeType::InlineBuffer))
+    return true;
+
+  if ((nodeType == ResourceNodeType::DescriptorBuffer || nodeType == DescriptorAnyBuffer) &&
+      (candidateType == ResourceNodeType::DescriptorBufferCompact ||
+       candidateType == ResourceNodeType::DescriptorBuffer))
     return true;
 
   if ((nodeType == ResourceNodeType::DescriptorResource || nodeType == ResourceNodeType::DescriptorTexelBuffer ||
@@ -793,6 +815,8 @@ static bool nodeTypeHasBinding(ResourceNodeType nodeType) {
   case ResourceNodeType::DescriptorTableVaPtr:
   case ResourceNodeType::DescriptorBufferCompact:
   case ResourceNodeType::InlineBuffer:
+  case ResourceNodeType::DescriptorConstBuffer:
+  case ResourceNodeType::DescriptorConstBufferCompact:
     return true;
   case ResourceNodeType::IndirectUserDataVaPtr:
   case ResourceNodeType::PushConst:
@@ -1239,6 +1263,8 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
       //  1) A stage-specific default is preferred.
       //  2) If specified by tuning option, use the specified wave size.
       //  3) If gl_SubgroupSize is used in shader, use the specified subgroup size when required.
+      //  4) If gl_SubgroupSize is not used in the (mesh/task/compute) shader, and the workgroup size is
+      //     not larger than 32, use wave size 32.
 
       if (checkingStage == ShaderStageFragment) {
         // Per programming guide, it's recommended to use wave64 for fragment shader.
@@ -1257,8 +1283,9 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
       if (waveSizeOption != 0)
         waveSize = waveSizeOption;
 
+      // Note: the conditions below override the tuning option.
       // If subgroup size is used in any shader in the pipeline, use the specified subgroup size as wave size.
-      if (getShaderModes()->getAnyUseSubgroupSize()) {
+      if (m_shaderModes.getAnyUseSubgroupSize()) {
         // If allowVaryWaveSize is enabled, subgroupSize is default as zero, initialized as waveSize
         subgroupSize = getShaderOptions(checkingStage).subgroupSize;
         subgroupSize = (subgroupSize == 0) ? waveSize : subgroupSize;
@@ -1267,6 +1294,21 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
 
         if ((subgroupSize < waveSize) || getOptions().fullSubgroups)
           waveSize = subgroupSize;
+      } else if (checkingStage == ShaderStageMesh || checkingStage == ShaderStageTask ||
+                 checkingStage == ShaderStageCompute) {
+        // If workgroup size is not larger than 32, use wave size 32.
+        unsigned workGroupSize;
+        if (checkingStage == ShaderStageMesh) {
+          auto &mode = m_shaderModes.getMeshShaderMode();
+          workGroupSize = mode.workgroupSizeX * mode.workgroupSizeY * mode.workgroupSizeZ;
+        } else {
+          assert(checkingStage == ShaderStageTask || checkingStage == ShaderStageCompute);
+          auto &mode = m_shaderModes.getComputeShaderMode();
+          workGroupSize = mode.workgroupSizeX * mode.workgroupSizeY * mode.workgroupSizeZ;
+        }
+
+        if (workGroupSize <= 32)
+          waveSize = 32;
       }
 
       assert(waveSize == 32 || waveSize == 64);
@@ -1278,6 +1320,21 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
     m_waveSize[stage] = m_waveSize[checkingStage];
     m_subgroupSize[stage] = m_subgroupSize[checkingStage];
   }
+}
+
+// =====================================================================================================================
+// Checks if SW-emulated mesh pipeline statistics is needed
+bool PipelineState::needSwMeshPipelineStats() const {
+  return getTargetInfo().getGfxIpVersion().major < 11;
+}
+
+// =====================================================================================================================
+// Checks if row export for mesh shader is enabled or not
+bool PipelineState::enableMeshRowExport() const {
+  if (getTargetInfo().getGfxIpVersion().major < 11)
+    return false; // Row export is not supported by HW
+
+  return m_meshRowExport;
 }
 
 // =====================================================================================================================
@@ -1432,7 +1489,7 @@ const char *PipelineState::getResourceNodeTypeName(ResourceNodeType type) {
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorReserved13)
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, InlineBuffer)
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorConstBuffer)
-    CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorReserved16)
+    CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorConstBufferCompact)
     break;
   default:
     llvm_unreachable("Should never be called!");
@@ -1460,7 +1517,16 @@ StringRef PipelineState::getBuiltInName(BuiltInKind builtIn) {
     return "InterpLinearCenter";
   case BuiltInInterpPullMode:
     return "InterpPullMode";
-
+  case BuiltInInterpPerspCenter:
+    return "InterpPerspCenter";
+  case BuiltInInterpPerspCentroid:
+    return "InterpPerspCentroid";
+  case BuiltInInterpLinearCentroid:
+    return "InterpLinearCentroid";
+  case BuiltInInterpPerspSample:
+    return "InterpPerspSample";
+  case BuiltInInterpLinearSample:
+    return "InterpLinearSample";
   default:
     llvm_unreachable("Should never be called!");
     return "unknown";

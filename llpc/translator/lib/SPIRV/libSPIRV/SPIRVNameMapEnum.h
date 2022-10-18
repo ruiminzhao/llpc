@@ -46,8 +46,8 @@
 #ifndef SPIRV_LIBSPIRV_SPIRVNAMEMAPENUM_H
 #define SPIRV_LIBSPIRV_SPIRVNAMEMAPENUM_H
 
-#include "spirvExt.h"
 #include "SPIRVEnum.h"
+#include "spirvExt.h"
 
 using namespace spv;
 
@@ -68,6 +68,14 @@ template <> inline void SPIRVMap<ExecutionModel, std::string>::init() {
   add(ExecutionModelGeometry, "Geometry");
   add(ExecutionModelFragment, "Fragment");
   add(ExecutionModelGLCompute, "GLCompute");
+#if VKI_RAY_TRACING
+  add(ExecutionModelRayGenerationKHR, "RayGenerationKHR");
+  add(ExecutionModelIntersectionKHR, "IntersectionKHR");
+  add(ExecutionModelAnyHitKHR, "AnyHitKHR");
+  add(ExecutionModelClosestHitKHR, "ClosestHitKHR");
+  add(ExecutionModelMissKHR, "MissKHR");
+  add(ExecutionModelCallableKHR, "CallableKHR");
+#endif
 }
 SPIRV_DEF_NAMEMAP(ExecutionModel, SPIRVExecutionModelNameMap)
 
@@ -144,6 +152,14 @@ template <> inline void SPIRVMap<StorageClass, std::string>::init() {
   add(StorageClassAtomicCounter, "AtomicCounter");
   add(StorageClassImage, "Image");
   add(StorageClassStorageBuffer, "StorageBuffer");
+#if VKI_RAY_TRACING
+  add(StorageClassCallableDataKHR, "CallableDataKHR");
+  add(StorageClassIncomingCallableDataKHR, "IncomingCallableDataKHR");
+  add(StorageClassRayPayloadKHR, "RayPayloadKHR");
+  add(StorageClassHitAttributeKHR, "HitAttributeKHR");
+  add(StorageClassIncomingRayPayloadKHR, "IncomingRayPayloadKHR");
+  add(StorageClassShaderRecordBufferKHR, "ShaderRecordBufferKHR");
+#endif
 }
 SPIRV_DEF_NAMEMAP(StorageClass, SPIRVStorageClassNameMap)
 
@@ -334,6 +350,23 @@ template <> inline void SPIRVMap<BuiltIn, std::string>::init() {
   add(BuiltInBaryCoordPullModelAMD, "BuiltInBaryCoordPullModelAMD");
   add(BuiltInBaryCoordKHR, "BuiltInBaryCoordKHR");
   add(BuiltInBaryCoordNoPerspKHR, "BuiltInBaryCoordNoPerspKHR");
+#if VKI_RAY_TRACING
+  add(BuiltInLaunchIdKHR, "BuiltInLaunchIdKHR");
+  add(BuiltInLaunchSizeKHR, "BuiltInLaunchSizeKHR");
+  add(BuiltInWorldRayOriginKHR, "BuiltInWorldRayOriginKHR");
+  add(BuiltInWorldRayDirectionKHR, "BuiltInWorldRayDirectionKHR");
+  add(BuiltInObjectRayOriginKHR, "BuiltInObjectRayOriginKHR");
+  add(BuiltInObjectRayDirectionKHR, "BuiltInObjectRayDirectionKHR");
+  add(BuiltInRayTminKHR, "BuiltInRayTminKHR");
+  add(BuiltInRayTmaxKHR, "BuiltInRayTmaxKHR");
+  add(BuiltInInstanceCustomIndexKHR, "BuiltInInstanceCustomIndexKHR");
+  add(BuiltInObjectToWorldKHR, "BuiltInObjectToWorldKHR");
+  add(BuiltInWorldToObjectKHR, "BuiltInWorldToObjectKHR");
+  add(BuiltInHitTNV, "BuiltInHitTNV");
+  add(BuiltInHitKindKHR, "BuiltInHitKindKHR");
+  add(BuiltInIncomingRayFlagsKHR, "BuiltInIncomingRayFlagsKHR");
+  add(BuiltInCullMaskKHR, "BuiltInCullMaskKHR");
+#endif
 }
 SPIRV_DEF_NAMEMAP(BuiltIn, SPIRVBuiltInNameMap)
 
@@ -372,14 +405,10 @@ template <> inline void SPIRVMap<Capability, std::string>::init() {
   add(CapabilityGeometryPointSize, "GeometryPointSize");
   add(CapabilityImageGatherExtended, "ImageGatherExtended");
   add(CapabilityStorageImageMultisample, "StorageImageMultisample");
-  add(CapabilityUniformBufferArrayDynamicIndexing,
-      "UniformBufferArrayDynamicIndexing");
-  add(CapabilitySampledImageArrayDynamicIndexing,
-      "SampledImageArrayDynamicIndexing");
-  add(CapabilityStorageBufferArrayDynamicIndexing,
-      "StorageBufferArrayDynamicIndexing");
-  add(CapabilityStorageImageArrayDynamicIndexing,
-      "StorageImageArrayDynamicIndexing");
+  add(CapabilityUniformBufferArrayDynamicIndexing, "UniformBufferArrayDynamicIndexing");
+  add(CapabilitySampledImageArrayDynamicIndexing, "SampledImageArrayDynamicIndexing");
+  add(CapabilityStorageBufferArrayDynamicIndexing, "StorageBufferArrayDynamicIndexing");
+  add(CapabilityStorageImageArrayDynamicIndexing, "StorageImageArrayDynamicIndexing");
   add(CapabilityClipDistance, "ClipDistance");
   add(CapabilityCullDistance, "CullDistance");
   add(CapabilityImageCubeArray, "ImageCubeArray");
@@ -404,8 +433,7 @@ template <> inline void SPIRVMap<Capability, std::string>::init() {
   add(CapabilityTransformFeedback, "TransformFeedback");
   add(CapabilityGeometryStreams, "GeometryStreams");
   add(CapabilityStorageImageReadWithoutFormat, "StorageImageReadWithoutFormat");
-  add(CapabilityStorageImageWriteWithoutFormat,
-      "StorageImageWriteWithoutFormat");
+  add(CapabilityStorageImageWriteWithoutFormat, "StorageImageWriteWithoutFormat");
   add(CapabilityMultiViewport, "MultiViewport");
   add(CapabilityStencilExportEXT, "StencilExportEXT");
   add(CapabilityShaderViewportIndexLayerEXT, "ShaderViewportIndexLayerEXT");
@@ -434,6 +462,10 @@ template <> inline void SPIRVMap<Capability, std::string>::init() {
   add(CapabilitySignedZeroInfNanPreserve, "SignedZeroInfNanPreserve");
   add(CapabilityRoundingModeRTE, "RoundingModeRTE");
   add(CapabilityRoundingModeRTZ, "RoundingModeRTZ");
+#if VKI_RAY_TRACING
+  add(CapabilityRayQueryProvisionalKHR, "RayQueryProvisionalKHR");
+  add(CapabilityRayTraversalPrimitiveCullingKHR, "RayTraversalPrimitiveCullingKHR");
+#endif
   add(CapabilityImageGatherBiasLodAMD, "ImageGatherBiasLodAMD");
   add(CapabilityFragmentMaskAMD, "FragmentMaskAMD");
   add(CapabilityFloat16ImageAMD, "Float16ImageAMD");
@@ -443,6 +475,9 @@ template <> inline void SPIRVMap<Capability, std::string>::init() {
   add(CapabilityVariablePointers, "VariablePointers");
   add(CapabilityFragmentShadingRateKHR, "FragmentShadingRateKHR");
   add(CapabilityFragmentBarycentricKHR, "FragmentBarycentricKHR");
+#if VKI_RAY_TRACING
+  add(CapabilityRayTracingProvisionalKHR, "RayTracingProvisionalKHR");
+#endif
   add(CapabilityShaderNonUniformEXT, "ShaderNonUniformEXT");
   add(CapabilityRuntimeDescriptorArrayEXT, "RuntimeDescriptorArrayEXT");
   add(CapabilityInputAttachmentArrayDynamicIndexingEXT, "InputAttachmentArrayDynamicIndexingEXT");

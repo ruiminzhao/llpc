@@ -116,7 +116,6 @@ bool PatchPreparePipelineAbi::runImpl(Module &module, PipelineShadersResult &pip
   } else {
     if (m_gfxIp.major >= 9)
       mergeShaderAndSetCallingConvs(module);
-
     setAbiEntryNames(module);
     setRemainingCallingConvs(module);
   }

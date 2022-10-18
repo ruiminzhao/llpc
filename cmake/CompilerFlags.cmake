@@ -33,7 +33,11 @@ function(set_compiler_options PROJECT_NAME ENABLE_WERROR)
         target_compile_options("${PROJECT_NAME}" PRIVATE $<$<COMPILE_LANGUAGE:CXX>:
             -fno-rtti
             -fPIC
-            -std=c++14
+            -std=c++17
+            # Some of the games using old versions of the tcmalloc lib are
+            # crashing when allocating aligned memory. C++17 enables aligned new
+            # by default, so we need to disable it to prevent those crashes.
+            -fno-aligned-new
             -Wno-ignored-qualifiers
             -Wno-missing-field-initializers
             -Wno-invalid-offsetof           # offsetof within non-standard-layout type 'x' is undefined
@@ -93,6 +97,9 @@ function(set_compiler_options PROJECT_NAME ENABLE_WERROR)
                 /wd4800 # forcing value to bool 'true' or 'false' (performance warning)
                 /wd6246 # Local declaration of 'S' hides declaration of the same name in outer scope
                 /wd6323 # Use of arithmetic operator on Boolean type(s)
+        )
+        target_compile_options("${PROJECT_NAME}" PRIVATE
+          /std:c++17
         )
 
         target_compile_definitions("${PROJECT_NAME}" PRIVATE _SCL_SECURE_NO_WARNINGS)

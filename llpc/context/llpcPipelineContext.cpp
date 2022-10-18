@@ -147,8 +147,18 @@ namespace Llpc {
 // @param gfxIp : Graphics IP version info
 // @param pipelineHash : Pipeline hash code
 // @param cacheHash : Cache hash code
-PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash)
-    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash), m_resourceMapping() {
+PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash
+#if VKI_RAY_TRACING
+                                 ,
+                                 const Vkgc::RtState *rtState
+#endif
+                                 )
+    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash)
+#if VKI_RAY_TRACING
+      ,
+      m_rtState(rtState)
+#endif
+{
 }
 
 // =====================================================================================================================
@@ -202,6 +212,17 @@ ShaderHash PipelineContext::getShaderHashCode(ShaderStage stage) const {
   return hash;
 }
 
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Return ray tracing/ray query entry function names
+//
+// @param funcType : function type
+const char *PipelineContext::getRayTracingFunctionName(unsigned funcType) {
+  assert(funcType < Vkgc::RT_ENTRY_FUNC_COUNT);
+  return getRayTracingState()->gpurtFuncTable.pFunc[funcType];
+}
+#endif
+
 // =====================================================================================================================
 // Set pipeline state in Pipeline object for middle-end and/or calculate the hash for the state to be added.
 // Doing both these things in the same code ensures that we hash and use the same pipeline state in all situations.
@@ -217,6 +238,10 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
   // Give the shader stage mask to the middle-end. We need to translate the Vkgc::ShaderStage bit numbers
   // to lgc::ShaderStage bit numbers. We only process native shader stages, ignoring the CopyShader stage.
   unsigned stageMask = getShaderStageMask();
+#if VKI_RAY_TRACING
+  if (hasRayTracingShaderStage(stageMask))
+    stageMask = ShaderStageComputeBit;
+#endif
   unsigned lgcStageMask = 0;
   const auto stages = maskToShaderStages(stageMask);
   for (ShaderStage stage : make_filter_range(stages, isNativeStage)) {
@@ -231,14 +256,13 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
     if (getPreRasterHasGs())
       pipeline->setPreRasterHasGs(true);
   }
-
-  // Give the pipeline options to the middle-end, and/or hash them.
-  setOptionsInPipeline(pipeline, hasher);
-
   if (!unlinked) {
     // Give the user data nodes to the middle-end, and/or hash them.
     setUserDataInPipeline(pipeline, hasher, stageMask);
   }
+
+  // Give the pipeline options to the middle-end, and/or hash them.
+  setOptionsInPipeline(pipeline, hasher);
 
   if (isGraphics()) {
     if ((stageMask & ~shaderStageToMask(ShaderStageFragment)) && (!unlinked || DisableFetchShader)) {
@@ -254,6 +278,9 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
     // Give the graphics pipeline state to the middle-end.
     setGraphicsStateInPipeline(pipeline, hasher, stageMask);
   } else {
+#if VKI_RAY_TRACING
+    if (!hasRayTracingShaderStage(stageMask))
+#endif
     {
       unsigned deviceIndex = static_cast<const ComputePipelineBuildInfo *>(getPipelineBuildInfo())->deviceIndex;
       if (pipeline)
@@ -285,6 +312,11 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
   options.threadGroupSwizzleMode =
       static_cast<lgc::ThreadGroupSwizzleMode>(getPipelineOptions()->threadGroupSwizzleMode);
+
+  if (getPipelineOptions()->reverseThreadGroup) {
+    options.reverseThreadGroupBufferDescSet = Vkgc::InternalDescriptorSetId;
+    options.reverseThreadGroupBufferBinding = Vkgc::ReverseThreadGroupControlBinding;
+  }
 
   switch (getPipelineOptions()->shadowDescriptorTableUsage) {
   case Vkgc::ShadowDescriptorTableUsage::Auto:
@@ -357,6 +389,12 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
   // Driver report full subgroup lanes for compute shader, here we just set fullSubgroups as default options
   options.fullSubgroups = true;
+#if VKI_RAY_TRACING
+  // NOTE: raytracing waveSize and subgroupSize can be different.
+  if (isRayTracing()) {
+    options.fullSubgroups = false;
+  }
+#endif
   if (pipeline)
     pipeline->setOptions(options);
   if (hasher)
@@ -380,6 +418,7 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
     shaderOptions.trapPresent = shaderInfo->options.trapPresent;
     shaderOptions.debugMode = shaderInfo->options.debugMode;
     shaderOptions.allowReZ = shaderInfo->options.allowReZ;
+    shaderOptions.forceLateZ = shaderInfo->options.forceLateZ;
 
     if (shaderInfo->options.vgprLimit != 0 && shaderInfo->options.vgprLimit != UINT_MAX)
       shaderOptions.vgprLimit = shaderInfo->options.vgprLimit;
@@ -416,6 +455,15 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
       // size for a shader that uses gl_SubgroupSize.
       shaderOptions.subgroupSize = SubgroupSize;
     }
+#if VKI_RAY_TRACING
+    // NOTE: WaveSize of raytracing usually be 32
+    if (hasRayQuery() || isRayTracing()) {
+      shaderOptions.waveSize = getRayTracingWaveSize();
+    }
+#endif
+#if VKI_RAY_TRACING
+    options.internalRtShaders = getPipelineOptions()->internalRtShaders;
+#endif
 
     // Use a static cast from Vkgc WaveBreakSize to LGC WaveBreak, and static assert that
     // that is valid.
@@ -473,6 +521,15 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
       shaderOptions.ldsSpillLimitDwords = shaderInfo->options.ldsSpillLimitDwords;
     else
       shaderOptions.ldsSpillLimitDwords = LdsSpillLimitDwords;
+
+    shaderOptions.overrideShaderThreadGroupSizeX = shaderInfo->options.overrideShaderThreadGroupSizeX;
+    shaderOptions.overrideShaderThreadGroupSizeY = shaderInfo->options.overrideShaderThreadGroupSizeY;
+    shaderOptions.overrideShaderThreadGroupSizeZ = shaderInfo->options.overrideShaderThreadGroupSizeZ;
+
+    shaderOptions.nsaThreshold = shaderInfo->options.nsaThreshold;
+
+    shaderOptions.aggressiveInvariantLoads = shaderInfo->options.aggressiveInvariantLoads;
+    shaderOptions.disableInvariantLoads = shaderInfo->options.disableInvariantLoads;
 
     pipeline->setShaderOptions(getLgcShaderStage(static_cast<ShaderStage>(stage)), shaderOptions);
   }
@@ -608,12 +665,8 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
       static_assert(ResourceNodeType::DescriptorBufferCompact ==
                         static_cast<ResourceNodeType>(ResourceMappingNodeType::DescriptorBufferCompact),
                     "Mismatch");
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 50
+
       if (node.type == ResourceMappingNodeType::InlineBuffer)
-#else
-      // A "PushConst" is in fact an InlineBuffer when it appears in a non-root table.
-      if (node.type == ResourceMappingNodeType::PushConst && !isRoot)
-#endif
         destNode.concreteType = ResourceNodeType::InlineBuffer;
       else if (node.type == ResourceMappingNodeType::DescriptorYCbCrSampler)
         destNode.concreteType = ResourceNodeType::DescriptorResource;
@@ -645,6 +698,7 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
       case ResourceMappingNodeType::DescriptorCombinedTexture:
         destNode.stride = (DescriptorSizeResource + DescriptorSizeSampler) / sizeof(uint32_t);
         break;
+      case ResourceMappingNodeType::InlineBuffer:
       case ResourceMappingNodeType::DescriptorYCbCrSampler:
         // Current node.sizeInDwords = resourceDescSizeInDwords * M * N (M means plane count, N means array count)
         // TODO: Desired destNode.stride = resourceDescSizeInDwords * M
@@ -914,6 +968,17 @@ void PipelineContext::setColorExportState(Pipeline *pipeline, Util::MetroHash64 
 
   pipeline->setColorExportState(formats, state);
 }
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Get wave size used for raytracing
+unsigned PipelineContext::getRayTracingWaveSize() const {
+  if ((m_gfxIp.major >= 10) && !isGraphics())
+    return 32;
+  return 64;
+}
+
+#endif
 
 // =====================================================================================================================
 // Map a VkFormat to a {BufDataFormat, BufNumFormat}. Returns BufDataFormatInvalid if the

@@ -118,10 +118,11 @@ Expected<BinaryData> ComputePipelineBuilder::buildComputePipeline() {
     ResourceMappingNodeMap nodeSets;
     unsigned pushConstSize = 0;
     doAutoLayoutDesc(ShaderStageCompute, moduleData.spirvBin, nullptr, shaderInfo, nodeSets, pushConstSize,
-                     /*autoLayoutDesc =*/compileInfo.autoLayoutDesc);
+                     /*autoLayoutDesc =*/compileInfo.autoLayoutDesc,
+                     compileInfo.compPipelineInfo.options.reverseThreadGroup);
 
     buildTopLevelMapping(ShaderStageComputeBit, nodeSets, pushConstSize, &pipelineInfo->resourceMapping,
-                         compileInfo.autoLayoutDesc);
+                         compileInfo.autoLayoutDesc | compileInfo.compPipelineInfo.options.reverseThreadGroup);
   }
 
   pipelineInfo->pInstance = nullptr; // Placeholder, unused.
@@ -137,11 +138,15 @@ Expected<BinaryData> ComputePipelineBuilder::buildComputePipeline() {
   pipelineInfo->options.overrideThreadGroupSizeY = compileInfo.compPipelineInfo.options.overrideThreadGroupSizeY;
   pipelineInfo->options.overrideThreadGroupSizeZ = compileInfo.compPipelineInfo.options.overrideThreadGroupSizeZ;
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
-  if (compileInfo.optimizationLevel.hasValue()) {
-    pipelineInfo->options.optimizationLevel = compileInfo.optimizationLevel.getValue();
+  if (compileInfo.optimizationLevel.has_value()) {
+    pipelineInfo->options.optimizationLevel = compileInfo.optimizationLevel.value();
   }
 #endif
   pipelineInfo->options.threadGroupSwizzleMode = compileInfo.compPipelineInfo.options.threadGroupSwizzleMode;
+  pipelineInfo->options.reverseThreadGroup = compileInfo.compPipelineInfo.options.reverseThreadGroup;
+#if VKI_RAY_TRACING
+  pipelineInfo->options.internalRtShaders = compileInfo.internalRtShaders;
+#endif
 
   PipelineBuildInfo localPipelineInfo = {};
   localPipelineInfo.pComputeInfo = pipelineInfo;
