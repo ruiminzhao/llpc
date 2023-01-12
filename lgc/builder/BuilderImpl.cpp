@@ -28,7 +28,7 @@
  * @brief LLPC source file: implementation of lgc::BuilderImpl
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
@@ -76,165 +76,160 @@ Value *BuilderImplBase::CreateDotProduct(Value *const vector1, Value *const vect
 
 // =====================================================================================================================
 // Create code to calculate the dot product of two integer vectors, with optional accumulator, using hardware support
-// where available.
-// Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is saturated
-// if there is an accumulator. The component type of input vectors can have 8-bit/16-bit/32-bit and i32/i16/i8 result.
+// where available. The factor inputs are always <N x iM> of the same type, N can be arbitrary and M must be 4, 8, 16,
+// 32, or 64 Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is
+// saturated if there is an accumulator. Only the final addition to the accumulator needs to be saturated.
+// Intermediate overflows of the dot product can lead to an undefined result.
 //
-// @param vector1 : The integer vector 1
-// @param vector2 : The integer vector 2
+// @param vector1 : The integer Vector 1
+// @param vector2 : The integer Vector 2
 // @param accumulator : The accumulator to the scalar of dot product
-// @param flags : Bit 0 is "first vector is signed" and bit 1 is "second vector is signed"
+// @param flags : The first bit marks whether Vector 1 is signed and the second bit marks whether Vector 2 is signed
 // @param instName : Name to give instruction(s)
 Value *BuilderImplBase::CreateIntegerDotProduct(Value *vector1, Value *vector2, Value *accumulator, unsigned flags,
                                                 const Twine &instName) {
+  if (flags == SecondVectorSigned) {
+    std::swap(vector1, vector2);
+    flags = FirstVectorSigned;
+  }
+  const bool isBothSigned = (flags == (FirstVectorSigned | SecondVectorSigned));
+  const bool isMixedSigned = (flags == FirstVectorSigned);
+  const bool isSigned = isBothSigned || isMixedSigned;
+
+  // The factor inputs are always <N x iM> of the same type
   Type *inputTy = vector1->getType();
-  assert(inputTy->isVectorTy() && inputTy->getScalarType()->isIntegerTy());
-  Value *scalar = nullptr;
-  Type *outputTy = accumulator->getType();
-
-  // The component of Vector 2 can be signed or unsigned
-  const bool isSigned = (flags & FirstVectorSigned);
-  // The mixed signed/unsigned is that component of Vector 1 is treated as signed and component of Vector 2 is treated
-  // as unsigned.
-  const bool isMixed = (flags == FirstVectorSigned);
-
-  const unsigned compBitWidth = inputTy->getScalarSizeInBits();
-  assert(compBitWidth >= 8 && compBitWidth <= 64);
-
-  auto &supportIntegerDotFlag = getPipelineState()->getTargetInfo().getGpuProperty().supportIntegerDotFlag;
-  // Check if the component bitwidth of vectors and the signedness of component of vectors are both supported by HW.
-  const bool isSupportCompBitwidth = (supportIntegerDotFlag.compBitwidth16 && compBitWidth == 16) ||
-                                     (supportIntegerDotFlag.compBitwidth8 && compBitWidth == 8);
-  const bool isSupportSignedness =
-      isMixed ? supportIntegerDotFlag.diffSignedness : supportIntegerDotFlag.sameSignedness;
-  const bool hasHwNativeSupport = isSupportCompBitwidth && isSupportSignedness;
-
-  // NOTE: For opcodes with an accumulator, the spec said "If any of the multiplications or additions, with the
-  // exception of the final accumulation, overflow or underflow, the result of the instruction is undefined". For
-  // opcodes without accumulator, the spec said "The resulting value will equal the low-order N bits of the correct
-  // result R, where N is the result width and R is computed with enough precision to avoid overflow and underflow".
-  const bool hasAccumulator = !(isa<ConstantInt>(accumulator) && cast<ConstantInt>(accumulator)->isNullValue());
+  assert(inputTy->isVectorTy() && inputTy->getScalarType()->isIntegerTy() && inputTy == vector2->getType());
   const unsigned compCount = cast<FixedVectorType>(inputTy)->getNumElements();
-  Type *targetTy = hasHwNativeSupport ? getInt32Ty() : getInt64Ty();
-  accumulator = isSigned ? CreateSExt(accumulator, targetTy) : CreateZExt(accumulator, targetTy);
-  if (!hasHwNativeSupport) {
-    // Emulate dot product with no HW support cases
-    scalar = getIntN(targetTy->getScalarSizeInBits(), 0);
 
-    for (unsigned elemIdx = 0; elemIdx < compCount; ++elemIdx) {
-      Value *elem1 = CreateExtractElement(vector1, elemIdx);
-      elem1 = isSigned ? CreateSExt(elem1, targetTy) : CreateZExt(elem1, targetTy);
-      Value *elem2 = CreateExtractElement(vector2, elemIdx);
-      elem2 = (isSigned && !isMixed) ? CreateSExt(elem2, targetTy) : CreateZExt(elem2, targetTy);
-      Value *product = CreateMul(elem1, elem2);
-      scalar = CreateAdd(product, scalar);
+  // The supported size of M
+  const unsigned compBitWidth = inputTy->getScalarSizeInBits();
+  assert(compBitWidth == 4 || compBitWidth == 8 || compBitWidth == 16 || compBitWidth == 32 || compBitWidth == 64);
+
+  // The result type is given by accumulator, which must be greater than or equal to that of the components of Vector 1
+  Type *expectedTy = accumulator->getType();
+  const bool hasAccumulator = !(isa<ConstantInt>(accumulator) && cast<ConstantInt>(accumulator)->isNullValue());
+  const unsigned expectedWidth = expectedTy->getScalarSizeInBits();
+  assert(expectedWidth == 4 || expectedWidth == 8 || expectedWidth == 16 || expectedWidth == 32 || expectedWidth == 64);
+
+  // Check if there is a native intrinsic that can do the entire operation (dot product and saturating accumulate) in a
+  // single instruction. They must meet the two conditions:
+  // 1. The required native intrinsic is supported by the specified hardware
+  // 2. The factor inputs must be <2 x i16> or <N x i8> (N <= 4) or <N x i4> (N <= 8)
+  const auto &supportIntegerDotFlag = getPipelineState()->getTargetInfo().getGpuProperty().supportIntegerDotFlag;
+  const bool isSupportCompBitwidth = (supportIntegerDotFlag.compBitwidth16 && compBitWidth == 16) ||
+                                     (supportIntegerDotFlag.compBitwidth8 && compBitWidth == 8) ||
+                                     (supportIntegerDotFlag.compBitwidth4 && compBitWidth == 4);
+  const bool isSupportSignedness =
+      isMixedSigned ? supportIntegerDotFlag.diffSignedness : supportIntegerDotFlag.sameSignedness;
+  const bool isDot2 = (compCount == 2 && compBitWidth == 16);
+  const bool isDot4 = (compCount <= 4 && compBitWidth == 8);
+  const bool isDot8 = (compCount <= 8 && compBitWidth == 4);
+  const bool hasNativeIntrinsic =
+      isSupportCompBitwidth && isSupportSignedness && (isDot2 || isDot4 || isDot8) && (expectedWidth <= 32);
+  const bool hasSudot = getPipelineState()->getTargetInfo().getGfxIpVersion().major >= 11;
+
+  auto input1 = vector1;
+  auto input2 = vector2;
+  Value *computedResult = nullptr;
+  if (hasNativeIntrinsic) {
+    int supportedN = InvalidValue;
+    int intrinsic = InvalidValue;
+    if (isDot2) {
+      intrinsic = isBothSigned ? Intrinsic::amdgcn_sdot2 : Intrinsic::amdgcn_udot2;
+      supportedN = 2;
+    } else if (isDot4) {
+      if (hasSudot)
+        intrinsic = isSigned ? Intrinsic::amdgcn_sudot4 : Intrinsic::amdgcn_udot4;
+      else
+        intrinsic = isBothSigned ? Intrinsic::amdgcn_sdot4 : Intrinsic::amdgcn_udot4;
+      supportedN = 4;
+    } else {
+      assert(isDot8);
+      if (hasSudot)
+        intrinsic = isSigned ? Intrinsic::amdgcn_sudot8 : Intrinsic::amdgcn_udot8;
+      else
+        intrinsic = isBothSigned ? Intrinsic::amdgcn_sdot8 : Intrinsic::amdgcn_udot8;
+      supportedN = 8;
     }
-    if (hasAccumulator) {
-      if (compBitWidth == 8 || compBitWidth == 16) {
-        scalar = CreateTrunc(scalar, getInt32Ty());
-        accumulator = CreateTrunc(accumulator, getInt32Ty());
-        Intrinsic::ID addIntrinsic = isSigned ? Intrinsic::sadd_sat : Intrinsic::uadd_sat;
-        scalar = CreateBinaryIntrinsic(addIntrinsic, scalar, accumulator, nullptr, instName);
-      } else {
-        scalar = CreateAdd(scalar, accumulator);
-      }
-    }
-  } else {
-    // <4xi8>, <3xi8>, <2xi8> are native supported by using v_dot4_i32_i8 or v_dot4_u32_u8
-    // <2xi16> is native supported by using v_dot2_i32_i16 and v_dot2_u32_u16
-    // <3xi16>, <4xi16> will be split up with two sequences of v_dot2 and a final saturation add
-    Value *input1 = vector1;
-    Value *input2 = vector2;
+    assert(intrinsic != InvalidValue);
+    // Do null-extension
+    SmallVector<int, 8> shuffleMask;
+    for (int i = 0; i < supportedN; ++i)
+      shuffleMask.push_back(std::min(i, static_cast<int>(compCount)));
+    input1 = CreateShuffleVector(input1, Constant::getNullValue(inputTy), shuffleMask);
+    input2 = CreateShuffleVector(input2, Constant::getNullValue(inputTy), shuffleMask);
 
-    bool isDot4 = (compBitWidth == 8);
-    Value *clamp = hasAccumulator ? getTrue() : getFalse();
-
-    if (isDot4) {
-      if (compCount < 4) {
-        // Extend <3xi8> or <2xi8> to <4xi8>
-        input1 = CreateShuffleVector(input1, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1, 2, 3}));
-        input2 = CreateShuffleVector(input2, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1, 2, 3}));
-      }
-      // Cast <4xi8> to i32
+    // Cast to i32 for dot4 and dot8
+    if (compBitWidth == 4 || compBitWidth == 8) {
       input1 = CreateBitCast(input1, getInt32Ty());
       input2 = CreateBitCast(input2, getInt32Ty());
-      auto intrinsicDot4 = isSigned ? Intrinsic::amdgcn_sdot4 : Intrinsic::amdgcn_udot4;
-      { scalar = CreateIntrinsic(intrinsicDot4, {}, {input1, input2, accumulator, clamp}, nullptr, instName); }
+    }
+
+    Value *clamp = hasAccumulator ? getTrue() : getFalse();
+    accumulator = isSigned ? CreateSExt(accumulator, getInt32Ty()) : CreateZExt(accumulator, getInt32Ty());
+    if (hasSudot && isSigned) {
+      computedResult = CreateIntrinsic(
+          intrinsic, {}, {getTrue(), input1, getInt1(isBothSigned), input2, accumulator, clamp}, nullptr, instName);
     } else {
-      auto intrinsicDot2 = isSigned ? Intrinsic::amdgcn_sdot2 : Intrinsic::amdgcn_udot2;
-      if (compCount == 2) {
-        scalar = CreateIntrinsic(intrinsicDot2, {}, {input1, input2, accumulator, clamp}, nullptr, instName);
-      } else {
-        Value *intermediateRes = nullptr;
-        scalar = nullptr;
-        if (compCount == 3) {
-          // Split <3xi16> up with an integer multiplication, a 16-bit integer dot product
-          Value *w1 = CreateExtractElement(input1, 2);
-          Value *w2 = CreateExtractElement(input2, 2);
-          w1 = isSigned ? CreateSExt(w1, getInt32Ty()) : CreateZExt(w1, getInt32Ty());
-          w2 = isSigned ? CreateSExt(w2, getInt32Ty()) : CreateZExt(w2, getInt32Ty());
-          intermediateRes = CreateMul(w1, w2);
-
-          input1 = CreateShuffleVector(input1, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1}));
-          input2 = CreateShuffleVector(input2, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1}));
-          scalar =
-              CreateIntrinsic(intrinsicDot2, {}, {input1, input2, intermediateRes, getInt1(false)}, nullptr, instName);
-        } else {
-          assert(compCount == 4);
-          // Split <4xi16> up with two 16-bit integer dot product
-          Value *vec1 = CreateShuffleVector(input1, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1}));
-          Value *vec2 = CreateShuffleVector(input2, Constant::getNullValue(inputTy), ArrayRef<int>({0, 1}));
-          intermediateRes =
-              CreateIntrinsic(intrinsicDot2, {}, {vec1, vec2, getInt32(0), getInt1(false)}, nullptr, instName);
-
-          input1 = CreateShuffleVector(input1, Constant::getNullValue(inputTy), ArrayRef<int>({2, 3}));
-          input2 = CreateShuffleVector(input2, Constant::getNullValue(inputTy), ArrayRef<int>({2, 3}));
-          scalar =
-              CreateIntrinsic(intrinsicDot2, {}, {input1, input2, intermediateRes, getInt1(false)}, nullptr, instName);
-        }
-        // Add a saturation add if required.
-        if (hasAccumulator) {
-          Intrinsic::ID addIntrinsic = isSigned ? Intrinsic::sadd_sat : Intrinsic::uadd_sat;
-          scalar = CreateBinaryIntrinsic(addIntrinsic, scalar, accumulator, nullptr, instName);
-        }
+      computedResult = CreateIntrinsic(intrinsic, {}, {input1, input2, accumulator, clamp}, nullptr, instName);
+    }
+  } else {
+    Value *sum = nullptr;
+    const bool canUseDot2 = isSupportCompBitwidth && isSupportSignedness && !isDot4 && !isDot8;
+    if (canUseDot2) {
+      sum = getInt32(0);
+      // Iterator over two components at a time and perform shuffle vectors and then use the intrinsic
+      unsigned intrinsic = isBothSigned ? Intrinsic::amdgcn_sdot2 : Intrinsic::amdgcn_udot2;
+      for (int compIdx = 0; compIdx < compCount; compIdx += 2) {
+        input1 = CreateShuffleVector(vector1, Constant::getNullValue(inputTy), ArrayRef<int>{compIdx, compIdx + 1});
+        input2 = CreateShuffleVector(vector2, Constant::getNullValue(inputTy), ArrayRef<int>{compIdx, compIdx + 1});
+        sum = CreateIntrinsic(intrinsic, {}, {input1, input2, sum, getFalse()}, nullptr, instName);
+      }
+    } else {
+      sum = getIntN(expectedWidth, 0);
+      for (unsigned compIdx = 0; compIdx < compCount; ++compIdx) {
+        Value *elem1 = CreateExtractElement(vector1, compIdx);
+        elem1 = isSigned ? CreateSExt(elem1, expectedTy) : CreateZExt(elem1, expectedTy);
+        Value *elem2 = CreateExtractElement(vector2, compIdx);
+        elem2 = isBothSigned ? CreateSExt(elem2, expectedTy) : CreateZExt(elem2, expectedTy);
+        sum = CreateAdd(sum, CreateMul(elem1, elem2));
       }
     }
-  }
-
-  // Do clamp if it has an accumulator
-  // NOTE: 32-bit result is a saturating add result. Do the manual saturating for 8-bit/16-bit result.
-  if (scalar->getType() != outputTy) {
     if (hasAccumulator) {
-      const unsigned bitWidth = outputTy->getScalarSizeInBits();
-      auto unsignedMax = (2ULL << (bitWidth - 1)) - 1;
-      auto signedMax = unsignedMax >> 1;
-      auto signedMin = -1ULL - signedMax;
+      if (sum->getType()->getScalarSizeInBits() > expectedWidth)
+        sum = CreateTrunc(sum, expectedTy);
+      else if (sum->getType()->getScalarSizeInBits() < expectedWidth)
+        sum = isSigned ? CreateSExt(sum, expectedTy) : CreateZExt(sum, expectedTy);
 
-      Value *minimum = nullptr, *maximum = nullptr;
-      Value *isUnderflow = nullptr, *isOverflow = nullptr;
-      if (isSigned) {
-        scalar = CreateSExt(scalar, getInt64Ty());
-        minimum = ConstantInt::getSigned(getInt64Ty(), signedMin);
-        maximum = ConstantInt::getSigned(getInt64Ty(), signedMax);
-        isUnderflow = CreateICmpSLT(scalar, minimum);
-        isOverflow = CreateICmpSGT(scalar, maximum);
-      } else {
-        scalar = CreateZExt(scalar, getInt64Ty());
-        minimum = getInt64(0);
-        maximum = getInt64(unsignedMax);
-        isUnderflow = CreateICmpULT(scalar, minimum);
-        isOverflow = CreateICmpUGT(scalar, maximum);
-      }
-      scalar = CreateSelect(isUnderflow, minimum, scalar);
-      scalar = CreateSelect(isOverflow, maximum, scalar);
-      scalar = CreateTrunc(scalar, outputTy);
-    } else {
-      scalar = isSigned ? CreateSExtOrTrunc(scalar, outputTy) : CreateZExtOrTrunc(scalar, outputTy);
+      Intrinsic::ID addIntrinsic = isSigned ? Intrinsic::sadd_sat : Intrinsic::uadd_sat;
+      sum = CreateBinaryIntrinsic(addIntrinsic, sum, accumulator, nullptr, instName);
     }
+    computedResult = sum;
   }
 
-  scalar->setName(instName);
-  return scalar;
+  // Do clampping or truncation
+  Type *computedTy = computedResult->getType();
+  const unsigned computedWidth = computedTy->getScalarSizeInBits();
+  if (expectedWidth < computedWidth) {
+    if (hasAccumulator) {
+      // Compute the clamp range based on the
+      unsigned long long unsignedMax = (2ULL << (expectedWidth - 1)) - 1;
+      long long signedMax = unsignedMax >> 1;
+      long long signedMin = -1LL - signedMax;
+
+      Value *minimum = isSigned ? ConstantInt::getSigned(computedTy, signedMin) : getIntN(computedWidth, 0);
+      Value *maximum = isSigned ? ConstantInt::getSigned(computedTy, signedMax) : getIntN(computedWidth, unsignedMax);
+      Intrinsic::ID minIntrinsic = isSigned ? Intrinsic::smin : Intrinsic::umin;
+      Intrinsic::ID maxIntrinsic = isSigned ? Intrinsic::smax : Intrinsic::umax;
+
+      computedResult = CreateBinaryIntrinsic(maxIntrinsic, computedResult, minimum, nullptr, instName);
+      computedResult = CreateBinaryIntrinsic(minIntrinsic, computedResult, maximum, nullptr, instName);
+    }
+    computedResult = CreateTrunc(computedResult, expectedTy);
+  }
+
+  computedResult->setName(instName);
+  return computedResult;
 }
 
 // =====================================================================================================================
@@ -290,7 +285,13 @@ BranchInst *BuilderImplBase::createIf(Value *condition, bool wantElse, const Twi
   BasicBlock *ifBlock = BasicBlock::Create(getContext(), "", endIfBlock->getParent(), endIfBlock);
   ifBlock->takeName(endIfBlock);
   endIfBlock->setName(instName + ".endif");
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 445640
+  // Old version of the code
   ifBlock->getInstList().splice(ifBlock->end(), endIfBlock->getInstList(), endIfBlock->begin(), GetInsertPoint());
+#else
+  // New version of the code (also handles unknown version, which we treat as latest)
+  ifBlock->splice(ifBlock->end(), endIfBlock, endIfBlock->begin(), GetInsertPoint());
+#endif
 
   // Replace non-phi uses of the original block with the new "if" block.
   SmallVector<Use *, 4> nonPhiUses;
@@ -542,7 +543,7 @@ Instruction *BuilderImplBase::createWaterfallLoop(Instruction *nonUniformInst, A
   }
 
   // Save Builder's insert point
-  auto savedInsertPoint = saveIP();
+  IRBuilder<>::InsertPointGuard guard(*this);
 
   Value *waterfallBegin;
   if (scalarizeDescriptorLoads && firstIndexInst && identicalIndexes) {
@@ -632,8 +633,6 @@ Instruction *BuilderImplBase::createWaterfallLoop(Instruction *nonUniformInst, A
     *useOfNonUniformInst = nonUniformInst;
   }
 
-  // Restore Builder's insert point.
-  restoreIP(savedInsertPoint);
   return resultValue;
 #endif
 }

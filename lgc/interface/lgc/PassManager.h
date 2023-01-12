@@ -32,9 +32,10 @@
 
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/Target/TargetMachine.h"
 
 namespace lgc {
+
+class LgcContext;
 
 // =====================================================================================================================
 // Public interface of LLPC middle-end's legacy::PassManager override
@@ -50,7 +51,7 @@ public:
 // Public interface of LLPC middle-end's PassManager override
 class PassManager : public llvm::ModulePassManager {
 public:
-  static PassManager *Create(llvm::TargetMachine *targetMachine = nullptr);
+  static PassManager *Create(LgcContext *lgcContext);
   virtual ~PassManager() {}
   template <typename PassBuilderT> bool registerFunctionAnalysis(PassBuilderT &&PassBuilder) {
     return m_functionAnalysisManager.registerPass(std::forward<PassBuilderT>(PassBuilder));
@@ -62,6 +63,8 @@ public:
   virtual void registerPass(llvm::StringRef passName, llvm::StringRef className) = 0;
   virtual void run(llvm::Module &module) = 0;
   virtual void setPassIndex(unsigned *passIndex) = 0;
+
+  virtual llvm::PassInstrumentationCallbacks &getInstrumentationCallbacks() = 0;
 
 protected:
   llvm::FunctionAnalysisManager m_functionAnalysisManager;

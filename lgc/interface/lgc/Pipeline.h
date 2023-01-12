@@ -107,6 +107,8 @@ enum class ThreadGroupSwizzleMode : unsigned {
 // Value for shadowDescriptorTable pipeline option.
 static const unsigned ShadowDescriptorTableDisable = ~0U;
 
+static const char XfbStateMetadataName[] = "lgc.xfb.state";
+
 // Middle-end per-pipeline options to pass to SetOptions.
 // The front-end should zero-initialize it with "= {}" in case future changes add new fields.
 // Note: new fields must be added to the end of this structure to maintain test compatibility.
@@ -139,9 +141,10 @@ struct Options {
   unsigned reserved0f;                 // Reserved for future functionality
   unsigned useResourceBindingRange;    // A resource node binding is the start of a range whose size is
                                        //  sizeInDwords/stride.
-  unsigned reserved1f;                 // Reserved for future functionality
-  unsigned enableInterpModePatch;      // Enable to do per-sample interpolation for nonperspective and smooth input
-  unsigned pageMigrationEnabled;       // Enable page migration
+  unsigned optimizeTessFactor;    // If set, we can determine either send HT_TessFactor message or write to TF buffer
+                                  // depending the values of tessellation factors.
+  unsigned enableInterpModePatch; // Enable to do per-sample interpolation for nonperspective and smooth input
+  unsigned pageMigrationEnabled;  // Enable page migration
   ResourceLayoutScheme resourceLayoutScheme;     // Resource layout scheme
   ThreadGroupSwizzleMode threadGroupSwizzleMode; // Thread group swizzle mode
   unsigned reverseThreadGroupBufferDescSet;      // Descriptor set ID of the internal buffer for reverse thread group
@@ -152,7 +155,11 @@ struct Options {
 #else
   bool reserved15;
 #endif
+  bool enableUberFetchShader; // Enable UberShader
 };
+
+/// Represent a pipeline option which can be automatic as well as explicitly set.
+enum InvariantLoadsOption : unsigned { Auto = 0, EnableOptimization = 1, DisableOptimization = 2, ClearInvariants = 3 };
 
 // Middle-end per-shader options to pass to SetShaderOptions.
 // Note: new fields must be added to the end of this structure to maintain test compatibility.
@@ -193,6 +200,12 @@ struct ShaderOptions {
 
   // Use the LLVM backend's SI scheduler instead of the default scheduler.
   bool useSiScheduler;
+
+  // Disable various LLVM IR code sinking passes.
+  bool disableCodeSinking;
+
+  // Schedule for latency even if it reduces occupancy.
+  bool favorLatencyHiding;
 
   // Whether update descriptor root offset in ELF
   bool updateDescInElf;
@@ -249,10 +262,7 @@ struct ShaderOptions {
   unsigned nsaThreshold;
 
   /// Aggressively mark shader loads as invariant (where it is safe to do so).
-  bool aggressiveInvariantLoads;
-
-  /// Strip invariant load metadata.
-  bool disableInvariantLoads;
+  InvariantLoadsOption aggressiveInvariantLoads;
 
   ShaderOptions() {
     // The memory representation of this struct gets written into LLVM metadata. To prevent uninitialized values from
@@ -400,6 +410,22 @@ struct VertexInputDescription {
   BufDataFormat dfmt; // Data format of input; one of the BufDataFormat* values
   BufNumFormat nfmt;  // Numeric format of input; one of the BufNumFormat* values
   unsigned inputRate; // Vertex input rate for the binding
+};
+
+// Represents assistant info for each vertex attribute in uber fetch shader
+struct UberFetchShaderAttribInfo {
+  uint32_t binding : 8;       //< Attribute binding in vertex buffer table
+  uint32_t perInstance : 1;   //< Whether vertex input rate is per-instance
+  uint32_t isCurrent : 1;     //< Whether it is a current attribute
+  uint32_t isPacked : 1;      //< Whether it is a packed format
+  uint32_t isFixed : 1;       //< Whether it is a fixed format
+  uint32_t componentSize : 4; //< Byte size per component
+  uint32_t componentMask : 4; //< Component mask of this attribute.
+  uint32_t isBgra : 1;        //< Whether is BGRA format
+  uint32_t reserved : 11;     //< reserved bits in DWORD 0
+  uint32_t offset;            //< Attribute offset
+  uint32_t instanceDivisor;   //< Reciprocal of instance divisor
+  uint32_t bufferFormat;      //< Buffer format info. it is a copy of buffer SRD DWORD3.
 };
 
 // A single color export format.
@@ -629,9 +655,6 @@ public:
   // -----------------------------------------------------------------------------------------------------------------
   // State setting methods
 
-  // Set the shader stage mask
-  virtual void setShaderStageMask(unsigned mask) = 0;
-
   // Set whether pre-rasterization part has a geometry shader
   // NOTE: Only applicable in the part pipeline compilation mode.
   virtual void setPreRasterHasGs(bool preRasterHasGs) = 0;
@@ -704,9 +727,15 @@ public:
   // with irLink(). This is a static method in Pipeline, as it does not need a Pipeline object, and can be used
   // in the front-end before a shader is associated with a pipeline.
   //
-  // @param func : Shader entry-point function
-  // @param stage : Shader stage
+  // @param func : Function to mark
+  // @param stage : Shader stage, or ShaderStageInvalid if none
   static void markShaderEntryPoint(llvm::Function *func, ShaderStage stage);
+
+  // Get a function's shader stage.
+  //
+  // @param func : Function to check
+  // @returns stage : Shader stage, or ShaderStageInvalid if none
+  static ShaderStage getShaderStage(llvm::Function *func);
 
   // Link the individual shader modules into a single pipeline module. The front-end must have
   // finished calling Builder::Create* methods and finished building the IR. In the case that
@@ -766,16 +795,13 @@ public:
   //                 timers[1]: LLVM optimizations
   //                 timers[2]: codegen
   // @param otherElf : Optional ELF for the other part-pipeline when compiling an unlinked part-pipeline ELF.
-  // @param newPassManager : Whether to use the new pass manager or not
   // @returns : True for success.
   //           False if irLink asked for an "unlinked" shader or part-pipeline, and there is some reason why the
   //           module cannot be compiled that way.  The client typically then does a whole-pipeline compilation
   //           instead. The client can call getLastError() to get a textual representation of the error, for
   //           use in logging or in error reporting in a command-line utility.
-  // NOTE: The newPassManager argument will be removed once the switch to the new pass manager is completed.
   virtual bool generate(std::unique_ptr<llvm::Module> pipelineModule, llvm::raw_pwrite_stream &outStream,
-                        CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers,
-                        bool newPassManager) = 0;
+                        CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers) = 0;
 
   // Create an ELF linker object for linking unlinked shader or part-pipeline ELFs into a pipeline ELF using
   // the pipeline state. This needs to be deleted after use.

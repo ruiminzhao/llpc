@@ -439,6 +439,31 @@ static void setGfx1034Info(TargetInfo *targetInfo) {
   targetInfo->getGpuProperty().numShaderEngines = 1;
 }
 
+// gfx11
+//
+// @param [in/out] targetInfo : Target info
+static void setGfx11Info(TargetInfo *targetInfo) {
+  setGfx10Info(targetInfo);
+
+  targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth16 = false;
+  targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth8 = true;
+  targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth4 = true;
+  targetInfo->getGpuProperty().supportIntegerDotFlag.sameSignedness = true;
+  targetInfo->getGpuProperty().supportIntegerDotFlag.diffSignedness = true;
+}
+
+// gfx1100
+//
+// @param [in/out] targetInfo : Target info
+static void setGfx1100Info(TargetInfo *targetInfo) {
+  setGfx11Info(targetInfo);
+
+  targetInfo->getGpuWorkarounds().gfx11.waUserSgprInitBug = 1;
+  targetInfo->getGpuWorkarounds().gfx11.waAtmPrecedesPos = 1;
+
+  targetInfo->getGpuProperty().numShaderEngines = 6;
+}
+
 // =====================================================================================================================
 // Set TargetInfo. Returns false if the GPU name is not found or not supported.
 //
@@ -481,6 +506,7 @@ bool TargetInfo::setTargetInfo(StringRef gpuName) {
       {"gfx1031", &setGfx1031Info}, // gfx1031, navi22
       {"gfx1032", &setGfx1032Info}, // gfx1032, navi23
       {"gfx1034", &setGfx1034Info}, // gfx1034, navi24
+      {"gfx1100", &setGfx1100Info}, // gfx1100, navi31
   };
 
   void (*setTargetInfoFunc)(TargetInfo * targetInfo) = nullptr;

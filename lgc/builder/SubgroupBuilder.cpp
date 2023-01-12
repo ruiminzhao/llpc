@@ -28,7 +28,7 @@
  * @brief LLPC source file: implementation of subgroup Builder methods
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/util/Internal.h"
 #include "llvm/IR/Intrinsics.h"
@@ -268,7 +268,8 @@ Value *SubgroupBuilder::CreateSubgroupBallotInclusiveBitCount(Value *const value
 // @param instName : Name to give final instruction.
 Value *SubgroupBuilder::CreateSubgroupBallotExclusiveBitCount(Value *const value, const Twine &instName) {
   if (getShaderSubgroupSize() <= 32)
-    return CreateSubgroupMbcnt(CreateExtractElement(value, getInt32(0)), "");
+    // Directly invoke the required mbcnt_lo intrinsic since CreateSubgroupMbcnt expects a 64-bit mask
+    return CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {CreateExtractElement(value, getInt32(0)), getInt32(0)});
   Value *result = CreateShuffleVector(value, UndefValue::get(value->getType()), ArrayRef<int>{0, 1});
   result = CreateBitCast(result, getInt64Ty());
   return CreateSubgroupMbcnt(result, "");
@@ -515,7 +516,10 @@ Value *SubgroupBuilder::CreateSubgroupClusteredReduction(GroupArithOp groupArith
                                          createPermLaneX16(result, result, UINT32_MAX, UINT32_MAX, true, false)),
           result);
 
-      {
+      if (supportPermLane64Dpp()) {
+        result = CreateSelect(CreateICmpEQ(clusterSize, getInt32(64)),
+                              createGroupArithmeticOperation(groupArithOp, result, createPermLane64(result)), result);
+      } else {
         Value *const broadcast31 = CreateSubgroupBroadcast(result, getInt32(31), instName);
         Value *const broadcast63 = CreateSubgroupBroadcast(result, getInt32(63), instName);
 
@@ -1315,6 +1319,18 @@ Value *SubgroupBuilder::createPermLaneX16(Value *const origValue, Value *const u
           updateValue,
       },
       {getInt32(selectBitsLow), getInt32(selectBitsHigh), getInt1(fetchInactive), getInt1(boundCtrl)});
+}
+
+// =====================================================================================================================
+// Create a call to permute lane 64.
+//
+// @param updateValue : The value to update with.
+Value *SubgroupBuilder::createPermLane64(Value *const updateValue) {
+  auto mapFunc = [](BuilderBase &builder, ArrayRef<Value *> mappedArgs, ArrayRef<Value *> passthroughArgs) -> Value * {
+    return builder.CreateIntrinsic(Intrinsic::amdgcn_permlane64, {}, {mappedArgs[0]});
+  };
+
+  return CreateMapToInt32(mapFunc, updateValue, {});
 }
 
 // =====================================================================================================================

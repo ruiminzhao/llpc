@@ -111,6 +111,7 @@ static constexpr char StreamOutTableAddress[] = ".stream_out_table_address";
 static constexpr char IndirectUserDataTableAddresses[] = ".indirect_user_data_table_addresses";
 static constexpr char NggSubgroupSize[] = ".nggSubgroupSize";
 static constexpr char NumInterpolants[] = ".num_interpolants";
+static constexpr char StreamOutVertexStrides[] = ".streamout_vertex_strides";
 static constexpr char Api[] = ".api";
 static constexpr char ApiCreateInfo[] = ".api_create_info";
 static constexpr char PsSampleMask[] = ".ps_sample_mask";
@@ -176,6 +177,8 @@ enum class UserDataMapping : unsigned {
                                      //  Mesh/Task shader rings for the shader to consume.
   MeshPipeStatsBuf = 0x10000014,     // 32-bit GPU virtual address of a buffer storing the shader-emulated mesh
                                      //  pipeline stats query.
+  StreamOutControlBuf = 0x10000016,  // 32-bit GPU virtual address to the streamout control buffer for GPUs that
+                                     // use SW-emulated streamout.
 
   // Values used in a user data PAL metadata register to be resolved at link time.
   // This is part of the "unlinked" ABI, so should arguably be in AbiUnlinked.h.
@@ -262,6 +265,9 @@ constexpr unsigned mmSPI_PS_INPUT_ADDR = 0xA1B4;
 constexpr unsigned mmSPI_PS_IN_CONTROL = 0xA1B6;
 constexpr unsigned mmPA_SC_SHADER_CONTROL = 0xA310;
 constexpr unsigned mmPA_SC_AA_CONFIG = 0xA2F8;
+
+// GS register numbers in PAL metadata
+constexpr unsigned mmVGT_GS_OUT_PRIM_TYPE = 0xA29B;
 
 // Register bitfield layout.
 

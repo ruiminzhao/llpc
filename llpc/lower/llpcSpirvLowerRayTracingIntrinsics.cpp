@@ -49,23 +49,6 @@ const char *ConvertF32toF16PosInf = "AmdExtD3DShaderIntrinsics_ConvertF32toF16Po
 } // namespace RtName
 
 namespace Llpc {
-// =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerRayTracingIntrinsics::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering ray tracing intrinsics.
-ModulePass *createLegacySpirvLowerRayTracingIntrinsics() {
-  return new LegacySpirvLowerRayTracingIntrinsics();
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-bool LegacySpirvLowerRayTracingIntrinsics::runOnModule(Module &module) {
-  return Impl.runImpl(module);
-}
 
 // =====================================================================================================================
 // Executes this SPIR-V lowering pass on the specified LLVM module.
@@ -136,7 +119,7 @@ bool SpirvLowerRayTracingIntrinsics::processIntrinsicsFunction(Function *func) {
 // @param func : Function to create
 // @param loadTy : Base type of the load value
 void SpirvLowerRayTracingIntrinsics::createLoadDwordAtAddr(Function *func, Type *loadTy) {
-  assert(func->getBasicBlockList().size() == 1);
+  assert(func->size() == 1);
   (*func->begin()).eraseFromParent();
 
   Type *loadPtrTy = loadTy->getPointerTo(SPIRAS_Global);
@@ -178,7 +161,7 @@ void SpirvLowerRayTracingIntrinsics::createConvertF32toF16(Function *func, unsig
   //   return uint3(f32tof16NegInf/PosInf(inVec));
   // }
 
-  assert(func->getBasicBlockList().size() == 1);
+  assert(func->size() == 1);
   (*func->begin()).eraseFromParent();
 
   BasicBlock *entryBlock = BasicBlock::Create(m_builder->getContext(), "", func);
@@ -201,7 +184,3 @@ void SpirvLowerRayTracingIntrinsics::createConvertF32toF16(Function *func, unsig
 }
 
 } // namespace Llpc
-
-// =====================================================================================================================
-// Initializes the pass of SPIR-V lowering the ray tracing intrinsics.
-INITIALIZE_PASS(LegacySpirvLowerRayTracingIntrinsics, DEBUG_TYPE, "Lower SPIR-V RayTracing intrinsics", false, false)

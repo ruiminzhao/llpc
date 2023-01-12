@@ -23,10 +23,12 @@ public:
     INIT_SECTION_INFO("RtState", SectionTypeRtState, 0)
 #endif
     INIT_SECTION_INFO("VertexInputState", SectionTypeVertexInputState, 0)
+    INIT_SECTION_INFO("TaskInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageTask)
     INIT_SECTION_INFO("VsInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageVertex)
     INIT_SECTION_INFO("TcsInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageTessControl)
     INIT_SECTION_INFO("TesInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageTessEval)
     INIT_SECTION_INFO("GsInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageGeometry)
+    INIT_SECTION_INFO("MeshInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageMesh)
     INIT_SECTION_INFO("FsInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageFragment)
     INIT_SECTION_INFO("CsInfo", SectionTypeShaderInfo, ShaderStage::ShaderStageCompute)
 #if VKI_RAY_TRACING
@@ -88,6 +90,11 @@ public:
     ADD_CLASS_ENUM_MAP(ThreadGroupSwizzleMode, _4x4)
     ADD_CLASS_ENUM_MAP(ThreadGroupSwizzleMode, _8x8)
     ADD_CLASS_ENUM_MAP(ThreadGroupSwizzleMode, _16x16)
+
+    ADD_CLASS_ENUM_MAP(InvariantLoads, Auto)
+    ADD_CLASS_ENUM_MAP(InvariantLoads, EnableOptimization)
+    ADD_CLASS_ENUM_MAP(InvariantLoads, DisableOptimization)
+    ADD_CLASS_ENUM_MAP(InvariantLoads, ClearInvariants)
   }
 };
 

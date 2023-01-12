@@ -72,7 +72,9 @@ public:
   void visitPtrToIntInst(llvm::PtrToIntInst &ptrToIntInst);
 
 private:
-  llvm::Value *getPointerOperandAsInst(llvm::Value *const value);
+  using Replacement = std::pair<llvm::Value *, llvm::Value *>;
+  Replacement getRemappedValueOrNull(llvm::Value *value) const;
+  Replacement getRemappedValue(llvm::Value *value) const;
   llvm::Value *getBaseAddressFromBufferDesc(llvm::Value *const bufferDesc) const;
   void copyMetadata(llvm::Value *const dest, const llvm::Value *const src) const;
   llvm::PointerType *getRemappedType(llvm::Type *const type) const;
@@ -85,39 +87,19 @@ private:
   void postVisitMemSetInst(llvm::MemSetInst &memSetInst);
   void fixIncompletePhis();
 
-  using Replacement = std::pair<llvm::Value *, llvm::Value *>;
   using PhiIncoming = std::pair<llvm::PHINode *, llvm::BasicBlock *>;
   llvm::DenseMap<llvm::Value *, Replacement> m_replacementMap; // The replacement map.
   llvm::DenseMap<PhiIncoming, llvm::Value *> m_incompletePhis; // The incomplete phi map.
   llvm::DenseSet<llvm::Value *> m_invariantSet;                // The invariant set.
   llvm::DenseSet<llvm::Value *> m_divergenceSet;               // The divergence set.
   llvm::SmallVector<llvm::Instruction *, 16> m_postVisitInsts; // The post process instruction set.
-  std::unique_ptr<llvm::IRBuilder<>> m_builder;                // The IRBuilder.
+  llvm::IRBuilder<> *m_builder;                                // The IRBuilder.
   llvm::LLVMContext *m_context;                                // The LLVM context.
   PipelineState *m_pipelineState;                              // The pipeline state
 
   std::function<bool(const llvm::Value &)> m_isDivergent;
 
   static constexpr unsigned MinMemOpLoopBytes = 256;
-};
-
-// =====================================================================================================================
-// Represents the pass of LLVM patching operations for buffer operations
-class LegacyPatchBufferOp final : public llvm::FunctionPass, public llvm::InstVisitor<LegacyPatchBufferOp> {
-public:
-  LegacyPatchBufferOp();
-
-  bool runOnFunction(llvm::Function &function) override;
-
-  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override;
-
-  static char ID; // NOLINT
-
-private:
-  LegacyPatchBufferOp(const LegacyPatchBufferOp &) = delete;
-  LegacyPatchBufferOp &operator=(const LegacyPatchBufferOp &) = delete;
-
-  PatchBufferOp m_impl;
 };
 
 } // namespace lgc

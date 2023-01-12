@@ -53,12 +53,14 @@ public:
   void handleReturnInst();
 
   void handleLoadInst();
-  void handleLoadInstGlobal(LoadInst &loadInst, const unsigned addrSpace);
-  void handleLoadInstGEP(GetElementPtrInst *const getElemPtr, LoadInst &loadInst, const unsigned addrSpace);
+  void handleLoadInstGEP(GlobalVariable *inOut, ArrayRef<Value *> indexOperands, LoadInst &loadInst);
 
   void handleStoreInst();
-  void handleStoreInstGlobal(StoreInst &storeInst);
-  void handleStoreInstGEP(GetElementPtrInst *const getElemPtr, StoreInst &storeInst);
+  void handleStoreInstGEP(GlobalVariable *output, ArrayRef<Value *> indexOperands, StoreInst &storeInst);
+
+  void handleAtomicInst();
+  void handleAtomicInstGlobal(Instruction &atomicInst);
+  void handleAtomicInstGEP(GetElementPtrInst *const getElemPtr, Instruction &atomicInst);
 
   static llvm::StringRef name() { return "Lower SPIR-V globals (global variables, inputs, and outputs)"; }
 
@@ -90,16 +92,31 @@ private:
                                    Constant *inOutMetaVal, Value *locOffset, unsigned interpLoc, Value *auxInterpValue,
                                    bool isPerVertexDimension);
 
-  llvm::Value *loadInOutMember(llvm::Type *inOutTy, unsigned addrSpace, llvm::ArrayRef<llvm::Value *> indexOperands,
-                               unsigned maxLocOffset, llvm::Constant *inOutMeta, llvm::Value *locOffset,
-                               llvm::Value *vertexIdx, unsigned interpLoc, llvm::Value *interpInfo,
-                               bool isPerVertexDimension);
+  llvm::Value *loadInOutMember(llvm::Type *inOutTy, llvm::Type *loadType, unsigned addrSpace,
+                               llvm::ArrayRef<llvm::Value *> indexOperands, unsigned maxLocOffset,
+                               llvm::Constant *inOutMeta, llvm::Value *locOffset, llvm::Value *vertexIdx,
+                               unsigned interpLoc, llvm::Value *interpInfo, bool isPerVertexDimension);
 
-  void storeOutputMember(llvm::Type *outputTy, llvm::Value *storeValue, llvm::ArrayRef<llvm::Value *> indexOperands,
-                         unsigned maxLocOffset, llvm::Constant *outputMeta, llvm::Value *locOffset,
-                         llvm::Value *vertexOrPrimitiveIdx);
+  void storeOutputMember(llvm::Type *outputTy, llvm::Type *storeTy, llvm::Value *storeValue,
+                         llvm::ArrayRef<llvm::Value *> indexOperands, unsigned maxLocOffset, llvm::Constant *outputMeta,
+                         llvm::Value *locOffset, llvm::Value *vertexOrPrimitiveIdx);
 
-  void interpolateInputElement(unsigned interpLoc, llvm::Value *interpInfo, llvm::CallInst &callInst);
+  llvm::Value *loadIndexedValueFromTaskPayload(llvm::Type *indexedTy, llvm::Type *loadTy,
+                                               llvm::ArrayRef<llvm::Value *> indexOperands, llvm::Constant *metadata,
+                                               llvm::Value *extraByteOffset);
+  llvm::Value *loadValueFromTaskPayload(llvm::Type *loadTy, llvm::Constant *metadata, llvm::Value *extraByteOffset);
+  void storeIndexedValueToTaskPayload(llvm::Type *indexedTy, llvm::Type *storeTy, llvm::Value *storeValue,
+                                      llvm::ArrayRef<llvm::Value *> indexOperands, llvm::Constant *metadata,
+                                      llvm::Value *extraByteOffset);
+  void storeValueToTaskPayload(llvm::Value *storeValue, llvm::Constant *metadata, llvm::Value *extraByteOffse);
+  llvm::Value *atomicOpWithIndexedValueInTaskPayload(llvm::Type *indexedTy, llvm::Instruction *atomicInst,
+                                                     llvm::ArrayRef<llvm::Value *> indexOperands,
+                                                     llvm::Constant *metadata, llvm::Value *extraByteOffset);
+  llvm::Value *atomicOpWithValueInTaskPayload(llvm::Instruction *atomicInst, llvm::Constant *metadata,
+                                              llvm::Value *extraByteOffset);
+
+  void interpolateInputElement(unsigned interpLoc, llvm::Value *interpInfo, llvm::CallInst &callInst,
+                               GlobalVariable *gv, ArrayRef<Value *> indexOperands);
 
   std::unordered_map<llvm::Value *, llvm::Value *> m_globalVarProxyMap; // Proxy map for lowering global variables
   std::unordered_map<llvm::Value *, llvm::Value *> m_inputProxyMap;     // Proxy map for lowering inputs
@@ -113,29 +130,13 @@ private:
   bool m_lowerInputInPlace;  // Whether to lower input inplace
   bool m_lowerOutputInPlace; // Whether to lower output inplace
 
-  std::unordered_set<llvm::ReturnInst *> m_retInsts;  // "Return" instructions to be removed
-  std::unordered_set<llvm::CallInst *> m_emitCalls;   // "Call" instructions to emit vertex (geometry shader)
-  std::unordered_set<llvm::LoadInst *> m_loadInsts;   // "Load" instructions to be removed
-  std::unordered_set<llvm::StoreInst *> m_storeInsts; // "Store" instructions to be removed
-  std::unordered_set<llvm::CallInst *> m_interpCalls; // "Call" instruction to do input interpolation
-                                                      // (fragment shader)
-};
-
-// =====================================================================================================================
-// Legacy pass manager wrapper class
-class LegacySpirvLowerGlobal : public llvm::ModulePass {
-public:
-  LegacySpirvLowerGlobal();
-
-  virtual bool runOnModule(llvm::Module &module);
-
-  static char ID; // ID of this pass
-
-private:
-  LegacySpirvLowerGlobal(const LegacySpirvLowerGlobal &) = delete;
-  LegacySpirvLowerGlobal &operator=(const LegacySpirvLowerGlobal &) = delete;
-
-  SpirvLowerGlobal Impl;
+  std::unordered_set<llvm::ReturnInst *> m_retInsts;     // "Return" instructions to be removed
+  std::unordered_set<llvm::CallInst *> m_emitCalls;      // "Call" instructions to emit vertex (geometry shader)
+  std::unordered_set<llvm::LoadInst *> m_loadInsts;      // "Load" instructions to be removed
+  std::unordered_set<llvm::StoreInst *> m_storeInsts;    // "Store" instructions to be removed
+  std::unordered_set<llvm::Instruction *> m_atomicInsts; // "Atomicrwm" or "cmpxchg" instructions to be removed
+  std::unordered_set<llvm::CallInst *> m_interpCalls;    // "Call" instruction to do input interpolation
+                                                         // (fragment shader)
 };
 
 } // namespace Llpc

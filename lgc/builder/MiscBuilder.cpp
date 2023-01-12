@@ -28,7 +28,7 @@
  * @brief LLPC source file: implementation of miscellaneous Builder methods
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/TargetInfo.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
@@ -152,16 +152,13 @@ Instruction *MiscBuilder::CreateSetMeshOutputs(Value *vertexCount, Value *primit
 Instruction *MiscBuilder::CreateReadClock(bool realtime, const Twine &instName) {
   CallInst *readClock = nullptr;
   if (realtime) {
-    readClock = CreateIntrinsic(Intrinsic::amdgcn_s_memrealtime, {}, {}, nullptr, instName);
+    if (getPipelineState()->getTargetInfo().getGfxIpVersion().major >= 11)
+      readClock = CreateNamedCall("llvm.amdgcn.s.sendmsg.rtn", getInt64Ty(), getInt32(GetRealTime), {}, instName);
+    else
+      readClock = CreateIntrinsic(Intrinsic::amdgcn_s_memrealtime, {}, {}, nullptr, instName);
   } else
     readClock = CreateIntrinsic(Intrinsic::readcyclecounter, {}, {}, nullptr, instName);
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396596
-  // Old version of the code
-  readClock->addAttribute(AttributeList::FunctionIndex, Attribute::ReadOnly);
-#else
-  // New version of the code (also handles unknown version, which we treat as latest)
-  readClock->addFnAttr(Attribute::ReadOnly);
-#endif
+  readClock->setOnlyReadsMemory();
 
   // NOTE: The inline ASM is to prevent optimization of backend compiler.
   InlineAsm *asmFunc = InlineAsm::get(FunctionType::get(getInt64Ty(), {getInt64Ty()}, false), "; %1", "=r,0", true);

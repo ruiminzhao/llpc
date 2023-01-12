@@ -69,6 +69,10 @@ static const char *GetTriangleCompressionMode = "AmdTraceRayGetTriangleCompressi
 static const char *SetHitTokenData = "AmdTraceRaySetHitTokenData";
 static const char *GetBoxSortHeuristicMode = "AmdTraceRayGetBoxSortHeuristicMode";
 static const char *SampleGpuTimer = "AmdTraceRaySampleGpuTimer";
+#if VKI_BUILD_GFX11
+static const char *LdsStackInit = "AmdTraceRayLdsStackInit";
+static const char *LdsStackStore = "AmdTraceRayLdsStackStore";
+#endif
 } // namespace RtName
 
 // Enum for the RayDesc
@@ -292,18 +296,6 @@ Type *getRayQueryInternalTy(lgc::Builder *builder) {
 }
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerRayQuery::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering ray query operations.
-//
-// @param rayQueryLibrary : ray query library
-ModulePass *createLegacySpirvLowerRayQuery(bool rayQueryLibrary) {
-  return new LegacySpirvLowerRayQuery(rayQueryLibrary);
-}
-
-// =====================================================================================================================
 SpirvLowerRayQuery::SpirvLowerRayQuery() : SpirvLowerRayQuery(false) {
 }
 
@@ -311,19 +303,6 @@ SpirvLowerRayQuery::SpirvLowerRayQuery() : SpirvLowerRayQuery(false) {
 SpirvLowerRayQuery::SpirvLowerRayQuery(bool rayQueryLibrary)
     : m_rayQueryLibrary(rayQueryLibrary), m_spirvOpMetaKindId(0), m_ldsStack(nullptr), m_prevRayQueryObj(nullptr),
       m_rayQueryObjGen(nullptr) {
-}
-
-// =====================================================================================================================
-LegacySpirvLowerRayQuery::LegacySpirvLowerRayQuery(bool rayQueryLibrary) : ModulePass(ID), Impl(rayQueryLibrary) {
-  initializeLegacySpirvLowerRayQueryPass(*PassRegistry::getPassRegistry());
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-bool LegacySpirvLowerRayQuery::runOnModule(Module &module) {
-  return Impl.runImpl(module);
 }
 
 // =====================================================================================================================
@@ -448,7 +427,15 @@ void SpirvLowerRayQuery::processLibraryFunction(Function *&func) {
     m_builder->SetInsertPoint(entryBlock);
     m_builder->CreateRet(m_builder->getInt32(rtState->boxSortHeuristicMode));
     func->setName(RtName::GetBoxSortHeuristicMode);
-  } else {
+  }
+#if VKI_BUILD_GFX11
+  else if (mangledName.startswith(RtName::LdsStackInit)) {
+    createLdsStackInit(func);
+  } else if (mangledName.startswith(RtName::LdsStackStore)) {
+    createLdsStackStore(func);
+  }
+#endif
+  else {
     // Nothing to do
   }
 }
@@ -595,34 +582,58 @@ Value *SpirvLowerRayQuery::getDispatchId() {
 }
 
 // =====================================================================================================================
-// Process RayQuery OpRayQueryProceedKHR
+// Create instructions to get BVH SRD given the expansion and box sort mode at the current insert point
 //
-// @param func : The function to create
-template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryProceedKHR>(Function *func) {
+// @param expansion : Box expansion
+// @param boxSortMode : Box sort mode
+Value *SpirvLowerRayQuery::createGetBvhSrd(llvm::Value *expansion, llvm::Value *boxSortMode) {
+  const auto *rtState = m_context->getPipelineContext()->getRayTracingState();
+  assert(rtState->bvhResDesc.dataSizeInDwords == 4);
+
+  // Construct image descriptor from rtstate.
+  Value *bvhSrd = PoisonValue::get(FixedVectorType::get(m_builder->getInt32Ty(), 4));
+  bvhSrd =
+      m_builder->CreateInsertElement(bvhSrd, m_builder->getInt32(rtState->bvhResDesc.descriptorData[0]), uint64_t(0));
+  bvhSrd = m_builder->CreateInsertElement(bvhSrd, m_builder->getInt32(rtState->bvhResDesc.descriptorData[2]), 2u);
+  bvhSrd = m_builder->CreateInsertElement(bvhSrd, m_builder->getInt32(rtState->bvhResDesc.descriptorData[3]), 3u);
+
+  Value *bvhSrdDw1 = m_builder->getInt32(rtState->bvhResDesc.descriptorData[1]);
+
+  if (expansion) {
+    const unsigned BvhSrdBoxExpansionShift = 23;
+    const unsigned BvhSrdBoxExpansionBitCount = 8;
+    // Update the box expansion ULPs field.
+    bvhSrdDw1 = m_builder->CreateInsertBitField(bvhSrdDw1, expansion, m_builder->getInt32(BvhSrdBoxExpansionShift),
+                                                m_builder->getInt32(BvhSrdBoxExpansionBitCount));
+  }
+
+  if (boxSortMode) {
+    const unsigned BvhSrdBoxSortDisableValue = 3;
+    const unsigned BvhSrdBoxSortModeShift = 21;
+    const unsigned BvhSrdBoxSortModeBitCount = 2;
+    const unsigned BvhSrdBoxSortEnabledFlag = 1u << 31u;
+    // Update the box sort mode field.
+    Value *newBvhSrdDw1 =
+        m_builder->CreateInsertBitField(bvhSrdDw1, boxSortMode, m_builder->getInt32(BvhSrdBoxSortModeShift),
+                                        m_builder->getInt32(BvhSrdBoxSortModeBitCount));
+    // Box sort enabled, need to OR in the box sort flag at bit 31 in DWORD 1.
+    newBvhSrdDw1 = m_builder->CreateOr(newBvhSrdDw1, m_builder->getInt32(BvhSrdBoxSortEnabledFlag));
+
+    Value *boxSortEnabled = m_builder->CreateICmpNE(boxSortMode, m_builder->getInt32(BvhSrdBoxSortDisableValue));
+    bvhSrdDw1 = m_builder->CreateSelect(boxSortEnabled, newBvhSrdDw1, bvhSrdDw1);
+  }
+
+  // Fill in modified DW1 to the BVH SRD.
+  bvhSrd = m_builder->CreateInsertElement(bvhSrd, bvhSrdDw1, 1u);
+
+  return bvhSrd;
+}
+
+void SpirvLowerRayQuery::createRayQueryProceedFunc(Function *func) {
   func->addFnAttr(Attribute::AlwaysInline);
   BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
   m_builder->SetInsertPoint(entryBlock);
 
-  // bool RayQueryProceedAmdInternal(
-  //     inout RayQueryInternal rayQuery,
-  //     in    uint             constRayFlags,
-  //     in    uint3            dispatchThreadId)
-
-  // bool rayQueryProceedEXT(rayQueryEXT q -> rayQuery)
-  // {
-  //     if (stageNotSupportLds(stage))
-  //         ldsUsage = 0;
-  //     else
-  //         ldsUsage = 1;
-  //     if (rayQuery != prevRayQueryObj)
-  //         rayQuery.stackNumEntries = 0
-  //     prevRayQueryObj = rayQuery
-  //     constRayFlags = 0
-  //     rayId = 0
-  //     bool proceed = call RayQueryProceedAmdInternal
-  //     ldsUsage = 1;
-  //     return proceed;
-  // }
   auto int32x3Ty = FixedVectorType::get(m_builder->getInt32Ty(), 3);
   Value *constRayFlags = m_builder->CreateAlloca(m_builder->getInt32Ty(), SPIRAS_Private);
   Value *threadId = m_builder->CreateAlloca(int32x3Ty, SPIRAS_Private);
@@ -659,11 +670,45 @@ template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryProceedKHR>(Fu
 
   m_builder->CreateStore(getDispatchId(), threadId);
 
-  Value *result = m_builder->CreateNamedCall(
-      m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_RAY_QUERY_PROCEED),
-      func->getReturnType(), {rayQuery, constRayFlags, threadId}, {Attribute::NoUnwind, Attribute::AlwaysInline});
+  Value *result;
+  {
+    result = m_builder->CreateNamedCall(
+        m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_RAY_QUERY_PROCEED),
+        func->getReturnType(), {rayQuery, constRayFlags, threadId}, {Attribute::NoUnwind, Attribute::AlwaysInline});
+  }
+
   m_builder->CreateStore(m_builder->getInt32(1), m_ldsUsage);
   m_builder->CreateRet(result);
+}
+
+// =====================================================================================================================
+// Process RayQuery OpRayQueryProceedKHR
+//
+// @param func : The function to create
+template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryProceedKHR>(Function *func) {
+
+  // bool RayQueryProceedAmdInternal(
+  //     inout RayQueryInternal rayQuery,
+  //     in    uint             constRayFlags,
+  //     in    uint3            dispatchThreadId)
+
+  // bool rayQueryProceedEXT(rayQueryEXT q -> rayQuery)
+  // {
+  //     if (stageNotSupportLds(stage))
+  //         ldsUsage = 0;
+  //     else
+  //         ldsUsage = 1;
+  //     if (rayQuery != prevRayQueryObj)
+  //         rayQuery.stackNumEntries = 0
+  //     prevRayQueryObj = rayQuery
+  //     constRayFlags = 0
+  //     rayId = 0
+  //     bool proceed = call RayQueryProceedAmdInternal
+  //     ldsUsage = 1;
+  //     return proceed;
+  // }
+
+  createRayQueryProceedFunc(func);
 }
 
 // =====================================================================================================================
@@ -878,6 +923,18 @@ template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryTerminateKHR>(
   // TODO: Remove this when LLPC will switch fully to opaque pointers.
   assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(rayQuery->getType()->getScalarType(), rayQueryEltTy));
 
+#if VKI_BUILD_GFX11
+  if (m_context->getGfxIpVersion().major >= 11) {
+    // Navi3x and beyond, use rayQuery.currentNodePtr == TERMINAL_NODE to determine Terminate()
+
+    // TERMINAL_NODE defined in GPURT is 0xFFFFFFFE
+    static const unsigned RayQueryTerminalNode = 0xFFFFFFFE;
+
+    Value *currNodeAddr = m_builder->CreateGEP(
+        rayQueryEltTy, rayQuery, {m_builder->getInt32(0), m_builder->getInt32(RayQueryParams::CurrNodePtr)});
+    m_builder->CreateStore(m_builder->getInt32(RayQueryTerminalNode), currNodeAddr);
+  } else
+#endif
   {
     // Navi2x, use the following combination to determine Terminate()
     //  rayQuery.nodeIndex = 0xFFFFFFFF // invalid index
@@ -1432,6 +1489,12 @@ unsigned SpirvLowerRayQuery::getWorkgroupSize() const {
     workgroupSize = computeMode.workgroupSizeX * computeMode.workgroupSizeY * computeMode.workgroupSizeZ;
   }
   assert(workgroupSize != 0);
+#if VKI_BUILD_GFX11
+  if (m_context->getPipelineContext()->getGfxIpVersion().major >= 11) {
+    // Round up to multiple of 32, as the ds_bvh_stack swizzle as 32 threads
+    workgroupSize = alignTo(workgroupSize, 32);
+  }
+#endif
   return workgroupSize;
 }
 
@@ -1492,33 +1555,16 @@ void SpirvLowerRayQuery::createIntersectBvh(Function *func) {
   Value *origin = m_builder->CreateLoad(FixedVectorType::get(m_builder->getFloatTy(), 3), argIt);
   argIt++;
 
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 406441
-  // Construct vec3 = {0.0, 1.0, 0.0}
-  auto zero = ConstantFP::get(m_builder->getFloatTy(), 0.0f);
-  auto one = ConstantFP::get(m_builder->getFloatTy(), 1.0f);
-  Value *constVec = ConstantVector::get({zero, one, zero});
-
-  // vec4 origin = vec4(origin.xyz, 1.0);
-  origin = m_builder->CreateShuffleVector(origin, constVec, ArrayRef<int>{0, 1, 2, 4});
-#endif
   // Ray dir vec3 type
   // TODO: Remove this when LLPC will switch fully to opaque pointers.
   assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(argIt->getType(), FixedVectorType::get(m_builder->getFloatTy(), 3)));
   Value *dir = m_builder->CreateLoad(FixedVectorType::get(m_builder->getFloatTy(), 3), argIt);
   argIt++;
 
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 406441
-  // vec4 dir = vec4(dir.xyz, 0.0)
-  dir = m_builder->CreateShuffleVector(dir, constVec, ArrayRef<int>{0, 1, 2, 3});
-#endif
   // Ray inv_dir vec3 type
   // TODO: Remove this when LLPC will switch fully to opaque pointers.
   assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(argIt->getType(), FixedVectorType::get(m_builder->getFloatTy(), 3)));
   Value *invDir = m_builder->CreateLoad(FixedVectorType::get(m_builder->getFloatTy(), 3), argIt);
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 406441
-  // vec4 inDir = vec4(invDir, 0.0)
-  invDir = m_builder->CreateShuffleVector(invDir, constVec, ArrayRef<int>{0, 1, 2, 3});
-#endif
   argIt++;
 
   // uint flag
@@ -1531,35 +1577,8 @@ void SpirvLowerRayQuery::createIntersectBvh(Function *func) {
   // TODO: Remove this when LLPC will switch fully to opaque pointers.
   assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(argIt->getType(), m_builder->getInt32Ty()));
   Value *expansion = m_builder->CreateLoad(m_builder->getInt32Ty(), argIt);
-  const unsigned boxExpansionShift = 23;
-  expansion = m_builder->CreateShl(expansion, boxExpansionShift);
 
-  // Construct image descriptor from rtstate
-  Value *imageDesc = UndefValue::get(FixedVectorType::get(m_builder->getInt32Ty(), 4));
-  imageDesc = m_builder->CreateInsertElement(imageDesc, m_builder->getInt32(rtState->bvhResDesc.descriptorData[0]),
-                                             uint64_t(0));
-  imageDesc = m_builder->CreateInsertElement(imageDesc, m_builder->getInt32(rtState->bvhResDesc.descriptorData[1]), 1u);
-  imageDesc = m_builder->CreateInsertElement(imageDesc, m_builder->getInt32(rtState->bvhResDesc.descriptorData[2]), 2u);
-  imageDesc = m_builder->CreateInsertElement(imageDesc, m_builder->getInt32(rtState->bvhResDesc.descriptorData[3]), 3u);
-
-  // Process box sort heuristic
-
-  auto disableBoxSortFlag = m_builder->getInt32(3);
-  auto enableBoxSort = m_builder->CreateICmpNE(flags, disableBoxSortFlag);
-
-  // flag_in_dw1 = (value << 21)
-  const unsigned BoxSortHeuristicShift = 21;
-  const unsigned boxSortEnabledValue = 1u << 31u;
-  auto boxSortFlag = m_builder->CreateShl(flags, BoxSortHeuristicShift);
-  boxSortFlag = m_builder->CreateOr(boxSortFlag, m_builder->getInt32(boxSortEnabledValue));
-  boxSortFlag = m_builder->CreateOr(boxSortFlag, expansion);
-
-  // Initially set DW upon ULP bit, and default box_sort_en bit as 0
-  // box_sort logic could be overwritten if sort is enabled.
-  auto imageDescDW1 = m_builder->CreateSelect(enableBoxSort, boxSortFlag, expansion);
-
-  // update / overwrite DW1 bit 31 (box sorting enable), 21 (box sorting heuristic)
-  imageDesc = m_builder->CreateInsertElement(imageDesc, imageDescDW1, 1u);
+  Value *imageDesc = createGetBvhSrd(expansion, flags);
 
   m_builder->CreateRet(m_builder->CreateImageBvhIntersectRay(address, extent, origin, dir, invDir, imageDesc));
 }
@@ -1568,7 +1587,7 @@ void SpirvLowerRayQuery::createIntersectBvh(Function *func) {
 // Create sample gpu time
 //
 void SpirvLowerRayQuery::createSampleGpuTime(llvm::Function *func) {
-  assert(func->getBasicBlockList().size() == 1);
+  assert(func->size() == 1);
   m_builder->SetInsertPoint(func->getEntryBlock().getTerminator());
   Value *clocksHiPtr = func->getArg(0);
   Value *clocksLoPtr = func->getArg(1);
@@ -1751,8 +1770,86 @@ Value *SpirvLowerRayQuery::createLoadMatrixFromAddr(Value *matrixAddr) {
   return matrix;
 }
 
-} // namespace Llpc
+#if VKI_BUILD_GFX11
+// =====================================================================================================================
+// Init LDS stack address
+//
+// @param func : The function to create
+void SpirvLowerRayQuery::createLdsStackInit(Function *func) {
+  eraseFunctionBlocks(func);
+  BasicBlock *block = BasicBlock::Create(*m_context, "", func);
+  m_builder->SetInsertPoint(block);
+
+  // The initial stack index is 0 currently.
+  // stackIndex = 0
+  // stackBase = AmdTraceRayGetStackBase()
+  // stackAddr = ((stackBase << 18u) | startIndex)
+  Type *ldsStackElemTy = m_ldsStack->getValueType();
+  // TODO: Remove this when LLPC will switch fully to opaque pointers.
+  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(m_ldsStack->getType()->getScalarType(), ldsStackElemTy));
+  Value *stackBasePerThread = getThreadIdInGroup();
+
+  // From Navi3x on, Hardware has decided that the stacks are only swizzled across every 32 threads,
+  // with stacks for every set of 32 threads stored after all the stack data for the previous 32 threads.
+  if (getWorkgroupSize() > 32) {
+    // localThreadId = (LinearLocalThreadID%32)
+    // localGroupId = (LinearLocalThreadID/32)
+    // stackSize = STACK_SIZE * 32 = m_stackEntries * 32
+    // groupOf32ThreadSize = (LinearLocalThreadID/32) * stackSize
+    // stackBasePerThread (in DW) = (LinearLocalThreadID%32)+(LinearLocalThreadID/32)*STACK_SIZE*32
+    //                            = localThreadId + groupOf32ThreadSize
+    Value *localThreadId = m_builder->CreateAnd(stackBasePerThread, m_builder->getInt32(31));
+    Value *localGroupId = m_builder->CreateLShr(stackBasePerThread, m_builder->getInt32(5));
+    Value *stackSize = m_builder->getInt32(MaxLdsStackEntries * 32);
+    Value *groupOf32ThreadSize = m_builder->CreateMul(localGroupId, stackSize);
+    stackBasePerThread = m_builder->CreateAdd(localThreadId, groupOf32ThreadSize);
+  }
+
+  Value *stackBaseAsInt = m_builder->CreatePtrToInt(
+      m_builder->CreateGEP(ldsStackElemTy, m_ldsStack, {m_builder->getInt32(0), stackBasePerThread}),
+      m_builder->getInt32Ty());
+
+  // stack_addr[31:18] = stack_base[15:2]
+  // stack_addr[17:0] = stack_index[17:0]
+  // The low 18 bits of stackAddr contain stackIndex which we always initialize to 0.
+  // Note that this relies on stackAddr being a multiple of 4, so that bits 17 and 16 are 0.
+  Value *stackAddr = m_builder->CreateShl(stackBaseAsInt, 16);
+
+  m_builder->CreateRet(stackAddr);
+}
 
 // =====================================================================================================================
-// Initializes the pass of SPIR-V lowering the ray query operations.
-INITIALIZE_PASS(LegacySpirvLowerRayQuery, DEBUG_TYPE, "Lower SPIR-V RayQuery operations", false, false)
+// Store to LDS stack
+//
+// @param func : The function to create
+void SpirvLowerRayQuery::createLdsStackStore(Function *func) {
+  eraseFunctionBlocks(func);
+  BasicBlock *block = BasicBlock::Create(*m_context, "", func);
+  m_builder->SetInsertPoint(block);
+
+  auto int32x4Ty = FixedVectorType::get(m_builder->getInt32Ty(), 4);
+
+  auto argIt = func->arg_begin();
+  Value *stackAddr = argIt++;
+  Value *stackAddrVal = m_builder->CreateLoad(m_builder->getInt32Ty(), stackAddr);
+  Value *lastVisited = m_builder->CreateLoad(m_builder->getInt32Ty(), argIt++);
+  Value *data = m_builder->CreateLoad(int32x4Ty, argIt);
+  // OFFSET = {OFFSET1, OFFSET0}
+  // stack_size[1:0] = OFFSET1[5:4]
+  // Stack size is encoded in the offset argument as:
+  // 8 -> {0x00, 0x00}
+  // 16 -> {0x10, 0x00}
+  // 32 -> {0x20, 0x00}
+  // 64 -> {0x30, 0x00}
+  assert(MaxLdsStackEntries == 16);
+  Value *offset = m_builder->getInt32((Log2_32(MaxLdsStackEntries) - 3) << 12);
+
+  Value *result =
+      m_builder->CreateIntrinsic(Intrinsic::amdgcn_ds_bvh_stack_rtn, {}, {stackAddrVal, lastVisited, data, offset});
+
+  m_builder->CreateStore(m_builder->CreateExtractValue(result, 1), stackAddr);
+  m_builder->CreateRet(m_builder->CreateExtractValue(result, 0));
+}
+#endif
+
+} // namespace Llpc

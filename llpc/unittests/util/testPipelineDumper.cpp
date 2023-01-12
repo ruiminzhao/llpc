@@ -253,6 +253,28 @@ TEST(PipelineDumperTest, TestShadowDescriptorTableUsageCompute) {
   HashModifiedFunc expectHashToBeEqual = [](const GenerateHashParams &params) { return params.isRelocatableShader; };
   runComputePipelineVariations(modifyBuildInfo, expectHashToBeEqual);
 }
+#if VKI_BUILD_GFX11
+
+// =====================================================================================================================
+// Test the optimizeTessFactor option.
+
+TEST(PipelineDumperTest, TestOptimizeTessFactorOptionGraphics) {
+  ModifyGraphicsBuildInfo modifyBuildInfo = [](GraphicsPipelineBuildInfo *buildInfo) {
+    buildInfo->options.optimizeTessFactor = true;
+  };
+  HashModifiedFunc expectHashToBeEqual = [](const GenerateHashParams &params) { return false; };
+  runGraphicsPipelineVariations(modifyBuildInfo, expectHashToBeEqual);
+}
+
+TEST(PipelineDumperTest, TestOptimizeTessFactorOptionCompute) {
+  ModifyComputeBuildInfo modifyBuildInfo = [](ComputePipelineBuildInfo *buildInfo) {
+    buildInfo->options.optimizeTessFactor = true;
+  };
+  // Should not modify compute shader
+  HashModifiedFunc expectHashToBeEqual = [](const GenerateHashParams &params) { return true; };
+  runComputePipelineVariations(modifyBuildInfo, expectHashToBeEqual);
+}
+#endif
 
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
 // =====================================================================================================================
@@ -371,6 +393,26 @@ TEST(PipelineDumperTest, TestInternalRTShadersCompute) {
   runComputePipelineVariations(modifyBuildInfo, expectHashToBeEqual);
 }
 #endif
+
+// =====================================================================================================================
+// Test the forceNonUniformResourceIndexStageMask option.
+
+TEST(PipelineDumperTest, TestForceNonUniformResourceIndexStageMaskGraphics) {
+  ModifyGraphicsBuildInfo modifyBuildInfo = [](GraphicsPipelineBuildInfo *buildInfo) {
+    buildInfo->options.forceNonUniformResourceIndexStageMask = ~0u;
+  };
+
+  HashModifiedFunc expectHashToBeEqual = [](const GenerateHashParams &params) { return false; };
+  runGraphicsPipelineVariations(modifyBuildInfo, expectHashToBeEqual);
+}
+
+TEST(PipelineDumperTest, TestForceNonUniformResourceIndexStageMaskCompute) {
+  ModifyComputeBuildInfo modifyBuildInfo = [](ComputePipelineBuildInfo *buildInfo) {
+    buildInfo->options.forceNonUniformResourceIndexStageMask = ~0u;
+  };
+  HashModifiedFunc expectHashToBeEqual = [](const GenerateHashParams &params) { return false; };
+  runComputePipelineVariations(modifyBuildInfo, expectHashToBeEqual);
+}
 
 } // namespace
 } // namespace Llpc

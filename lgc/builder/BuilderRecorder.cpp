@@ -247,9 +247,13 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
   case Opcode::ImageGetLod:
     return "image.get.lod";
 #if VKI_RAY_TRACING
-  case Opcode::ImageBvhIntersectRayAMD:
+  case Opcode::ImageBvhIntersectRay:
     return "image.bvh.intersect.ray";
+  case Opcode::Reserved2:
+    return "reserved2";
 #else
+  case Opcode::Reserved2:
+    return "reserved2";
   case Opcode::Reserved1:
     return "reserved1";
 #endif
@@ -339,7 +343,6 @@ BuilderRecorderMetadataKinds::BuilderRecorderMetadataKinds(LLVMContext &context)
 BuilderRecorder::BuilderRecorder(LgcContext *builderContext, Pipeline *pipeline, bool omitOpcodes)
     : Builder(builderContext), BuilderRecorderMetadataKinds(builderContext->getContext()),
       m_pipelineState(reinterpret_cast<PipelineState *>(pipeline)), m_omitOpcodes(omitOpcodes) {
-  m_isBuilderRecorder = true;
 }
 
 // =====================================================================================================================
@@ -376,14 +379,15 @@ Value *BuilderRecorder::CreateDotProduct(Value *const vector1, Value *const vect
 
 // =====================================================================================================================
 // Create code to calculate the dot product of two integer vectors, with optional accumulator, using hardware support
-// where available.
-// Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is saturated
-// if there is an accumulator. The component type of input vectors can have 8-bit/16-bit/32-bit and i32/i16/i8 result.
+// where available. The factor inputs are always <N x iM> of the same type, N can be arbitrary and M must be 4, 8, 16,
+// 32, or 64 Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is
+// saturated if there is an accumulator. Only the final addition to the accumulator needs to be saturated.
+// Intermediate overflows of the dot product can lead to an undefined result.
 //
-// @param vector1 : The integer vector 1
-// @param vector2 : The integer vector 2
+// @param vector1 : The integer Vector 1
+// @param vector2 : The integer Vector 2
 // @param accumulator : The accumulator to the scalar of dot product
-// @param flags : Bit 0 is "first vector is signed" and bit 1 is "second vector is signed"
+// @param flags : The first bit marks whether Vector 1 is signed and the second bit marks whether Vector 2 is signed
 // @param instName : Name to give instruction(s)
 Value *BuilderRecorder::CreateIntegerDotProduct(Value *vector1, Value *vector2, Value *accumulator, unsigned flags,
                                                 const Twine &instName) {
@@ -1656,7 +1660,7 @@ Instruction *BuilderRecorder::CreateWriteBuiltInOutput(Value *valueToWrite, Buil
 // @param instName : Name to give instruction(s)
 Value *BuilderRecorder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, Value *origin, Value *direction,
                                                    Value *invDirection, Value *imageDesc, const Twine &instName) {
-  return record(Opcode::ImageBvhIntersectRayAMD, FixedVectorType::get(getInt32Ty(), 4),
+  return record(Opcode::ImageBvhIntersectRay, FixedVectorType::get(getInt32Ty(), 4),
                 {nodePtr, extent, origin, direction, invDirection, imageDesc}, instName);
 }
 
@@ -2150,7 +2154,7 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::SubgroupBallotFindMsb:
     case Opcode::SubgroupBallotInclusiveBitCount:
       // Functions that don't access memory.
-      func->addFnAttr(Attribute::ReadNone);
+      func->setDoesNotAccessMemory();
       break;
     case Opcode::ImageGather:
     case Opcode::ImageLoad:
@@ -2167,13 +2171,13 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::ReadPerVertexInput:
     case Opcode::ReadTaskPayload:
       // Functions that only read memory.
-      func->addFnAttr(Attribute::ReadOnly);
+      func->setOnlyReadsMemory();
       // Must be marked as returning for DCE.
       func->addFnAttr(Attribute::WillReturn);
       break;
     case Opcode::ImageStore:
       // Functions that only write memory.
-      func->addFnAttr(Attribute::WriteOnly);
+      func->setOnlyWritesMemory();
       break;
     case Opcode::ImageAtomic:
     case Opcode::ImageAtomicCompareSwap:
@@ -2227,7 +2231,7 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::WriteBuiltInOutput:
     case Opcode::WriteGenericOutput:
 #if VKI_RAY_TRACING
-    case Opcode::ImageBvhIntersectRayAMD:
+    case Opcode::ImageBvhIntersectRay:
 #endif
       // TODO: These functions have not been classified yet.
       break;

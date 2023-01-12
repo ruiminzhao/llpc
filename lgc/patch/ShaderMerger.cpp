@@ -31,15 +31,17 @@
 #include "ShaderMerger.h"
 #include "NggPrimShader.h"
 #include "lgc/patch/Patch.h"
+#include "lgc/patch/PatchPreparePipelineAbi.h"
+#include "lgc/patch/SystemValues.h"
 #include "lgc/state/PalMetadata.h"
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/util/BuilderBase.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 
 #define DEBUG_TYPE "lgc-shader-merger"
@@ -82,7 +84,21 @@ unsigned ShaderMerger::getSpecialSgprInputIndex(GfxIpVersion gfxIp, LsHs::Specia
       {LsHs::HsShaderAddrHigh, 7},    // s7
   };
 
+  static const std::unordered_map<LsHs::SpecialSgprInput, unsigned> LsHsSpecialSgprInputMapGfx11 = {
+      {LsHs::HsShaderAddrLow, 0},  // s0
+      {LsHs::HsShaderAddrHigh, 1}, // s1
+      {LsHs::OffChipLdsBase, 2},   // s2
+      {LsHs::MergedWaveInfo, 3},   // s3
+      {LsHs::TfBufferBase, 4},     // s4
+      {LsHs::waveIdInGroup, 5},    // s5
+  };
+
   assert(gfxIp.major >= 9); // Must be GFX9+
+
+  if (gfxIp.major >= 11) {
+    assert(LsHsSpecialSgprInputMapGfx11.count(sgprInput) > 0);
+    return LsHsSpecialSgprInputMapGfx11.at(sgprInput);
+  }
 
   assert(LsHsSpecialSgprInputMapGfx9.count(sgprInput) > 0);
   return LsHsSpecialSgprInputMapGfx9.at(sgprInput);
@@ -118,7 +134,23 @@ unsigned ShaderMerger::getSpecialSgprInputIndex(GfxIpVersion gfxIp, EsGs::Specia
       {EsGs::GsShaderAddrHigh, 7},    // s7
   };
 
+  static const std::unordered_map<EsGs::SpecialSgprInput, unsigned> EsGsSpecialSgprInputMapGfx11 = {
+      {EsGs::GsShaderAddrLow, 0},  // s0
+      {EsGs::GsShaderAddrHigh, 1}, // s1
+      {EsGs::MergedGroupInfo, 2},  // s2
+      {EsGs::MergedWaveInfo, 3},   // s3
+      {EsGs::OffChipLdsBase, 4},   // s4
+      {EsGs::AttribRingBase, 5},   // s5
+      {EsGs::FlatScratchLow, 6},   // s6
+      {EsGs::FlatScratchHigh, 7},  // s7
+  };
+
   assert(gfxIp.major >= 9); // Must be GFX9+
+
+  if (gfxIp.major >= 11) {
+    assert(EsGsSpecialSgprInputMapGfx11.count(sgprInput) > 0);
+    return EsGsSpecialSgprInputMapGfx11.at(sgprInput);
+  }
 
   if (gfxIp.major >= 10) {
     if (useNgg) {
@@ -129,6 +161,51 @@ unsigned ShaderMerger::getSpecialSgprInputIndex(GfxIpVersion gfxIp, EsGs::Specia
 
   assert(EsGsSpecialSgprInputMapGfx9.count(sgprInput) > 0);
   return EsGsSpecialSgprInputMapGfx9.at(sgprInput);
+}
+
+// =====================================================================================================================
+// Gather tuning attributes from an new entry-point function.
+//
+// @param tuningAttrs : Attribute builder holding gathered tuning options
+// @param srcEntryPoint : Entry-point providing tuning options (can be null)
+void ShaderMerger::gatherTuningAttributes(AttrBuilder &tuningAttrs, const Function *srcEntryPoint) const {
+  if (!srcEntryPoint)
+    return;
+
+  const AttributeSet &fnAttrs = srcEntryPoint->getAttributes().getFnAttrs();
+  for (const Attribute &srcAttr : fnAttrs) {
+    if (!srcAttr.isStringAttribute())
+      continue;
+
+    auto attrKind = srcAttr.getKindAsString();
+    if (!(attrKind.startswith("amdgpu") || attrKind.startswith("disable")))
+      continue;
+
+    // Note: this doesn't mean attribute values match
+    if (!tuningAttrs.contains(attrKind)) {
+      tuningAttrs.addAttribute(srcAttr);
+    } else if (tuningAttrs.getAttribute(attrKind) != srcAttr) {
+      LLVM_DEBUG(dbgs() << "[gatherTuningAttributes] Incompatible values for " << attrKind << "\n");
+    }
+  }
+}
+
+// =====================================================================================================================
+// Apply tuning attributes to new entry-point function.
+//
+// @param dstEntryPoint : Entry-point receiving tuning options
+// @param tuningAttrs : Attribute builder holding gathered tuning options
+void ShaderMerger::applyTuningAttributes(Function *dstEntryPoint, const AttrBuilder &tuningAttrs) const {
+  AttrBuilder attrs(*m_context);
+  attrs.merge(tuningAttrs);
+
+  // Remove any attributes already defined in the destination
+  const AttributeSet &existingAttrs = dstEntryPoint->getAttributes().getFnAttrs();
+  for (const Attribute &dstAttr : existingAttrs)
+    attrs.removeAttribute(dstAttr);
+
+  // Apply attributes
+  dstEntryPoint->addFnAttrs(attrs);
 }
 
 // =====================================================================================================================
@@ -143,8 +220,15 @@ Function *ShaderMerger::buildPrimShader(Function *esEntryPoint, Function *gsEntr
   processRayQueryLdsStack(esEntryPoint, gsEntryPoint);
 #endif
 
+  AttrBuilder tuningAttrs(*m_context);
+  gatherTuningAttributes(tuningAttrs, esEntryPoint);
+  gatherTuningAttributes(tuningAttrs, gsEntryPoint);
+  gatherTuningAttributes(tuningAttrs, copyShaderEntryPoint);
+
   NggPrimShader primShader(m_pipelineState);
-  return primShader.generate(esEntryPoint, gsEntryPoint, copyShaderEntryPoint);
+  auto primShaderEntryPoint = primShader.generate(esEntryPoint, gsEntryPoint, copyShaderEntryPoint);
+  applyTuningAttributes(primShaderEntryPoint, tuningAttrs);
+  return primShaderEntryPoint;
 }
 
 // =====================================================================================================================
@@ -189,15 +273,21 @@ FunctionType *ShaderMerger::generateLsHsEntryPointType(uint64_t *inRegMask) cons
   argTys.push_back(FixedVectorType::get(Type::getInt32Ty(*m_context), userDataCount));
   *inRegMask |= (1ull << NumSpecialSgprInputs);
 
-  // Other system values (VGPRs)
+  // HS VGPRs
   argTys.push_back(Type::getInt32Ty(*m_context)); // Patch ID
   argTys.push_back(Type::getInt32Ty(*m_context)); // Relative patch ID (control point ID included)
+
+  // LS VGPRs
   argTys.push_back(Type::getInt32Ty(*m_context)); // Vertex ID
-  argTys.push_back(Type::getInt32Ty(*m_context)); // Relative vertex ID (auto index)
-  argTys.push_back(Type::getInt32Ty(*m_context)); // Step rate
+  if (m_gfxIp.major <= 11) {
+    argTys.push_back(Type::getInt32Ty(*m_context)); // Relative vertex ID (auto index)
+    argTys.push_back(Type::getInt32Ty(*m_context)); // Step rate
+  }
   argTys.push_back(Type::getInt32Ty(*m_context)); // Instance ID
 
+  // Vertex fetch VGPRs
   appendVertexFetchTypes(argTys);
+
   return FunctionType::get(Type::getVoidTy(*m_context), argTys, false);
 }
 
@@ -231,8 +321,13 @@ Function *ShaderMerger::generateLsHsEntryPoint(Function *lsEntryPoint, Function 
   auto module = hsEntryPoint->getParent();
   module->getFunctionList().push_front(entryPoint);
 
+  AttrBuilder tuningAttrs(*m_context);
+  gatherTuningAttributes(tuningAttrs, lsEntryPoint);
+  gatherTuningAttributes(tuningAttrs, hsEntryPoint);
+
   entryPoint->addFnAttr("amdgpu-flat-work-group-size",
                         "128,128"); // Force s_barrier to be present (ignore optimization)
+  applyTuningAttributes(entryPoint, tuningAttrs);
 
   for (auto &arg : entryPoint->args()) {
     auto argIdx = arg.getArgNo();
@@ -255,55 +350,74 @@ Function *ShaderMerger::generateLsHsEntryPoint(Function *lsEntryPoint, Function 
   //     Run HS
   // }
   //
+  SmallVector<Argument *, 32> args;
+  for (auto &arg : entryPoint->args())
+    args.push_back(&arg);
 
-  auto arg = entryPoint->arg_begin();
-
-  Value *offChipLdsBase = (arg + getSpecialSgprInputIndex(m_gfxIp, LsHs::OffChipLdsBase));
+  Value *offChipLdsBase = args[getSpecialSgprInputIndex(m_gfxIp, LsHs::OffChipLdsBase)];
   offChipLdsBase->setName("offChipLdsBase");
 
-  Value *mergeWaveInfo = (arg + getSpecialSgprInputIndex(m_gfxIp, LsHs::MergedWaveInfo));
+  Value *mergeWaveInfo = args[getSpecialSgprInputIndex(m_gfxIp, LsHs::MergedWaveInfo)];
   mergeWaveInfo->setName("mergeWaveInfo");
 
-  Value *tfBufferBase = (arg + getSpecialSgprInputIndex(m_gfxIp, LsHs::TfBufferBase));
+  Value *tfBufferBase = args[getSpecialSgprInputIndex(m_gfxIp, LsHs::TfBufferBase)];
   tfBufferBase->setName("tfBufferBase");
 
-  arg += NumSpecialSgprInputs;
-
-  Value *userData = arg++;
+  Value *userData = args[NumSpecialSgprInputs];
 
   // Define basic blocks
+  auto entryBlock = BasicBlock::Create(*m_context, ".entry", entryPoint);
+  auto beginLsBlock = BasicBlock::Create(*m_context, ".beginLs", entryPoint);
+  auto endLsBlock = BasicBlock::Create(*m_context, ".endLs", entryPoint);
+  BasicBlock *distribHsPatchCountBlock = nullptr;
+  BasicBlock *endDistribHsPatchCountBlock = nullptr;
+  if (m_pipelineState->canOptimizeTessFactor()) {
+    distribHsPatchCountBlock = BasicBlock::Create(*m_context, ".distribHsPatchCount", entryPoint);
+    endDistribHsPatchCountBlock = BasicBlock::Create(*m_context, ".endDistribHsPatchCount", entryPoint);
+  }
+  auto beginHsBlock = BasicBlock::Create(*m_context, ".beginHs", entryPoint);
   auto endHsBlock = BasicBlock::Create(*m_context, ".endHs", entryPoint);
-  auto beginHsBlock = BasicBlock::Create(*m_context, ".beginHs", entryPoint, endHsBlock);
-  auto endLsBlock = BasicBlock::Create(*m_context, ".endLs", entryPoint, beginHsBlock);
-  auto beginLsBlock = BasicBlock::Create(*m_context, ".beginLs", entryPoint, endLsBlock);
-  auto entryBlock = BasicBlock::Create(*m_context, ".entry", entryPoint, beginLsBlock);
 
   // Construct ".entry" block
   BuilderBase builder(entryBlock);
 
   builder.CreateIntrinsic(Intrinsic::amdgcn_init_exec, {}, {builder.getInt64(-1)});
 
-  auto threadId = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {builder.getInt32(-1), builder.getInt32(0)});
+  auto threadIdInWave =
+      builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {builder.getInt32(-1), builder.getInt32(0)});
 
   unsigned waveSize = m_pipelineState->getShaderWaveSize(ShaderStageTessControl);
   if (waveSize == 64) {
-    threadId = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, {}, {builder.getInt32(-1), threadId});
+    threadIdInWave = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, {}, {builder.getInt32(-1), threadIdInWave});
   }
+  threadIdInWave->setName("threadIdInWave");
 
   auto lsVertCount = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                              {mergeWaveInfo, builder.getInt32(0), builder.getInt32(8)});
+  lsVertCount->setName("lsVertCount");
 
-  Value *patchId = arg;
-  Value *relPatchId = (arg + 1);
-  Value *vertexId = (arg + 2);
-  Value *relVertexId = (arg + 3);
-  Value *stepRate = (arg + 4);
-  Value *instanceId = (arg + 5);
-  auto vertexFetchesStart = (arg + 6);
-  auto vertexFetchesEnd = entryPoint->arg_end();
+  ArrayRef<Argument *> vgprArgs(args.begin() + NumSpecialSgprInputs + 1, args.end());
+
+  // HS VGPRs
+  Value *patchId = vgprArgs[0];
+  Value *relPatchId = vgprArgs[1];
+
+  // LS VGPRs
+  Value *vertexId = vgprArgs[2];
+  Value *relVertexId = PoisonValue::get(builder.getInt32Ty());
+  Value *stepRate = PoisonValue::get(builder.getInt32Ty());
+  if (m_gfxIp.major <= 11) {
+    relVertexId = vgprArgs[3];
+    stepRate = vgprArgs[4];
+  }
+  Value *instanceId = m_gfxIp.major <= 11 ? vgprArgs[5] : vgprArgs[3];
+
+  // Vertex fetch VGPRs
+  ArrayRef<Argument *> vertexFetches = vgprArgs.drop_front(m_gfxIp.major <= 11 ? 6 : 4);
 
   auto hsVertCount = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                              {mergeWaveInfo, builder.getInt32(8), builder.getInt32(8)});
+  hsVertCount->setName("hsVertCount");
 
   // NOTE: For GFX9, hardware has an issue of initializing LS VGPRs. When HS is null, v0~v3 are initialized as LS
   // VGPRs rather than expected v2~v4.
@@ -311,53 +425,43 @@ Function *ShaderMerger::generateLsHsEntryPoint(Function *lsEntryPoint, Function 
   if (gpuWorkarounds->gfx9.fixLsVgprInput) {
     auto nullHs = builder.CreateICmpEQ(hsVertCount, builder.getInt32(0));
 
-    vertexId = builder.CreateSelect(nullHs, arg, (arg + 2));
-    relVertexId = builder.CreateSelect(nullHs, (arg + 1), (arg + 3));
-    stepRate = builder.CreateSelect(nullHs, (arg + 2), (arg + 4));
-    instanceId = builder.CreateSelect(nullHs, (arg + 3), (arg + 5));
+    vertexId = builder.CreateSelect(nullHs, vgprArgs[0], vgprArgs[2]);
+    relVertexId = builder.CreateSelect(nullHs, vgprArgs[1], vgprArgs[3]);
+    stepRate = builder.CreateSelect(nullHs, vgprArgs[2], vgprArgs[4]);
+    instanceId = builder.CreateSelect(nullHs, vgprArgs[3], vgprArgs[5]);
   }
 
-  auto lsEnable = builder.CreateICmpULT(threadId, lsVertCount);
-  builder.CreateCondBr(lsEnable, beginLsBlock, endLsBlock);
+  auto validLsVert = builder.CreateICmpULT(threadIdInWave, lsVertCount, "validLsVert");
+  builder.CreateCondBr(validLsVert, beginLsBlock, endLsBlock);
 
   // Construct ".beginLs" block
   builder.SetInsertPoint(beginLsBlock);
 
   if (m_hasVs) {
     // Call LS main function
-    SmallVector<Value *> args;
+    SmallVector<Value *> lsArgs;
     auto intfData = m_pipelineState->getShaderInterfaceData(ShaderStageVertex);
 
-    unsigned lsArgIdx = 0;
-    const unsigned lsArgCount = lsEntryPoint->arg_size();
+    const auto lsArgCount = lsEntryPoint->arg_size();
 
-    appendUserData(builder, args, lsEntryPoint, lsArgIdx, userData, intfData->userDataCount);
+    appendUserData(builder, lsArgs, lsEntryPoint, 0, userData, intfData->userDataCount);
 
     // Set up system value VGPRs (LS does not have system value SGPRs)
-    if (lsArgIdx < lsArgCount) {
-      args.push_back(vertexId);
-      ++lsArgIdx;
-    }
+    if (lsArgs.size() < lsArgCount)
+      lsArgs.push_back(vertexId);
 
-    if (lsArgIdx < lsArgCount) {
-      args.push_back(relVertexId);
-      ++lsArgIdx;
-    }
+    if (lsArgs.size() < lsArgCount)
+      lsArgs.push_back(relVertexId);
 
-    if (lsArgIdx < lsArgCount) {
-      args.push_back(stepRate);
-      ++lsArgIdx;
-    }
+    if (lsArgs.size() < lsArgCount)
+      lsArgs.push_back(stepRate);
 
-    if (lsArgIdx < lsArgCount) {
-      args.push_back(instanceId);
-      ++lsArgIdx;
-    }
+    if (lsArgs.size() < lsArgCount)
+      lsArgs.push_back(instanceId);
 
-    appendArguments(args, vertexFetchesStart, vertexFetchesEnd);
-    lsArgIdx += (vertexFetchesEnd - vertexFetchesStart);
+    appendArguments(lsArgs, vertexFetches);
 
-    CallInst *call = builder.CreateCall(lsEntryPoint, args);
+    CallInst *call = builder.CreateCall(lsEntryPoint, lsArgs);
     call->setCallingConv(CallingConv::AMDGPU_LS);
   }
 
@@ -366,24 +470,47 @@ Function *ShaderMerger::generateLsHsEntryPoint(Function *lsEntryPoint, Function 
   // Construct ".endLs" block
   builder.SetInsertPoint(endLsBlock);
 
-  SyncScope::ID workgroupScope = m_context->getOrInsertSyncScopeID("workgroup");
-  builder.CreateFence(AtomicOrdering::Release, workgroupScope);
-  builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-  builder.CreateFence(AtomicOrdering::Acquire, workgroupScope);
+  if (m_pipelineState->canOptimizeTessFactor()) {
+    assert(distribHsPatchCountBlock);
+    assert(endDistribHsPatchCountBlock);
 
-  auto hsEnable = builder.CreateICmpULT(threadId, hsVertCount);
-  builder.CreateCondBr(hsEnable, beginHsBlock, endHsBlock);
+    // firstWave = mergedWaveInfo[31]
+    Value *firstWaveInGroup = builder.CreateAnd(mergeWaveInfo, 0x80000000);
+    firstWaveInGroup = builder.CreateICmpNE(firstWaveInGroup, builder.getInt32(0), "firstWaveInGroup");
+    builder.CreateCondBr(firstWaveInGroup, distribHsPatchCountBlock, endDistribHsPatchCountBlock);
+
+    // Construct ".distribHsPatchCount" block
+    builder.SetInsertPoint(distribHsPatchCountBlock);
+
+    // NOTE: The hsPatchCount is only valid for the first wave in the group. We have to store it to LDS to distribute
+    // it through the group.
+    Value *hasPatchCount = builder.CreateLShr(mergeWaveInfo, 16); // hsWaveCount = mergedWaveInfo[24:16]
+    hasPatchCount = builder.CreateAnd(hasPatchCount, 0xFF);
+    const auto hsPatchCountStart = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)
+                                       ->inOutUsage.tcs.calcFactor.onChip.hsPatchCountStart;
+    writeValueToLds(hasPatchCount, builder.getInt32(hsPatchCountStart), builder);
+    builder.CreateBr(endDistribHsPatchCountBlock);
+
+    // Construct ".endDistribHsPatchCount" block
+    builder.SetInsertPoint(endDistribHsPatchCountBlock);
+  }
+
+  SyncScope::ID syncScope = m_context->getOrInsertSyncScopeID("workgroup");
+  builder.CreateFence(AtomicOrdering::Release, syncScope);
+  builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+  builder.CreateFence(AtomicOrdering::Acquire, syncScope);
+
+  auto validHsVert = builder.CreateICmpULT(threadIdInWave, hsVertCount, "validHsVert");
+  builder.CreateCondBr(validHsVert, beginHsBlock, endHsBlock);
 
   // Construct ".beginHs" block
   builder.SetInsertPoint(beginHsBlock);
 
   if (m_hasTcs) {
     // Call HS main function
-    SmallVector<Value *> args;
+    SmallVector<Value *> hsArgs;
 
     auto intfData = m_pipelineState->getShaderInterfaceData(ShaderStageTessControl);
-
-    unsigned hsArgIdx = 0;
 
     SmallVector<std::pair<unsigned, unsigned>> substitutions;
     if (intfData->spillTable.sizeInDwords > 0 && m_hasVs) {
@@ -391,33 +518,28 @@ Function *ShaderMerger::generateLsHsEntryPoint(Function *lsEntryPoint, Function 
       assert(vsIntfData->userDataUsage.spillTable > 0);
       substitutions.emplace_back(intfData->userDataUsage.spillTable, vsIntfData->userDataUsage.spillTable);
     }
-    appendUserData(builder, args, hsEntryPoint, hsArgIdx, userData, intfData->userDataCount, substitutions);
+    appendUserData(builder, hsArgs, hsEntryPoint, 0, userData, intfData->userDataCount, substitutions);
 
     // Set up system value SGPRs
-    if (m_pipelineState->isTessOffChip()) {
-      args.push_back(offChipLdsBase);
-      ++hsArgIdx;
-    }
-
-    args.push_back(tfBufferBase);
-    ++hsArgIdx;
+    if (m_pipelineState->isTessOffChip())
+      hsArgs.push_back(offChipLdsBase);
+    hsArgs.push_back(tfBufferBase);
 
     // Set up system value VGPRs
-    args.push_back(patchId);
-    ++hsArgIdx;
+    hsArgs.push_back(patchId);
+    hsArgs.push_back(relPatchId);
 
-    args.push_back(relPatchId);
-    ++hsArgIdx;
-
-    assert(hsArgIdx == hsEntryPoint->arg_size()); // Must have visit all arguments of HS entry point
-
-    CallInst *call = builder.CreateCall(hsEntryPoint, args);
+    CallInst *call = builder.CreateCall(hsEntryPoint, hsArgs);
     call->setCallingConv(CallingConv::AMDGPU_HS);
   }
   builder.CreateBr(endHsBlock);
 
   // Construct ".endHs" block
   builder.SetInsertPoint(endHsBlock);
+
+  if (m_pipelineState->canOptimizeTessFactor())
+    storeTessFactorsWithOpt(threadIdInWave, builder);
+
   builder.CreateRetVoid();
 
   return entryPoint;
@@ -480,7 +602,7 @@ FunctionType *ShaderMerger::generateEsGsEntryPointType(uint64_t *inRegMask) cons
   argTys.push_back(FixedVectorType::get(Type::getInt32Ty(*m_context), userDataCount));
   *inRegMask |= (1ull << NumSpecialSgprInputs);
 
-  // Other system values (VGPRs)
+  // GS VGPRs
   argTys.push_back(Type::getInt32Ty(*m_context)); // ES to GS offsets (vertex 0 and 1)
   argTys.push_back(Type::getInt32Ty(*m_context)); // ES to GS offsets (vertex 2 and 3)
   argTys.push_back(Type::getInt32Ty(*m_context)); // Primitive ID (GS)
@@ -488,15 +610,19 @@ FunctionType *ShaderMerger::generateEsGsEntryPointType(uint64_t *inRegMask) cons
   argTys.push_back(Type::getInt32Ty(*m_context)); // ES to GS offsets (vertex 4 and 5)
 
   if (hasTs) {
+    // ES VGPRs
     argTys.push_back(Type::getFloatTy(*m_context)); // X of TessCoord (U)
     argTys.push_back(Type::getFloatTy(*m_context)); // Y of TessCoord (V)
     argTys.push_back(Type::getInt32Ty(*m_context)); // Relative patch ID
     argTys.push_back(Type::getInt32Ty(*m_context)); // Patch ID
   } else {
+    // ES VGPRs
     argTys.push_back(Type::getInt32Ty(*m_context)); // Vertex ID
     argTys.push_back(Type::getInt32Ty(*m_context)); // Relative vertex ID (auto index)
     argTys.push_back(Type::getInt32Ty(*m_context)); // Primitive ID (VS)
     argTys.push_back(Type::getInt32Ty(*m_context)); // Instance ID
+
+    // Vertex fetch VGPRs
     appendVertexFetchTypes(argTys);
   }
 
@@ -535,8 +661,13 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
   entryPoint->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
   module->getFunctionList().push_front(entryPoint);
 
+  AttrBuilder tuningAttrs(*m_context);
+  gatherTuningAttributes(tuningAttrs, esEntryPoint);
+  gatherTuningAttributes(tuningAttrs, gsEntryPoint);
+
   entryPoint->addFnAttr("amdgpu-flat-work-group-size",
                         "128,128"); // Force s_barrier to be present (ignore optimization)
+  applyTuningAttributes(entryPoint, tuningAttrs);
 
   for (auto &arg : entryPoint->args()) {
     auto argIdx = arg.getArgNo();
@@ -559,85 +690,95 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
   //     Run GS
   // }
   //
-
   const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage.gs.calcFactor;
 
-  auto arg = entryPoint->arg_begin();
+  SmallVector<Argument *, 32> args;
+  for (auto &arg : entryPoint->args())
+    args.push_back(&arg);
 
-  Value *gsVsOffset = (arg + getSpecialSgprInputIndex(m_gfxIp, EsGs::GsVsOffset, false));
+  Value *gsVsOffset = args[getSpecialSgprInputIndex(m_gfxIp, EsGs::GsVsOffset, false)];
   gsVsOffset->setName("gsVsOffset");
 
-  Value *mergedWaveInfo = (arg + getSpecialSgprInputIndex(m_gfxIp, EsGs::MergedWaveInfo, false));
+  Value *mergedWaveInfo = args[getSpecialSgprInputIndex(m_gfxIp, EsGs::MergedWaveInfo, false)];
   mergedWaveInfo->setName("mergedWaveInfo");
 
-  Value *offChipLdsBase = (arg + getSpecialSgprInputIndex(m_gfxIp, EsGs::OffChipLdsBase, false));
+  Value *offChipLdsBase = args[getSpecialSgprInputIndex(m_gfxIp, EsGs::OffChipLdsBase, false)];
   offChipLdsBase->setName("offChipLdsBase");
 
-  arg += NumSpecialSgprInputs;
-
-  Value *userData = arg++;
+  Value *userData = args[NumSpecialSgprInputs];
 
   // Define basic blocks
+  auto entryBlock = BasicBlock::Create(*m_context, ".entry", entryPoint);
+  auto beginEsBlock = BasicBlock::Create(*m_context, ".beginEs", entryPoint);
+  auto endEsBlock = BasicBlock::Create(*m_context, ".endEs", entryPoint);
+  auto beginGsBlock = BasicBlock::Create(*m_context, ".beginGs", entryPoint);
   auto endGsBlock = BasicBlock::Create(*m_context, ".endGs", entryPoint);
-  auto beginGsBlock = BasicBlock::Create(*m_context, ".beginGs", entryPoint, endGsBlock);
-  auto endEsBlock = BasicBlock::Create(*m_context, ".endEs", entryPoint, beginGsBlock);
-  auto beginEsBlock = BasicBlock::Create(*m_context, ".beginEs", entryPoint, endEsBlock);
-  auto entryBlock = BasicBlock::Create(*m_context, ".entry", entryPoint, beginEsBlock);
 
   // Construct ".entry" block
   BuilderBase builder(entryBlock);
   builder.CreateIntrinsic(Intrinsic::amdgcn_init_exec, {}, {builder.getInt64(-1)});
 
-  auto threadId = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {builder.getInt32(-1), builder.getInt32(0)});
+  auto threadIdInWave =
+      builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {builder.getInt32(-1), builder.getInt32(0)});
 
   unsigned waveSize = m_pipelineState->getShaderWaveSize(ShaderStageGeometry);
   if (waveSize == 64) {
-    threadId = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, {}, {builder.getInt32(-1), threadId});
+    threadIdInWave = builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, {}, {builder.getInt32(-1), threadIdInWave});
   }
+  threadIdInWave->setName("threadIdInWave");
 
   auto esVertCount = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                              {mergedWaveInfo, builder.getInt32(0), builder.getInt32(8)});
+  esVertCount->setName("esVertCount");
   auto gsPrimCount = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                              {mergedWaveInfo, builder.getInt32(8), builder.getInt32(8)});
+  gsPrimCount->setName("gsPrimCount");
   auto gsWaveId = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                           {mergedWaveInfo, builder.getInt32(16), builder.getInt32(8)});
+  gsWaveId->setName("gsWaveId");
   auto waveInSubgroup = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, {builder.getInt32Ty()},
                                                 {mergedWaveInfo, builder.getInt32(24), builder.getInt32(4)});
+  waveInSubgroup->setName("waveInSubgroup");
 
   unsigned esGsBytesPerWave = waveSize * 4 * calcFactor.esGsRingItemSize;
   auto esGsOffset = builder.CreateMul(waveInSubgroup, builder.getInt32(esGsBytesPerWave));
 
-  auto esEnable = builder.CreateICmpULT(threadId, esVertCount);
-  builder.CreateCondBr(esEnable, beginEsBlock, endEsBlock);
+  auto validEsVert = builder.CreateICmpULT(threadIdInWave, esVertCount, "validEsVert");
+  builder.CreateCondBr(validEsVert, beginEsBlock, endEsBlock);
 
-  Value *esGsOffsets01 = arg;
+  ArrayRef<Argument *> vgprArgs(args.begin() + NumSpecialSgprInputs + 1, args.end());
 
-  Value *esGsOffsets23 = PoisonValue::get(Type::getInt32Ty(*m_context));
+  // GS VGPRs
+  Value *esGsOffsets01 = vgprArgs[0];
+
+  Value *esGsOffsets23 = PoisonValue::get(builder.getInt32Ty());
   if (calcFactor.inputVertices > 2) {
     // NOTE: ES to GS offset (vertex 2 and 3) is valid once the primitive type has more than 2 vertices.
-    esGsOffsets23 = (arg + 1);
+    esGsOffsets23 = vgprArgs[1];
   }
 
-  Value *gsPrimitiveId = (arg + 2);
-  Value *invocationId = (arg + 3);
+  Value *gsPrimitiveId = vgprArgs[2];
+  Value *invocationId = vgprArgs[3];
 
-  Value *esGsOffsets45 = PoisonValue::get(Type::getInt32Ty(*m_context));
+  Value *esGsOffsets45 = PoisonValue::get(builder.getInt32Ty());
   if (calcFactor.inputVertices > 4) {
     // NOTE: ES to GS offset (vertex 4 and 5) is valid once the primitive type has more than 4 vertices.
-    esGsOffsets45 = (arg + 4);
+    esGsOffsets45 = vgprArgs[4];
   }
 
-  Value *tessCoordX = (arg + 5);
-  Value *tessCoordY = (arg + 6);
-  Value *relPatchId = (arg + 7);
-  Value *patchId = (arg + 8);
+  // ES VGPRs
+  Value *tessCoordX = vgprArgs[5];
+  Value *tessCoordY = vgprArgs[6];
+  Value *relPatchId = vgprArgs[7];
+  Value *patchId = vgprArgs[8];
 
-  Value *vertexId = (arg + 5);
-  Value *relVertexId = (arg + 6);
-  Value *vsPrimitiveId = (arg + 7);
-  Value *instanceId = (arg + 8);
-  auto vertexFetchesStart = (arg + 9);
-  auto vertexFetchesEnd = entryPoint->arg_end();
+  Value *vertexId = vgprArgs[5];
+  Value *relVertexId = vgprArgs[6];
+  Value *vsPrimitiveId = vgprArgs[7];
+  Value *instanceId = vgprArgs[8];
+
+  // Vertex fetch VGPRs
+  ArrayRef<Argument *> vertexFetches = vgprArgs.drop_front(9);
 
   // Construct ".beginEs" block
   unsigned spillTableIdx = 0;
@@ -645,71 +786,48 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
 
   if ((hasTs && m_hasTes) || (!hasTs && m_hasVs)) {
     // Call ES main function
-    SmallVector<Value *> args;
+    SmallVector<Value *> esArgs;
     auto intfData = m_pipelineState->getShaderInterfaceData(hasTs ? ShaderStageTessEval : ShaderStageVertex);
     spillTableIdx = intfData->userDataUsage.spillTable;
 
-    unsigned esArgIdx = 0;
     const unsigned esArgCount = esEntryPoint->arg_size();
 
-    appendUserData(builder, args, esEntryPoint, esArgIdx, userData, intfData->userDataCount);
+    appendUserData(builder, esArgs, esEntryPoint, 0, userData, intfData->userDataCount);
 
     if (hasTs) {
       // Set up system value SGPRs
       if (m_pipelineState->isTessOffChip()) {
-        args.push_back(offChipLdsBase);
-        ++esArgIdx;
-
-        args.push_back(offChipLdsBase);
-        ++esArgIdx;
+        esArgs.push_back(offChipLdsBase);
+        esArgs.push_back(offChipLdsBase);
       }
-
-      args.push_back(esGsOffset);
-      ++esArgIdx;
+      esArgs.push_back(esGsOffset);
 
       // Set up system value VGPRs
-      args.push_back(tessCoordX);
-      ++esArgIdx;
-
-      args.push_back(tessCoordY);
-      ++esArgIdx;
-
-      args.push_back(relPatchId);
-      ++esArgIdx;
-
-      args.push_back(patchId);
-      ++esArgIdx;
+      esArgs.push_back(tessCoordX);
+      esArgs.push_back(tessCoordY);
+      esArgs.push_back(relPatchId);
+      esArgs.push_back(patchId);
     } else {
       // Set up system value SGPRs
-      args.push_back(esGsOffset);
-      ++esArgIdx;
+      esArgs.push_back(esGsOffset);
 
       // Set up system value VGPRs
-      if (esArgIdx < esArgCount) {
-        args.push_back(vertexId);
-        ++esArgIdx;
-      }
+      if (esArgs.size() < esArgCount)
+        esArgs.push_back(vertexId);
 
-      if (esArgIdx < esArgCount) {
-        args.push_back(relVertexId);
-        ++esArgIdx;
-      }
+      if (esArgs.size() < esArgCount)
+        esArgs.push_back(relVertexId);
 
-      if (esArgIdx < esArgCount) {
-        args.push_back(vsPrimitiveId);
-        ++esArgIdx;
-      }
+      if (esArgs.size() < esArgCount)
+        esArgs.push_back(vsPrimitiveId);
 
-      if (esArgIdx < esArgCount) {
-        args.push_back(instanceId);
-        ++esArgIdx;
-      }
+      if (esArgs.size() < esArgCount)
+        esArgs.push_back(instanceId);
 
-      appendArguments(args, vertexFetchesStart, vertexFetchesEnd);
-      esArgIdx += (vertexFetchesEnd - vertexFetchesStart);
+      appendArguments(esArgs, vertexFetches);
     }
 
-    CallInst *call = builder.CreateCall(esEntryPoint, args);
+    CallInst *call = builder.CreateCall(esEntryPoint, esArgs);
     call->setCallingConv(CallingConv::AMDGPU_ES);
   }
   builder.CreateBr(endEsBlock);
@@ -717,13 +835,13 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
   // Construct ".endEs" block
   builder.SetInsertPoint(endEsBlock);
 
-  SyncScope::ID workgroupScope = m_context->getOrInsertSyncScopeID("workgroup");
-  builder.CreateFence(AtomicOrdering::Release, workgroupScope);
+  SyncScope::ID syncScope = m_context->getOrInsertSyncScopeID("workgroup");
+  builder.CreateFence(AtomicOrdering::Release, syncScope);
   builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-  builder.CreateFence(AtomicOrdering::Acquire, workgroupScope);
+  builder.CreateFence(AtomicOrdering::Acquire, syncScope);
 
-  auto gsEnable = builder.CreateICmpULT(threadId, gsPrimCount);
-  builder.CreateCondBr(gsEnable, beginGsBlock, endGsBlock);
+  auto validGsPrim = builder.CreateICmpULT(threadIdInWave, gsPrimCount, "validGsPrim");
+  builder.CreateCondBr(validGsPrim, beginGsBlock, endGsBlock);
 
   // Construct ".beginGs" block
   builder.SetInsertPoint(beginGsBlock);
@@ -742,50 +860,29 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
                                                {esGsOffsets45, builder.getInt32(16), builder.getInt32(16)});
 
     // Call GS main function
-    SmallVector<llvm::Value *> args;
+    SmallVector<llvm::Value *> gsArgs;
     auto intfData = m_pipelineState->getShaderInterfaceData(ShaderStageGeometry);
-    unsigned gsArgIdx = 0;
 
     SmallVector<std::pair<unsigned, unsigned>> substitutions;
     if (intfData->spillTable.sizeInDwords > 0 && spillTableIdx > 0)
       substitutions.emplace_back(intfData->userDataUsage.spillTable, spillTableIdx);
-    appendUserData(builder, args, gsEntryPoint, gsArgIdx, userData, intfData->userDataCount, substitutions);
+    appendUserData(builder, gsArgs, gsEntryPoint, 0, userData, intfData->userDataCount, substitutions);
 
     // Set up system value SGPRs
-    args.push_back(gsVsOffset);
-    ++gsArgIdx;
-
-    args.push_back(gsWaveId);
-    ++gsArgIdx;
+    gsArgs.push_back(gsVsOffset);
+    gsArgs.push_back(gsWaveId);
 
     // Set up system value VGPRs
-    args.push_back(esGsOffset0);
-    ++gsArgIdx;
+    gsArgs.push_back(esGsOffset0);
+    gsArgs.push_back(esGsOffset1);
+    gsArgs.push_back(gsPrimitiveId);
+    gsArgs.push_back(esGsOffset2);
+    gsArgs.push_back(esGsOffset3);
+    gsArgs.push_back(esGsOffset4);
+    gsArgs.push_back(esGsOffset5);
+    gsArgs.push_back(invocationId);
 
-    args.push_back(esGsOffset1);
-    ++gsArgIdx;
-
-    args.push_back(gsPrimitiveId);
-    ++gsArgIdx;
-
-    args.push_back(esGsOffset2);
-    ++gsArgIdx;
-
-    args.push_back(esGsOffset3);
-    ++gsArgIdx;
-
-    args.push_back(esGsOffset4);
-    ++gsArgIdx;
-
-    args.push_back(esGsOffset5);
-    ++gsArgIdx;
-
-    args.push_back(invocationId);
-    ++gsArgIdx;
-
-    assert(gsArgIdx == gsEntryPoint->arg_size()); // Must have visit all arguments of GS entry point
-
-    CallInst *call = builder.CreateCall(gsEntryPoint, args);
+    CallInst *call = builder.CreateCall(gsEntryPoint, gsArgs);
     call->setCallingConv(CallingConv::AMDGPU_GS);
   }
   builder.CreateBr(endGsBlock);
@@ -799,18 +896,18 @@ Function *ShaderMerger::generateEsGsEntryPoint(Function *esEntryPoint, Function 
 
 // =====================================================================================================================
 // Append the user data arguments for calling @p target to @p args by referring to the arguments of @p target starting
-// at @p argIdx (which will be updated). User data values are taken from the @p userData vector.
+// at @p argIdx. User data values are taken from the @p userData vector.
 //
 // @param builder : The builder that will be used to create code to prepare the arguments
 // @param [in/out] args : The argument vector that will be appended to
 // @param target : The function we are preparing to call
-// @param [in/out] argIdx : Index into the target function's arguments
+// @param argIdx : Index into the target function's arguments
 // @param userData : The <N x i32> vector of user data values
 // @param userDataCount : The number of element of @p userData that should be processed
 // @param substitutions : A mapping of "target function user data index to merged function user data index" that is
 //                        applied to i32 arguments of the target function.
 void ShaderMerger::appendUserData(BuilderBase &builder, SmallVectorImpl<Value *> &args, Function *target,
-                                  unsigned &argIdx, Value *userData, unsigned userDataCount,
+                                  unsigned argIdx, Value *userData, unsigned userDataCount,
                                   ArrayRef<std::pair<unsigned, unsigned>> substitutions) {
   unsigned userDataIdx = 0;
 
@@ -835,8 +932,8 @@ void ShaderMerger::appendUserData(BuilderBase &builder, SmallVectorImpl<Value *>
 
       userDataIdx += userDataSize;
 
-      auto lsUserData = builder.CreateShuffleVector(userData, userData, shuffleMask);
-      args.push_back(lsUserData);
+      auto newUserData = builder.CreateShuffleVector(userData, userData, shuffleMask);
+      args.push_back(newUserData);
     } else {
       assert(argTy->isIntegerTy());
 
@@ -848,8 +945,8 @@ void ShaderMerger::appendUserData(BuilderBase &builder, SmallVectorImpl<Value *>
         }
       }
 
-      auto lsUserData = builder.CreateExtractElement(userData, actualUserDataIdx);
-      args.push_back(lsUserData);
+      auto newUserData = builder.CreateExtractElement(userData, actualUserDataIdx);
+      args.push_back(newUserData);
       ++userDataIdx;
     }
 
@@ -876,11 +973,10 @@ void ShaderMerger::appendVertexFetchTypes(std::vector<Type *> &argTys) const {
 // Appends the arguments in the range [begin,end) to the vector.
 //
 // @param [in/out] args : The vector to which the arguments will be appends.
-// @param begin : The start of the argument to add.
-// @param end : One past the last argument to add.
-void ShaderMerger::appendArguments(SmallVectorImpl<Value *> &args, Argument *begin, Argument *end) const {
-  for (auto &fetch : make_range(begin, end)) {
-    args.push_back(&fetch);
+// @param argsToAppend : The arguments to be appended
+void ShaderMerger::appendArguments(SmallVectorImpl<Value *> &args, ArrayRef<Argument *> argsToAppend) const {
+  for (auto arg : argsToAppend) {
+    args.push_back(arg);
   }
 }
 
@@ -949,3 +1045,387 @@ void ShaderMerger::processRayQueryLdsStack(Function *entryPoint1, Function *entr
   }
 }
 #endif
+
+// =====================================================================================================================
+// Handle the store of tessellation factors with optimization (TF0/TF1 messaging)
+//
+// @param threadIdInWave : Thread ID in wave
+// @param builder : IR builder to insert instructions
+void ShaderMerger::storeTessFactorsWithOpt(Value *threadIdInWave, IRBuilder<> &builder) {
+  assert(m_pipelineState->canOptimizeTessFactor());
+
+  //
+  // The processing is something like this:
+  //
+  // OPTIMIZED_TF_STORE() {
+  //   Read hsPatchCount from LDS
+  //
+  //   if (threadIdInGroup < hsPatchCount) {
+  //     Read TFs from LDS (with a barrier to make sure TFs are written)
+  //     Compute per-thread specielTf
+  //     Compute per-wave specielTf
+  //   }
+  //
+  //   hsPatchWaveCount = alignTo(hsPatchCount, waveSize) / waveSize
+  //   if (hsPatchWaveCount > 1) {
+  //     Write per-wave specielTf to LDS
+  //     Barrier
+  //
+  //     if (threadIdInWave < hsPatchWaveCount) {
+  //       Read per-wave specielTf from LDS
+  //       Compute per-group specielTf
+  //     }
+  //   }
+  //
+  //   if (threadIdInWave < hsPatchCount) {
+  //     if (specialTf)
+  //       if (waveIdInGroup == 0)
+  //         Send HsTessFactor message
+  //     } else {
+  //       Write TFs to buffer
+  //     }
+  //   }
+  // }
+  //
+
+  auto insertBlock = builder.GetInsertBlock();
+  auto entryPoint = insertBlock->getParent();
+  assert(entryPoint->getName() == lgcName::LsHsEntryPoint); // Must be LS-HS merged shader
+
+  const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
+  const unsigned waveSize = m_pipelineState->getMergedShaderWaveSize(ShaderStageTessControl);
+  assert(waveSize == 32 || waveSize == 64);
+
+  // Helper to create a basic block
+  auto createBlock = [&](const Twine &name) { return BasicBlock::Create(*m_context, name, entryPoint); };
+
+  // Helper to create a PHI node with two incomings
+  auto createPhi = [&](std::pair<Value *, BasicBlock *> incoming1, std::pair<Value *, BasicBlock *> incoming2) {
+    assert(incoming1.first->getType() == incoming2.first->getType());
+    auto phi = builder.CreatePHI(incoming1.first->getType(), 2);
+    phi->addIncoming(incoming1.first, incoming1.second);
+    phi->addIncoming(incoming2.first, incoming2.second);
+    return phi;
+  };
+
+  // Helper to do a group ballot
+  auto ballot = [&](Value *value) {
+    assert(value->getType()->isIntegerTy(1)); // Should be i1
+
+    value = builder.CreateSelect(value, builder.getInt32(1), builder.getInt32(0));
+    auto inlineAsmTy = FunctionType::get(builder.getInt32Ty(), builder.getInt32Ty(), false);
+    auto inlineAsm = InlineAsm::get(inlineAsmTy, "; %1", "=v,0", true);
+    value = builder.CreateCall(inlineAsm, value);
+
+    static const unsigned PredicateNE = 33; // 33 = predicate NE
+    Value *ballot = builder.CreateIntrinsic(Intrinsic::amdgcn_icmp,
+                                            {
+                                                builder.getIntNTy(waveSize), // Return type
+                                                builder.getInt32Ty()         // Argument type
+                                            },
+                                            {value, builder.getInt32(0), builder.getInt32(PredicateNE)});
+    if (waveSize == 32)
+      ballot = builder.CreateZExt(ballot, builder.getInt64Ty());
+    return ballot;
+  };
+
+  // Define basic blocks
+  auto checkSpecilTfInWaveBlock = createBlock(".checkSpecialTfInWave");
+  auto endCheckSpecialTfInWaveBlock = createBlock(".endCheckSpecialTfInWave");
+
+  auto handleMultiWaveBlock = createBlock(".handleMultiWave");
+  auto checkSpecilTfInGroupBlock = createBlock(".checkSpecialTfInGroup");
+  auto endCheckSpecialTfInGroupBlock = createBlock(".endCheckSpecialTfInGroup");
+  auto endHandleMultiWaveBlock = createBlock(".endHandleMultiWave");
+
+  auto tryStoreTfBlock = createBlock(".tryStoreTf");
+  auto checkSendTfMessageBlock = createBlock(".checkSendTfMessage");
+  auto sendTfMessageBlock = createBlock(".sendTfMessage");
+  auto storeTfBlock = createBlock(".storeTf");
+  auto endTryStoreTfBlock = createBlock(".endTryStoreTf");
+
+  // Construct current insert block
+  Value *waveIdInGroup = nullptr;
+  Value *threadIdInGroup = nullptr;
+  Value *hsPatchCount = nullptr;
+  Value *validHsPatch = nullptr;
+  {
+    waveIdInGroup = getFunctionArgument(entryPoint, getSpecialSgprInputIndex(m_gfxIp, LsHs::waveIdInGroup));
+    waveIdInGroup = builder.CreateAnd(waveIdInGroup, 0x1F, "waveIdInGroup"); // waveIdInGroup = [4:0]
+
+    threadIdInGroup = builder.CreateMul(builder.getInt32(waveSize), waveIdInGroup);
+    threadIdInGroup = builder.CreateAdd(threadIdInGroup, threadIdInWave, "threadIdInGroup");
+
+    const auto hsPatchCountStart = calcFactor.onChip.hsPatchCountStart;
+    hsPatchCount = readValueFromLds(builder.getInt32Ty(), builder.getInt32(hsPatchCountStart), builder);
+    hsPatchCount = builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, hsPatchCount);
+    hsPatchCount->setName("hsPatchCount");
+
+    validHsPatch = builder.CreateICmpULT(threadIdInGroup, hsPatchCount, "validHsPatch");
+    builder.CreateCondBr(validHsPatch, checkSpecilTfInWaveBlock, endCheckSpecialTfInWaveBlock);
+  }
+
+  // Construct ".checkSpecialTfInWave" block
+  Value *outerTf = nullptr;
+  Value *innerTf = nullptr;
+  std::pair<Value *, Value *> specialTfInWave = {}; // Special TF in this wave
+  {
+    builder.SetInsertPoint(checkSpecilTfInWaveBlock);
+
+    // Read back TFs from LDS
+    auto tessFactors = PatchPreparePipelineAbi::readTessFactors(m_pipelineState, threadIdInGroup, builder);
+    outerTf = tessFactors.first;
+    innerTf = tessFactors.second;
+
+    // Check special TFs
+    Value *one = ConstantFP::get(builder.getFloatTy(), 1.0);
+    Value *zero = ConstantFP::get(builder.getFloatTy(), 0.0);
+
+    Value *isAllOnesTf = builder.getTrue();
+    Value *isAllZerosTf = builder.getTrue();
+
+    // Check if the thread has all-ones/all-zeros TFs
+    for (unsigned i = 0; i < cast<FixedVectorType>(outerTf->getType())->getNumElements(); ++i) {
+      auto elem = builder.CreateExtractElement(outerTf, i);
+      Value *isOne = builder.CreateFCmpOEQ(elem, one);
+      Value *isZero = builder.CreateFCmpOEQ(elem, zero);
+
+      isAllOnesTf = builder.CreateAnd(isAllOnesTf, isOne);
+      isAllZerosTf = builder.CreateAnd(isAllZerosTf, isZero);
+    }
+
+    // Check inner tessellation factors
+    if (innerTf) {
+      // Isoline doesn't have inner tessellation factors
+      for (unsigned i = 0; i < cast<FixedVectorType>(innerTf->getType())->getNumElements(); ++i) {
+        auto elem = builder.CreateExtractElement(innerTf, i);
+        Value *isOne = builder.CreateFCmpOEQ(elem, one);
+        Value *isZero = builder.CreateFCmpOEQ(elem, zero);
+
+        isAllOnesTf = builder.CreateAnd(isAllOnesTf, isOne);
+        isAllZerosTf = builder.CreateAnd(isAllZerosTf, isZero);
+      }
+    }
+
+    auto validhMask = ballot(builder.getTrue());
+
+    // Check if the wave has all-ones TFs uniformly
+    Value *allOnesTfMask = ballot(isAllOnesTf);
+    auto isAllOnesTfInWave = builder.CreateICmpEQ(allOnesTfMask, validhMask);
+
+    // Check if the wave has all-zeros TFs uniformly
+    Value *allZerosTfMask = ballot(isAllZerosTf);
+    auto isAllZerosTfInWave = builder.CreateICmpEQ(allZerosTfMask, validhMask);
+
+    specialTfInWave = std::make_pair(isAllOnesTfInWave, isAllZerosTfInWave);
+
+    builder.CreateBr(endCheckSpecialTfInWaveBlock);
+  }
+
+  // Construct ".endCheckSpecialTfInWave" block
+  Value *hsPatchWaveCount = nullptr;
+  {
+    builder.SetInsertPoint(endCheckSpecialTfInWaveBlock);
+
+    outerTf = createPhi({PoisonValue::get(outerTf->getType()), insertBlock}, {outerTf, checkSpecilTfInWaveBlock});
+    outerTf->setName("outerTf");
+    if (innerTf) {
+      // Isoline doesn't have inner tessellation factors
+      innerTf = createPhi({PoisonValue::get(innerTf->getType()), insertBlock}, {innerTf, checkSpecilTfInWaveBlock});
+      innerTf->setName("innerTf");
+    }
+
+    auto isAllOnesTfInWave =
+        createPhi({builder.getTrue(), insertBlock}, {specialTfInWave.first, checkSpecilTfInWaveBlock});
+    isAllOnesTfInWave->setName("isAllOnesTfInWave");
+    auto isAllZerosTfInWave =
+        createPhi({builder.getTrue(), insertBlock}, {specialTfInWave.second, checkSpecilTfInWaveBlock});
+    isAllZerosTfInWave->setName("isAllZerosTfInWave");
+    specialTfInWave = std::make_pair(isAllOnesTfInWave, isAllZerosTfInWave);
+
+    // hsPatchWaveCount = alignTo(hsPatchCount, waveSize) / waveSize = (hsPatchCount + waveSize - 1) / waveSize
+    hsPatchWaveCount = builder.CreateAdd(hsPatchCount, builder.getInt32(waveSize - 1));
+    hsPatchWaveCount = builder.CreateLShr(hsPatchWaveCount, Log2_32(waveSize), "hsPatchWaveCount");
+
+    auto multiWave = builder.CreateICmpUGT(hsPatchWaveCount, builder.getInt32(1), "multiWave");
+    builder.CreateCondBr(multiWave, handleMultiWaveBlock, endHandleMultiWaveBlock);
+  }
+
+  // Construct ".handleMultiWave" block
+  {
+    builder.SetInsertPoint(handleMultiWaveBlock);
+
+    const unsigned specialTfValueStart = calcFactor.onChip.specialTfValueStart;
+
+    // ldsOffset = specialTfValueStart + 2 * waveIdInGroup
+    auto ldsOffset = builder.CreateAdd(builder.getInt32(specialTfValueStart), builder.CreateShl(waveIdInGroup, 1));
+    writeValueToLds(builder.CreateZExt(specialTfInWave.first, builder.getInt32Ty()), ldsOffset,
+                    builder); // Write isAllOnesTfInWave to LDS
+
+    ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(1));
+    writeValueToLds(builder.CreateZExt(specialTfInWave.second, builder.getInt32Ty()), ldsOffset,
+                    builder); // Write isAllZerosTfInWave to LDS
+
+    SyncScope::ID syncScope = m_context->getOrInsertSyncScopeID("workgroup");
+    builder.CreateFence(AtomicOrdering::Release, syncScope);
+    builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+    builder.CreateFence(AtomicOrdering::Acquire, syncScope);
+
+    auto validHsPatchWave = builder.CreateICmpULT(threadIdInWave, hsPatchWaveCount, "validHsPatchWave");
+    builder.CreateCondBr(validHsPatchWave, checkSpecilTfInGroupBlock, endCheckSpecialTfInGroupBlock);
+  }
+
+  // Construct ".checkSpecialTfInGroup" block
+  std::pair<Value *, Value *> specialTfInGroup = {}; // Special TF in this group
+  {
+    builder.SetInsertPoint(checkSpecilTfInGroupBlock);
+
+    const unsigned specialTfValueStart = calcFactor.onChip.specialTfValueStart;
+
+    // ldsOffset = specialTfValueStart + 2 * threadIdInWave
+    auto ldsOffset = builder.CreateAdd(builder.getInt32(specialTfValueStart), builder.CreateShl(threadIdInWave, 1));
+    Value *isAllOnesTf = readValueFromLds(builder.getInt32Ty(), ldsOffset, builder);
+    isAllOnesTf = builder.CreateTrunc(isAllOnesTf, builder.getInt1Ty());
+
+    ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(1));
+    Value *isAllZerosTf = readValueFromLds(builder.getInt32Ty(), ldsOffset, builder);
+    isAllZerosTf = builder.CreateTrunc(isAllZerosTf, builder.getInt1Ty());
+
+    auto validMask = ballot(builder.getTrue());
+
+    // Check if the group has all-ones TFs uniformly
+    Value *allOnesTfMask = ballot(isAllOnesTf);
+    Value *isAllOnesTfInGroup = builder.CreateICmpEQ(allOnesTfMask, validMask);
+
+    // Check if the group has all-zeros TFs uniformly
+    Value *allZerosTfMask = ballot(isAllZerosTf);
+    Value *isAllZerosTfInGroup = builder.CreateICmpEQ(allZerosTfMask, validMask);
+
+    specialTfInGroup = std::make_pair(isAllOnesTfInGroup, isAllZerosTfInGroup);
+
+    builder.CreateBr(endCheckSpecialTfInGroupBlock);
+  }
+
+  // Construct ".endCheckSpecialTfInGroup" block
+  {
+    builder.SetInsertPoint(endCheckSpecialTfInGroupBlock);
+
+    auto isAllOnesTfInGroup =
+        createPhi({builder.getTrue(), handleMultiWaveBlock}, {specialTfInGroup.first, checkSpecilTfInGroupBlock});
+    isAllOnesTfInGroup->setName("isAllOnesTfInGroup");
+    auto isAllZerosTfInGroup =
+        createPhi({builder.getTrue(), handleMultiWaveBlock}, {specialTfInGroup.second, checkSpecilTfInGroupBlock});
+    isAllZerosTfInGroup->setName("isAllZerosTfInGroup");
+    specialTfInGroup = std::make_pair(isAllOnesTfInGroup, isAllZerosTfInGroup);
+
+    builder.CreateBr(endHandleMultiWaveBlock);
+  }
+
+  // Construct ".endHandleMultiWave" block
+  std::pair<Value *, Value *> specialTf = {}; // Finalized special TF
+  {
+    builder.SetInsertPoint(endHandleMultiWaveBlock);
+
+    auto isAllOnesTf = createPhi({specialTfInWave.first, endCheckSpecialTfInWaveBlock},
+                                 {specialTfInGroup.first, endCheckSpecialTfInGroupBlock});
+    isAllOnesTf->setName("isAllOnesTf");
+    auto isAllZerosTf = createPhi({specialTfInWave.second, endCheckSpecialTfInWaveBlock},
+                                  {specialTfInGroup.second, endCheckSpecialTfInGroupBlock});
+    isAllZerosTf->setName("isAllZerosTf");
+    specialTf = std::make_pair(isAllOnesTf, isAllZerosTf);
+
+    builder.CreateCondBr(validHsPatch, tryStoreTfBlock, endTryStoreTfBlock);
+  }
+
+  // Construct ".tryStoreTf" block
+  {
+    builder.SetInsertPoint(tryStoreTfBlock);
+
+    auto isSpecialTf = builder.CreateOr(specialTf.first, specialTf.second, "isSpecialTf");
+    builder.CreateCondBr(isSpecialTf, checkSendTfMessageBlock, storeTfBlock);
+  }
+
+  // Construct ".checkSendTfMessage" block
+  {
+    builder.SetInsertPoint(checkSendTfMessageBlock);
+
+    auto firstWaveInGroup = builder.CreateICmpEQ(waveIdInGroup, builder.getInt32(0), "firstWaveInGroup");
+    builder.CreateCondBr(firstWaveInGroup, sendTfMessageBlock, endTryStoreTfBlock);
+  }
+
+  // Construct ".sendTfMessage" block
+  {
+    builder.SetInsertPoint(sendTfMessageBlock);
+
+    // M0[0] = 1 (allOnesTf), 0 (allZerosTf)
+    auto m0 = builder.CreateZExt(specialTf.first, builder.getInt32Ty());
+    builder.CreateIntrinsic(Intrinsic::amdgcn_s_sendmsg, {}, {builder.getInt32(HsTessFactor), m0});
+    builder.CreateBr(endTryStoreTfBlock);
+  }
+
+  // Construct ".storeTf" block
+  {
+    builder.SetInsertPoint(storeTfBlock);
+
+    auto userData = getFunctionArgument(entryPoint, NumSpecialSgprInputs);
+    auto globalTable = builder.CreateExtractElement(
+        userData, static_cast<uint64_t>(0)); // The first element of user data argument is always internal global tabl
+
+    Value *pc = builder.CreateIntrinsic(Intrinsic::amdgcn_s_getpc, {}, {});
+    pc = builder.CreateBitCast(pc, FixedVectorType::get(builder.getInt32Ty(), 2));
+
+    Value *globalTablePtr = builder.CreateInsertElement(pc, globalTable, static_cast<uint64_t>(0));
+    globalTablePtr = builder.CreateBitCast(globalTablePtr, builder.getInt64Ty());
+    Type *tfBufferDescTy = FixedVectorType::get(builder.getInt32Ty(), 4);
+    globalTablePtr =
+        builder.CreateIntToPtr(globalTablePtr, PointerType::get(tfBufferDescTy, ADDR_SPACE_CONST), "globalTablePtr");
+
+    Value *tfBufferDescPtr =
+        builder.CreateGEP(tfBufferDescTy, globalTablePtr, builder.getInt32(SiDrvTableTfBufferOffs), "tfBufferDescPtr");
+    auto tfBufferDesc = builder.CreateLoad(tfBufferDescTy, tfBufferDescPtr, "tfBufferDesc");
+    Value *tfBufferBase = getFunctionArgument(entryPoint, getSpecialSgprInputIndex(m_gfxIp, LsHs::TfBufferBase));
+
+    // Store TFs to TF buffer
+    PatchPreparePipelineAbi::writeTessFactors(m_pipelineState, tfBufferDesc, tfBufferBase, threadIdInGroup, outerTf,
+                                              innerTf, builder);
+    builder.CreateBr(endTryStoreTfBlock);
+  }
+
+  // Construct ".endTryStoreTf" block
+  {
+    builder.SetInsertPoint(endTryStoreTfBlock);
+    // Do nothing
+  }
+}
+
+// =====================================================================================================================
+// Read value from LDS.
+//
+// @param readTy : Type of value to read
+// @param ldsOffset : LDS offset in dwords
+// @param builder : IR builder to insert instructions
+// @returns : The Value read from LDS
+Value *ShaderMerger::readValueFromLds(Type *readTy, Value *ldsOffset, IRBuilder<> &builder) {
+  assert(readTy->getScalarSizeInBits() == 32); // Only accept 32-bit data
+
+  auto lds = Patch::getLdsVariable(m_pipelineState, builder.GetInsertBlock()->getModule());
+  Value *readPtr = builder.CreateGEP(lds->getValueType(), lds, {builder.getInt32(0), ldsOffset});
+  readPtr = builder.CreateBitCast(readPtr, PointerType::get(readTy, readPtr->getType()->getPointerAddressSpace()));
+  return builder.CreateAlignedLoad(readTy, readPtr, Align(4));
+}
+
+// =====================================================================================================================
+// Write value to mesh shader LDS.
+//
+// @param writeValue : Value to write
+// @param ldsOffset : LDS offset in dwords
+// @param builder : IR builder to insert instructions
+void ShaderMerger::writeValueToLds(Value *writeValue, Value *ldsOffset, IRBuilder<> &builder) {
+  auto writeTy = writeValue->getType();
+  assert(writeTy->getScalarSizeInBits() == 32); // Only accept 32-bit data
+
+  auto lds = Patch::getLdsVariable(m_pipelineState, builder.GetInsertBlock()->getModule());
+  Value *writePtr = builder.CreateGEP(lds->getValueType(), lds, {builder.getInt32(0), ldsOffset});
+  writePtr = builder.CreateBitCast(writePtr, PointerType::get(writeTy, writePtr->getType()->getPointerAddressSpace()));
+  builder.CreateAlignedStore(writeValue, writePtr, Align(4));
+}

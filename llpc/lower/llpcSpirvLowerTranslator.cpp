@@ -41,17 +41,6 @@
 using namespace llvm;
 using namespace Llpc;
 
-char LegacySpirvLowerTranslator::ID = 0;
-
-// =====================================================================================================================
-// Creates the pass of translating SPIR-V to LLVM IR.
-//
-// @param stage : Shader stage
-// @param shaderInfo : Shader info for this shader
-ModulePass *Llpc::createSpirvLowerTranslator(ShaderStage stage, const PipelineShaderInfo *shaderInfo) {
-  return new LegacySpirvLowerTranslator(stage, shaderInfo);
-}
-
 // =====================================================================================================================
 // Run the pass on the specified LLVM module.
 //
@@ -80,14 +69,6 @@ bool SpirvLowerTranslator::runImpl(Module &module) {
   // Translate SPIR-V binary to machine-independent LLVM module
   translateSpirvToLlvm(m_shaderInfo, &module);
   return true;
-}
-
-// =====================================================================================================================
-// Run the pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on (empty on entry)
-bool LegacySpirvLowerTranslator::runOnModule(Module &module) {
-  return Impl.runImpl(module);
 }
 
 // =====================================================================================================================
@@ -176,19 +157,8 @@ void SpirvLowerTranslator::translateSpirvToLlvm(const PipelineShaderInfo *shader
     }
     // Not shader entry-point.
     func.setLinkage(GlobalValue::InternalLinkage);
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396596
-    // Old version of the code
-    if (func.getAttributes().hasFnAttribute(Attribute::NoInline))
-      func.removeFnAttr(Attribute::NoInline);
-#else
-    // New version of the code (also handles unknown version, which we treat as latest)
     if (func.hasFnAttribute(Attribute::NoInline))
       func.removeFnAttr(Attribute::NoInline);
-#endif
     func.addFnAttr(Attribute::AlwaysInline);
   }
 }
-
-// =====================================================================================================================
-// Initializes the pass
-INITIALIZE_PASS(LegacySpirvLowerTranslator, DEBUG_TYPE, "LLPC translate SPIR-V binary to LLVM IR", false, false)

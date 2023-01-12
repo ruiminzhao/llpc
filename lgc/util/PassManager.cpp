@@ -29,11 +29,18 @@
  ***********************************************************************************************************************
  */
 #include "lgc/PassManager.h"
+#include "lgc/LgcContext.h"
 #include "lgc/util/Debug.h"
 #include "llvm/Analysis/CFGPrinter.h"
-#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/PrintPasses.h"
 #include "llvm/IR/Verifier.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
+#include "llvm/IR/IRPrintingPasses.h"
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/CommandLine.h"
@@ -97,10 +104,11 @@ private:
 // This is the implementation subclass of the PassManager class declared in PassManager.h
 class PassManagerImpl final : public lgc::PassManager {
 public:
-  PassManagerImpl(TargetMachine *targetMachine);
+  PassManagerImpl(LgcContext *lgcContext);
   void registerPass(StringRef passName, StringRef className) override;
   void run(Module &module) override;
   void setPassIndex(unsigned *passIndex) override { m_passIndex = passIndex; }
+  PassInstrumentationCallbacks &getInstrumentationCallbacks() override { return m_instrumentationCallbacks; }
 
 private:
   void registerCallbacks();
@@ -154,8 +162,8 @@ lgc::LegacyPassManager *lgc::LegacyPassManager::Create() {
 //
 // @param targetMachine : Optional target machine argument. Must be provided if the AMDLLPC target specific alias
 // analysis pass needs to be registered.
-lgc::PassManager *lgc::PassManager::Create(TargetMachine *targetMachine) {
-  return new PassManagerImpl(targetMachine);
+lgc::PassManager *lgc::PassManager::Create(LgcContext *lgcContext) {
+  return new PassManagerImpl(lgcContext);
 }
 
 // =====================================================================================================================
@@ -168,10 +176,15 @@ LegacyPassManagerImpl::LegacyPassManagerImpl() : LegacyPassManager() {
 }
 
 // =====================================================================================================================
-PassManagerImpl::PassManagerImpl(TargetMachine *targetMachine)
-    : PassManager(), m_targetMachine(targetMachine),
-      m_instrumentationStandard(cl::DebugPassManager, cl::DebugPassManager || cl::VerifyIr,
-                                /*PrintPassOpts=*/{true, false, true}) {
+PassManagerImpl::PassManagerImpl(LgcContext *lgcContext)
+    : PassManager(), m_targetMachine(lgcContext->getTargetMachine()),
+      m_instrumentationStandard(
+#if !LLVM_MAIN_REVISION || LLVM_MAIN_REVISION >= 442861
+          // New version of the code (also handles unknown version, which we treat as latest)
+          lgcContext->getContext(),
+#endif
+          cl::DebugPassManager, cl::DebugPassManager || cl::VerifyIr,
+          /*PrintPassOpts=*/{true, false, true}) {
   if (!cl::DumpCfgAfter.empty())
     report_fatal_error("The --dump-cfg-after option is not supported with the new pass manager.");
 
@@ -200,7 +213,7 @@ void PassManagerImpl::run(Module &module) {
   // We register LLVM's default analysis sets late to be sure our custom
   // analyses are added beforehand.
   if (!initialized) {
-    PassBuilder passBuilder(m_targetMachine, PipelineTuningOptions(), None, &m_instrumentationCallbacks);
+    PassBuilder passBuilder(m_targetMachine, PipelineTuningOptions(), {}, &m_instrumentationCallbacks);
     passBuilder.registerModuleAnalyses(m_moduleAnalysisManager);
     passBuilder.registerCGSCCAnalyses(m_cgsccAnalysisManager);
     passBuilder.registerFunctionAnalyses(m_functionAnalysisManager);

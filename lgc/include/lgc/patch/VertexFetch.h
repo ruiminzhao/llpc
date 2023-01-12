@@ -49,6 +49,9 @@ public:
   // Generate code to fetch a vertex value
   virtual llvm::Value *fetchVertex(llvm::Type *inputTy, const VertexInputDescription *description, unsigned location,
                                    unsigned compIdx, BuilderBase &builder) = 0;
+
+  // Generate code to fetch a vertex value for uber shader
+  virtual llvm::Value *fetchVertex(llvm::CallInst *vertexFetches, llvm::Value *inputDesc, BuilderBase &builder) = 0;
 };
 
 // =====================================================================================================================
@@ -60,25 +63,6 @@ public:
   bool runImpl(llvm::Module &module, PipelineState *pipelineState);
 
   static llvm::StringRef name() { return "Lower vertex fetch calls"; }
-};
-
-// =====================================================================================================================
-// Pass to lower vertex fetch calls
-class LegacyLowerVertexFetch : public llvm::ModulePass {
-public:
-  LegacyLowerVertexFetch();
-  LegacyLowerVertexFetch(const LegacyLowerVertexFetch &) = delete;
-  LegacyLowerVertexFetch &operator=(const LegacyLowerVertexFetch &) = delete;
-
-  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-  }
-
-  virtual bool runOnModule(llvm::Module &module) override;
-
-  static char ID; // ID of this pass
-private:
-  LowerVertexFetch m_impl;
 };
 
 } // namespace lgc

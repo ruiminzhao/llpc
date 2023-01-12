@@ -46,8 +46,10 @@ enum NggLdsRegionType {
   // LDS region for ES only (no GS)
   //
   LdsRegionDistribPrimId,     // Distributed primitive ID (VS only, for both pass-through and culling modes)
+  LdsRegionXfbOutput,         // Transform feedback output (pass-through mode only)
   LdsRegionVertPosData,       // Vertex position data
   LdsRegionVertCullInfo,      // Vertex cull info
+  LdsRegionXfbStatInfo,       // Transform feedback statistics info
   LdsRegionVertCountInWaves,  // Vertex count accumulated per wave (8 potential waves) and per sub-group
   LdsRegionVertThreadIdMap,   // Vertex thread ID map (compacted -> uncompacted), for vertex compaction
 
@@ -59,8 +61,11 @@ enum NggLdsRegionType {
   //
   LdsRegionEsGsRing,            // ES-GS ring
   LdsRegionOutPrimData,         // GS output primitive data
+  LdsRegionOutPrimCountInWaves, // GS output primitive count accumulated per wave (8 potential waves) and per sub-group
+  LdsRegionOutPrimThreadIdMap,  // GS output primitive thread ID map (compacted -> uncompacted)
   LdsRegionOutVertCountInWaves, // GS output vertex count accumulated per wave (8 potential waves) and per sub-group
   LdsRegionOutVertThreadIdMap,  // GS output vertex thread ID map (compacted -> uncompacted), for vertex compaction
+  LdsRegionGsXfbStatInfo,       // GS transform feedback statistics info
   LdsRegionGsVsRing,            // GS-VS ring
 
   LdsRegionGsBeginRange = LdsRegionEsGsRing,

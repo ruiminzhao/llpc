@@ -154,6 +154,15 @@ static_assert(lgc::BuiltInPrimitiveShadingRate == static_cast<lgc::BuiltInKind>(
               "Built-in kind mismatch");
 static_assert(lgc::BuiltInShadingRate == static_cast<lgc::BuiltInKind>(spv::BuiltInShadingRateKHR),
               "Built-in kind mismatch");
+static_assert(lgc::BuiltInCullPrimitive == static_cast<lgc::BuiltInKind>(spv::BuiltInCullPrimitiveEXT),
+              "Built-in kind mismatch");
+static_assert(lgc::BuiltInPrimitivePointIndices == static_cast<lgc::BuiltInKind>(spv::BuiltInPrimitivePointIndicesEXT),
+              "Built-in kind mismatch");
+static_assert(lgc::BuiltInPrimitiveLineIndices == static_cast<lgc::BuiltInKind>(spv::BuiltInPrimitiveLineIndicesEXT),
+              "Built-in kind mismatch");
+static_assert(lgc::BuiltInPrimitiveTriangleIndices ==
+                  static_cast<lgc::BuiltInKind>(spv::BuiltInPrimitiveTriangleIndicesEXT),
+              "Built-in kind mismatch");
 
 static_assert(lgc::ShadingRateNone == static_cast<lgc::ShadingRateFlags>(spv::FragmentShadingRateMaskNone),
               "Shading rate flag mismatch");
@@ -171,29 +180,7 @@ static_assert(lgc::ShadingRateHorizontal4Pixels ==
               "Shading rate flag mismatch");
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerGlobal::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering operations for globals
-ModulePass *createLegacySpirvLowerGlobal() {
-  return new LegacySpirvLowerGlobal();
-}
-
-// =====================================================================================================================
 SpirvLowerGlobal::SpirvLowerGlobal() : m_retBlock(nullptr), m_lowerInputInPlace(false), m_lowerOutputInPlace(false) {
-}
-
-// =====================================================================================================================
-LegacySpirvLowerGlobal::LegacySpirvLowerGlobal() : ModulePass(ID) {
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on (empty on entry)
-bool LegacySpirvLowerGlobal::runOnModule(Module &module) {
-  return Impl.runImpl(module);
 }
 
 // =====================================================================================================================
@@ -219,9 +206,11 @@ bool SpirvLowerGlobal::runImpl(Module &module) {
   for (auto global = m_module->global_begin(), end = m_module->global_end(); global != end; ++global) {
     if (global->getType()->getAddressSpace() == SPIRAS_Private)
       mapGlobalVariableToProxy(&*global);
-    else if (global->getType()->getAddressSpace() == SPIRAS_Input)
+    else if (global->getType()->getAddressSpace() == SPIRAS_Input ||
+             (m_shaderStage == ShaderStageMesh && global->getType()->getAddressSpace() == SPIRAS_TaskPayload))
       mapInputToProxy(&*global);
-    else if (global->getType()->getAddressSpace() == SPIRAS_Output)
+    else if (global->getType()->getAddressSpace() == SPIRAS_Output ||
+             (m_shaderStage == ShaderStageTask && global->getType()->getAddressSpace() == SPIRAS_TaskPayload))
       mapOutputToProxy(&*global);
   }
 
@@ -232,7 +221,8 @@ bool SpirvLowerGlobal::runImpl(Module &module) {
     auto addrSpace = global.getType()->getAddressSpace();
 
     // Remove constant expressions for global variables in these address spaces
-    bool isGlobalVar = addrSpace == SPIRAS_Private || addrSpace == SPIRAS_Input || addrSpace == SPIRAS_Output;
+    bool isGlobalVar = addrSpace == SPIRAS_Private || addrSpace == SPIRAS_Input || addrSpace == SPIRAS_Output ||
+                       addrSpace == SPIRAS_TaskPayload;
 
     if (!isGlobalVar)
       continue;
@@ -331,27 +321,17 @@ void SpirvLowerGlobal::handleCallInst(bool checkEmitCall, bool checkInterpCall) 
             auxInterpValue = callInst->getArgOperand(1); // Vertex no.
           }
 
-          if (isa<GetElementPtrInst>(loadSrc)) {
+          GlobalVariable *gv = nullptr;
+          SmallVector<Value *, 6> indexOperands;
+          if (auto getElemPtr = dyn_cast<GetElementPtrInst>(loadSrc)) {
             // The interpolant is an element of the input
-            interpolateInputElement(interpLoc, auxInterpValue, *callInst);
+            for (auto &index : getElemPtr->indices())
+              indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
+            gv = cast<GlobalVariable>(getElemPtr->getPointerOperand());
           } else {
-            // The interpolant is an input
-            assert(isa<GlobalVariable>(loadSrc));
-
-            auto input = cast<GlobalVariable>(loadSrc);
-            auto inputTy = input->getValueType();
-
-            MDNode *metaNode = input->getMetadata(gSPIRVMD::InOut);
-            assert(metaNode);
-            auto inputMeta = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
-
-            m_builder->SetInsertPoint(callInst);
-            auto loadValue = addCallInstForInOutImport(inputTy, SPIRAS_Input, inputMeta, nullptr, 0, nullptr, nullptr,
-                                                       interpLoc, auxInterpValue, false);
-
-            m_interpCalls.insert(callInst);
-            callInst->replaceAllUsesWith(loadValue);
+            gv = cast<GlobalVariable>(loadSrc);
           }
+          interpolateInputElement(interpLoc, auxInterpValue, *callInst, gv, indexOperands);
         }
       }
     }
@@ -380,81 +360,68 @@ static bool hasVertexIdx(const Constant &metaVal) {
 }
 
 // =====================================================================================================================
-// Handle a single "load" instruction directly loading a global.
+// Check if the given metadata value has a primitive index.
 //
-// @param loadInst : Load instruction
-// @param addrSpace : Address space
-void SpirvLowerGlobal::handleLoadInstGlobal(LoadInst &loadInst, const unsigned addrSpace) {
-  Value *loadSrc = loadInst.getOperand(0);
-  auto inOut = cast<GlobalVariable>(loadSrc);
-  auto inOutTy = inOut->getValueType();
+// @param metaVal : Metadata
+static bool hasPrimitiveIdx(const Constant &metaVal) {
+  assert(metaVal.getNumOperands() == 4);
+  ShaderInOutMetadata inOutMeta = {};
+  inOutMeta.U64All[0] = cast<ConstantInt>(metaVal.getOperand(2))->getZExtValue();
+  inOutMeta.U64All[1] = cast<ConstantInt>(metaVal.getOperand(3))->getZExtValue();
 
-  MDNode *metaNode = inOut->getMetadata(gSPIRVMD::InOut);
-  assert(metaNode);
-  auto inOutMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
-
-  m_builder->SetInsertPoint(&loadInst);
-
-  Value *loadValue = UndefValue::get(inOutTy);
-
-  // If the input/output is arrayed, the outermost index might be used for vertex indexing
-  if (inOutTy->isArrayTy() && hasVertexIdx(*inOutMetaVal)) {
-    auto elemTy = inOutTy->getArrayElementType();
-    auto elemMeta = cast<Constant>(inOutMetaVal->getOperand(1));
-
-    const unsigned elemCount = inOutTy->getArrayNumElements();
-    for (unsigned i = 0; i < elemCount; ++i) {
-      Value *vertexIdx = m_builder->getInt32(i);
-      auto elemValue = addCallInstForInOutImport(elemTy, addrSpace, elemMeta, nullptr, 0, nullptr, vertexIdx,
-                                                 InterpLocUnknown, nullptr, false);
-      loadValue = m_builder->CreateInsertValue(loadValue, elemValue, {i});
-    }
-  } else {
-    loadValue = addCallInstForInOutImport(inOutTy, addrSpace, inOutMetaVal, nullptr, 0, nullptr, nullptr,
-                                          InterpLocUnknown, nullptr, false);
+  if (inOutMeta.IsBuiltIn) {
+    unsigned builtInId = inOutMeta.Value;
+    return (builtInId == spv::BuiltInPerPrimitive || builtInId == spv::BuiltInPrimitivePointIndicesEXT ||
+            builtInId == spv::BuiltInPrimitiveLineIndicesEXT || builtInId == spv::BuiltInPrimitiveTriangleIndicesEXT);
   }
-  m_loadInsts.insert(&loadInst);
-  loadInst.replaceAllUsesWith(loadValue);
+
+  return static_cast<bool>(inOutMeta.PerPrimitive);
 }
 
 // =====================================================================================================================
-// Handle a single "load" instruction loading a global through a GEP instruction
+// Handle a single "load" instruction loading a global.
 //
-// @param getElemPtr : Load source GEP instruction
+// @param inOut : Global Variable instruction
+// @param indexOperands : Indices of GEP instruction
 // @param loadInst : Load instruction
-// @param addrSpace : Address space
-void SpirvLowerGlobal::handleLoadInstGEP(GetElementPtrInst *const getElemPtr, LoadInst &loadInst,
-                                         const unsigned addrSpace) {
-  std::vector<Value *> indexOperands;
+void SpirvLowerGlobal::handleLoadInstGEP(GlobalVariable *inOut, ArrayRef<Value *> indexOperands, LoadInst &loadInst) {
 
-  assert(cast<ConstantInt>(getElemPtr->getOperand(1))->isZero() && "Non-zero GEP first index\n");
-
-  GlobalVariable *inOut = cast<GlobalVariable>(getElemPtr->getPointerOperand());
-  assert(!isa<GetElementPtrInst>(getElemPtr->getPointerOperand()) &&
-         "Chained GEPs should have been coalesced by SpirvLowerAccessChain.");
+  assert(indexOperands.empty() || cast<ConstantInt>(indexOperands.front())->isZero() && "Non-zero GEP first index\n");
+  if (!indexOperands.empty())
+    indexOperands = indexOperands.drop_front();
 
   m_builder->SetInsertPoint(&loadInst);
-
-  for (auto &index : drop_begin(getElemPtr->indices()))
-    indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
 
   Value *vertexIdx = nullptr;
   auto inOutTy = inOut->getValueType();
 
-  MDNode *metaNode = inOut->getMetadata(gSPIRVMD::InOut);
+  auto addrSpace = inOut->getType()->getPointerAddressSpace();
+
+  const bool isTaskPayload = addrSpace == SPIRAS_TaskPayload;
+  MDNode *metaNode = inOut->getMetadata(isTaskPayload ? gSPIRVMD::Block : gSPIRVMD::InOut);
   assert(metaNode);
   auto inOutMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
 
   // If the input/output is arrayed, the outermost index might be used for vertex indexing
-  if (inOutTy->isArrayTy() && hasVertexIdx(*inOutMetaVal)) {
+  if (!isTaskPayload && inOutTy->isArrayTy() && hasVertexIdx(*inOutMetaVal)) {
+    if (!indexOperands.empty()) {
+      vertexIdx = indexOperands.front();
+      indexOperands = indexOperands.drop_front();
+    } else if (inOutTy != loadInst.getType()) {
+      vertexIdx = m_builder->getInt32(0);
+    }
     inOutTy = inOutTy->getArrayElementType();
-    vertexIdx = indexOperands.front();
-    indexOperands.erase(indexOperands.begin());
     inOutMetaVal = cast<Constant>(inOutMetaVal->getOperand(1));
   }
 
-  Value *loadValue = loadInOutMember(inOutTy, addrSpace, indexOperands, 0, inOutMetaVal, nullptr, vertexIdx,
-                                     InterpLocUnknown, nullptr, false);
+  Value *loadValue = nullptr;
+  if (isTaskPayload) {
+    loadValue = loadIndexedValueFromTaskPayload(inOutTy, loadInst.getType(), indexOperands, inOutMetaVal, nullptr);
+  } else {
+    loadValue = loadInOutMember(inOutTy, loadInst.getType(), addrSpace, indexOperands, 0, inOutMetaVal, nullptr,
+                                vertexIdx, InterpLocUnknown, nullptr, false);
+  }
+
   m_loadInsts.insert(&loadInst);
   loadInst.replaceAllUsesWith(loadValue);
 }
@@ -463,13 +430,17 @@ void SpirvLowerGlobal::handleLoadInstGEP(GetElementPtrInst *const getElemPtr, Lo
 // Handle "load" instructions.
 void SpirvLowerGlobal::handleLoadInst() {
   auto shouldHandle = [&](const unsigned addrSpace) {
-    if (addrSpace != SPIRAS_Input && addrSpace != SPIRAS_Output)
+    if (addrSpace != SPIRAS_Input && addrSpace != SPIRAS_Output && addrSpace != SPIRAS_TaskPayload)
       return false;
     // Skip if "load" instructions are not expected to be handled
     const bool isTcsInput = (m_shaderStage == ShaderStageTessControl && addrSpace == SPIRAS_Input);
     const bool isTcsOutput = (m_shaderStage == ShaderStageTessControl && addrSpace == SPIRAS_Output);
     const bool isTesInput = (m_shaderStage == ShaderStageTessEval && addrSpace == SPIRAS_Input);
-    return isTcsInput || isTcsOutput || isTesInput;
+    const bool isTaskOutput = (m_shaderStage == ShaderStageTask && addrSpace == SPIRAS_TaskPayload);
+    const bool isMeshInput =
+        (m_shaderStage == ShaderStageMesh && (addrSpace == SPIRAS_Input || addrSpace == SPIRAS_TaskPayload));
+
+    return isTcsInput || isTcsOutput || isTesInput || isTaskOutput || isMeshInput;
   };
 
   for (GlobalVariable &global : m_module->globals()) {
@@ -477,17 +448,20 @@ void SpirvLowerGlobal::handleLoadInst() {
     if (!shouldHandle(addrSpace))
       continue;
     for (User *user : global.users()) {
-      if (LoadInst *loadInst = dyn_cast<LoadInst>(user))
-        // The user is a load
-        handleLoadInstGlobal(*loadInst, addrSpace);
-      else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(user)) {
+      if (LoadInst *loadInst = dyn_cast<LoadInst>(user)) {
+        handleLoadInstGEP(&global, {}, *loadInst);
+      } else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(user)) {
         // The user is a GEP
         // We look for load instructions in the GEP users
         for (User *gepUser : gep->users()) {
           // We shouldn't have any chained GEPs here, they are coalesced by the LowerAccessChain pass.
           assert(!isa<GetElementPtrInst>(gepUser));
-          if (LoadInst *loadInst = dyn_cast<LoadInst>(gepUser))
-            handleLoadInstGEP(gep, *loadInst, addrSpace);
+          if (LoadInst *loadInst = dyn_cast<LoadInst>(gepUser)) {
+            SmallVector<Value *, 6> indexOperands;
+            for (auto &index : gep->indices())
+              indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
+            handleLoadInstGEP(&global, indexOperands, *loadInst);
+          }
         }
       }
     }
@@ -495,76 +469,47 @@ void SpirvLowerGlobal::handleLoadInst() {
 }
 
 // =====================================================================================================================
-// Handle a single "store" instruction directly storing a global.
+// Handle a single "store" instruction storing a global.
 //
+// @param output : Global Variable instruction
+// @param indexOperands : Indices of GEP instruction
 // @param storeInst : Store instruction
-void SpirvLowerGlobal::handleStoreInstGlobal(StoreInst &storeInst) {
-  Value *storeDest = storeInst.getOperand(1);
-  Value *storeValue = storeInst.getOperand(0);
-
-  auto output = cast<GlobalVariable>(storeDest);
-  auto outputy = output->getValueType();
+void SpirvLowerGlobal::handleStoreInstGEP(GlobalVariable *output, ArrayRef<Value *> indexOperands,
+                                          StoreInst &storeInst) {
+  assert(indexOperands.empty() || cast<ConstantInt>(indexOperands.front())->isZero() && "Non-zero GEP first index\n");
+  // drop first element
+  if (!indexOperands.empty())
+    indexOperands = indexOperands.drop_front();
 
   m_builder->SetInsertPoint(&storeInst);
 
-  MDNode *metaNode = output->getMetadata(gSPIRVMD::InOut);
-  assert(metaNode);
-  auto outputMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
-
-  // If the output is arrayed, the outermost dimension might for vertex indexing
-  if (outputy->isArrayTy() && hasVertexIdx(*outputMetaVal)) {
-    auto elemMeta = cast<Constant>(outputMetaVal->getOperand(1));
-
-    const unsigned elemCount = outputy->getArrayNumElements();
-    for (unsigned i = 0; i < elemCount; ++i) {
-      auto elemValue = ExtractValueInst::Create(storeValue, {i}, "", &storeInst);
-      Value *vertexOrPrimitiveIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-      addCallInstForOutputExport(elemValue, elemMeta, nullptr, 0, InvalidValue, 0, nullptr, vertexOrPrimitiveIdx,
-                                 InvalidValue);
-    }
-  } else {
-    addCallInstForOutputExport(storeValue, outputMetaVal, nullptr, 0, InvalidValue, 0, nullptr, nullptr, InvalidValue);
-  }
-  m_storeInsts.insert(&storeInst);
-}
-
-// =====================================================================================================================
-// Handle a single "store" instruction storing a global through a GEP instruction
-//
-// @param getElemPtr : Store destination GEP instruction
-// @param storeInst : Store instruction
-void SpirvLowerGlobal::handleStoreInstGEP(GetElementPtrInst *const getElemPtr, StoreInst &storeInst) {
   Value *storeValue = storeInst.getOperand(0);
-
-  std::vector<Value *> indexOperands;
-
-  assert(cast<ConstantInt>(getElemPtr->getOperand(1))->isZero() && "Non-zero GEP first index\n");
-
-  GlobalVariable *output = cast<GlobalVariable>(getElemPtr->getPointerOperand());
-  assert(!isa<GetElementPtrInst>(getElemPtr->getPointerOperand()) &&
-         "Chained GEPs should have been coalesced by SpirvLowerAccessChain.");
-
-  m_builder->SetInsertPoint(&storeInst);
-
-  for (auto &index : drop_begin(getElemPtr->indices()))
-    indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
-
   Value *vertexOrPrimitiveIdx = nullptr;
   auto outputTy = output->getValueType();
 
-  MDNode *metaNode = output->getMetadata(gSPIRVMD::InOut);
+  const bool isTaskPayload = output->getType()->getAddressSpace() == SPIRAS_TaskPayload;
+  MDNode *metaNode = output->getMetadata(isTaskPayload ? gSPIRVMD::Block : gSPIRVMD::InOut);
   assert(metaNode);
   auto outputMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
-
-  // If the output is arrayed, the outermost index might be used for vertex indexing
-  if (outputTy->isArrayTy() && hasVertexIdx(*outputMetaVal)) {
+  // If the output is arrayed, the outermost index might be used for vertex or primitive indexing
+  if (!isTaskPayload && outputTy->isArrayTy() && (hasVertexIdx(*outputMetaVal) || hasPrimitiveIdx(*outputMetaVal))) {
+    if (!indexOperands.empty()) {
+      vertexOrPrimitiveIdx = indexOperands.front();
+      indexOperands = indexOperands.drop_front();
+    } else if (outputTy != storeInst.getValueOperand()->getType()) {
+      vertexOrPrimitiveIdx = m_builder->getInt32(0);
+    }
     outputTy = outputTy->getArrayElementType();
-    vertexOrPrimitiveIdx = indexOperands.front();
-    indexOperands.erase(indexOperands.begin());
     outputMetaVal = cast<Constant>(outputMetaVal->getOperand(1));
   }
 
-  storeOutputMember(outputTy, storeValue, indexOperands, 0, outputMetaVal, nullptr, vertexOrPrimitiveIdx);
+  if (isTaskPayload)
+    storeIndexedValueToTaskPayload(outputTy, storeInst.getValueOperand()->getType(), storeValue, indexOperands,
+                                   outputMetaVal, nullptr);
+  else
+    storeOutputMember(outputTy, storeInst.getValueOperand()->getType(), storeValue, indexOperands, 0, outputMetaVal,
+                      nullptr, vertexOrPrimitiveIdx);
+
   m_storeInsts.insert(&storeInst);
 }
 
@@ -573,7 +518,9 @@ void SpirvLowerGlobal::handleStoreInstGEP(GetElementPtrInst *const getElemPtr, S
 void SpirvLowerGlobal::handleStoreInst() {
   auto shouldHandle = [&](const unsigned addrSpace) {
     const bool isTcsOutput = (m_shaderStage == ShaderStageTessControl && addrSpace == SPIRAS_Output);
-    return isTcsOutput;
+    const bool isTaskOutput = (m_shaderStage == ShaderStageTask && addrSpace == SPIRAS_TaskPayload);
+    const bool isMeshOutput = (m_shaderStage == ShaderStageMesh && addrSpace == SPIRAS_Output);
+    return isTcsOutput || isTaskOutput || isMeshOutput;
   };
 
   for (GlobalVariable &global : m_module->globals()) {
@@ -581,21 +528,118 @@ void SpirvLowerGlobal::handleStoreInst() {
     if (!shouldHandle(addrSpace))
       continue;
     for (User *user : global.users()) {
-      if (StoreInst *storeInst = dyn_cast<StoreInst>(user))
-        // The user is a store
-        handleStoreInstGlobal(*storeInst);
-      else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(user)) {
+      if (StoreInst *storeInst = dyn_cast<StoreInst>(user)) {
+        handleStoreInstGEP(&global, {}, *storeInst);
+      } else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(user)) {
         // The user is a GEP
         // We look for store instructions in the GEP users
         for (User *gepUser : gep->users()) {
           // We shouldn't have any chained GEPs here, they are coalesced by the LowerAccessChain pass.
           assert(!isa<GetElementPtrInst>(gepUser));
-          if (StoreInst *storeInst = dyn_cast<StoreInst>(gepUser))
-            handleStoreInstGEP(gep, *storeInst);
+          if (StoreInst *storeInst = dyn_cast<StoreInst>(gepUser)) {
+            SmallVector<Value *, 6> indexOperands;
+            for (auto &index : gep->indices())
+              indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
+            handleStoreInstGEP(&global, indexOperands, *storeInst);
+          }
         }
       }
     }
   }
+}
+
+// =====================================================================================================================
+// Visits "atomicrmw" or "cmpxchg" instructions.
+void SpirvLowerGlobal::handleAtomicInst() {
+  auto shouldHandle = [&](const unsigned addrSpace) {
+    const bool isTaskOutput = (m_shaderStage == ShaderStageTask && addrSpace == SPIRAS_TaskPayload);
+    return isTaskOutput;
+  };
+
+  for (GlobalVariable &global : m_module->globals()) {
+    const unsigned addrSpace = global.getType()->getPointerAddressSpace();
+    if (!shouldHandle(addrSpace))
+      continue;
+    for (User *user : global.users()) {
+      if (AtomicRMWInst *atomicRmw = dyn_cast<AtomicRMWInst>(user))
+        // The user is a atomicrmw
+        handleAtomicInstGlobal(*atomicRmw);
+      else if (AtomicCmpXchgInst *cmpXchg = dyn_cast<AtomicCmpXchgInst>(user))
+        // The user is a cmpxchg
+        handleAtomicInstGlobal(*cmpXchg);
+      else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(user)) {
+        // The user is a GEP
+        // We look for atomicrmw instructions in the GEP users
+        for (User *gepUser : gep->users()) {
+          // We shouldn't have any chained GEPs here, they are coalesced by the LowerAccessChain pass.
+          assert(!isa<GetElementPtrInst>(gepUser));
+          if (Instruction *atomicInst = dyn_cast<Instruction>(gepUser)) {
+            if (isa<AtomicRMWInst>(atomicInst) || isa<AtomicCmpXchgInst>(atomicInst))
+              handleAtomicInstGEP(gep, *atomicInst);
+          }
+        }
+      }
+    }
+  }
+}
+
+// =====================================================================================================================
+// Handle a single "atomicrmw" or "cmpxchg" instruction directly storing a global.
+//
+// @param atomicInst : Atomic instruction to handle
+void SpirvLowerGlobal::handleAtomicInstGlobal(Instruction &atomicInst) {
+  GlobalVariable *taskPayload = nullptr;
+  if (auto atomicRmw = dyn_cast<AtomicRMWInst>(&atomicInst)) {
+    taskPayload = cast<GlobalVariable>(atomicRmw->getPointerOperand());
+  } else {
+    auto cmpXchg = dyn_cast<AtomicCmpXchgInst>(&atomicInst);
+    assert(cmpXchg);
+    taskPayload = cast<GlobalVariable>(cmpXchg->getPointerOperand());
+  }
+  assert(taskPayload->getType()->getAddressSpace() == SPIRAS_TaskPayload);
+
+  m_builder->SetInsertPoint(&atomicInst);
+
+  MDNode *metaNode = taskPayload->getMetadata(gSPIRVMD::Block);
+  assert(metaNode);
+  auto taskPayloadMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
+
+  Value *atomicCall = atomicOpWithValueInTaskPayload(&atomicInst, taskPayloadMetaVal, nullptr);
+
+  m_atomicInsts.insert(&atomicInst);
+  atomicInst.replaceAllUsesWith(atomicCall);
+}
+
+// =====================================================================================================================
+// Handle a single "atomicrmw" or "cmpxchg" instruction storing a global through a GEP instruction
+//
+// @param getElemPtr : Store destination GEP instruction
+// @param atomicInst : Atomic instruction to handle
+void SpirvLowerGlobal::handleAtomicInstGEP(GetElementPtrInst *const getElemPtr, Instruction &atomicInst) {
+  assert(cast<ConstantInt>(getElemPtr->getOperand(1))->isZero() && "Non-zero GEP first index\n");
+  assert(!isa<GetElementPtrInst>(getElemPtr->getPointerOperand()) &&
+         "Chained GEPs should have been coalesced by SpirvLowerAccessChain.");
+
+  GlobalVariable *taskPayload = cast<GlobalVariable>(getElemPtr->getPointerOperand());
+  assert(taskPayload->getType()->getAddressSpace() == SPIRAS_TaskPayload);
+
+  m_builder->SetInsertPoint(&atomicInst);
+
+  std::vector<Value *> indexOperands;
+  for (auto &index : drop_begin(getElemPtr->indices()))
+    indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
+
+  auto taskPayloadTy = taskPayload->getValueType();
+
+  MDNode *metaNode = taskPayload->getMetadata(gSPIRVMD::Block);
+  assert(metaNode);
+  auto taskPayloadMetaVal = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
+
+  Value *atomicCall =
+      atomicOpWithIndexedValueInTaskPayload(taskPayloadTy, &atomicInst, indexOperands, taskPayloadMetaVal, nullptr);
+
+  m_atomicInsts.insert(&atomicInst);
+  atomicInst.replaceAllUsesWith(atomicCall);
 }
 
 // =====================================================================================================================
@@ -624,9 +668,10 @@ void SpirvLowerGlobal::mapGlobalVariableToProxy(GlobalVariable *globalVar) {
 //
 // @param input : Input to be mapped
 void SpirvLowerGlobal::mapInputToProxy(GlobalVariable *input) {
-  // NOTE: For tessellation shader, we do not map inputs to real proxy variables. Instead, we directly replace
-  // "load" instructions with import calls in the lowering operation.
-  if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval) {
+  // NOTE: For tessellation shader or mesh shader, we do not map inputs to real proxy variables. Instead, we directly
+  // replace "load" instructions with import calls in the lowering operation.
+  if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval ||
+      m_shaderStage == ShaderStageMesh) {
     m_inputProxyMap[input] = nullptr;
     m_lowerInputInPlace = true;
     return;
@@ -661,9 +706,9 @@ void SpirvLowerGlobal::mapInputToProxy(GlobalVariable *input) {
 void SpirvLowerGlobal::mapOutputToProxy(GlobalVariable *output) {
   m_builder->SetInsertPointPastAllocas(m_entryPoint);
 
-  // NOTE: For tessellation control shader, we do not map outputs to real proxy variables. Instead, we directly
-  // replace "store" instructions with export calls in the lowering operation.
-  if (m_shaderStage == ShaderStageTessControl) {
+  // NOTE: For tessellation control shader, task shader, or mesh shader, we do not map outputs to real proxy variables.
+  // Instead, we directly replace "store" instructions with export calls in the lowering operation.
+  if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh) {
     if (output->hasInitializer()) {
       auto initializer = output->getInitializer();
       m_builder->CreateStore(initializer, output);
@@ -874,12 +919,17 @@ void SpirvLowerGlobal::lowerOutput() {
 // Does inplace lowering operations for SPIR-V inputs/outputs, replaces "load" instructions with import calls and
 // "store" instructions with export calls.
 void SpirvLowerGlobal::lowerInOutInPlace() {
-  assert(m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval);
+  assert(m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval ||
+         m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh);
 
   // Invoke handling of "load" and "store" instruction
   handleLoadInst();
-  if (m_shaderStage == ShaderStageTessControl)
+  if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh)
     handleStoreInst();
+
+  // Invoke handling of "atomicrmw" instruction
+  if (m_shaderStage == ShaderStageTask)
+    handleAtomicInst();
 
   DenseSet<GetElementPtrInst *> getElemInsts;
 
@@ -908,6 +958,27 @@ void SpirvLowerGlobal::lowerInOutInPlace() {
   }
 
   m_storeInsts.clear();
+
+  // Remove unnecessary "atomicrmw" or "cmpxchg" instructions
+  for (auto atomicInst : m_atomicInsts) {
+    Value *pointer = nullptr;
+    if (auto atomicRmw = dyn_cast<AtomicRMWInst>(atomicInst)) {
+      pointer = atomicRmw->getPointerOperand();
+    } else {
+      auto cmpXchg = dyn_cast<AtomicCmpXchgInst>(atomicInst);
+      assert(cmpXchg);
+      pointer = cmpXchg->getPointerOperand();
+    }
+    GetElementPtrInst *const getElemPtr = dyn_cast<GetElementPtrInst>(pointer);
+    if (getElemPtr)
+      getElemInsts.insert(getElemPtr);
+
+    assert(atomicInst->use_empty());
+    atomicInst->dropAllReferences();
+    atomicInst->eraseFromParent();
+  }
+
+  m_atomicInsts.clear();
 
   // Remove unnecessary "getelementptr" instructions
   while (!getElemInsts.empty()) {
@@ -1016,6 +1087,7 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
         inOutInfo.setArraySize(inOutTy->getArrayNumElements());
         // For Barycentric interplotation
         inOutInfo.setInterpLoc(interpLoc);
+        assert(!inOutMeta.PerPrimitive); // No per-primitive arrayed built-in
         if (addrSpace == SPIRAS_Input) {
           inOutValue = m_builder->CreateReadBuiltInInput(static_cast<lgc::BuiltInKind>(inOutMeta.Value), inOutInfo,
                                                          vertexIdx, nullptr);
@@ -1103,6 +1175,7 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
         return m_builder->CreateReadBaryCoord(builtIn, inOutInfo, auxInterpValue);
       }
 
+      inOutInfo.setPerPrimitive(inOutMeta.PerPrimitive);
       if (addrSpace == SPIRAS_Input)
         inOutValue = m_builder->CreateReadBuiltInInput(builtIn, inOutInfo, vertexIdx, elemIdx);
       else
@@ -1149,6 +1222,7 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
             interpLoc = inOutMeta.InterpLoc;
           inOutInfo.setInterpLoc(interpLoc);
           inOutInfo.setInterpMode(inOutMeta.InterpMode);
+          inOutInfo.setPerPrimitive(inOutMeta.PerPrimitive);
         }
         if (isPerVertexDimension)
           inOutValue = m_builder->CreateReadPerVertexInput(inOutTy, inOutMeta.Value, locOffset, elemIdx, maxLocOffset,
@@ -1215,6 +1289,7 @@ void SpirvLowerGlobal::addCallInstForOutputExport(Value *outputValue, Constant *
       if (emitStreamId != InvalidValue)
         outputInfo.setStreamId(emitStreamId);
       outputInfo.setArraySize(outputTy->getArrayNumElements());
+      assert(!outputMeta.PerPrimitive); // No per-primitive arrayed built-in
       m_builder->CreateWriteBuiltInOutput(outputValue, builtInId, outputInfo, vertexOrPrimitiveIdx, nullptr);
 
       if (outputMeta.IsXfb) {
@@ -1313,6 +1388,7 @@ void SpirvLowerGlobal::addCallInstForOutputExport(Value *outputValue, Constant *
     if (emitStreamId != InvalidValue)
       outputInfo.setStreamId(emitStreamId);
     outputInfo.setIsSigned(outputMeta.Signedness);
+    outputInfo.setPerPrimitive(outputMeta.PerPrimitive);
 
     if (outputMeta.IsBuiltIn) {
       auto builtInId = static_cast<lgc::BuiltInKind>(outputMeta.Value);
@@ -1339,6 +1415,11 @@ void SpirvLowerGlobal::addCallInstForOutputExport(Value *outputValue, Constant *
                                           << "xfbOffset = " << cast<ConstantInt>(xfbOffset)->getZExtValue() << "\n");
       }
 
+      if (builtInId == lgc::BuiltInCullPrimitive && outputTy->isIntegerTy(32)) {
+        // NOTE: In SPIR-V translation, the boolean type (i1) in output block is converted to i32. Here, we convert it
+        // back to i1 for further processing in LGC.
+        outputValue = m_builder->CreateTrunc(outputValue, m_builder->getInt1Ty());
+      }
       m_builder->CreateWriteBuiltInOutput(outputValue, builtInId, outputInfo, vertexOrPrimitiveIdx, elemIdx);
       return;
     }
@@ -1497,8 +1578,9 @@ Value *SpirvLowerGlobal::loadDynamicIndexedMembers(Type *inOutTy, unsigned addrS
 // Inserts instructions to load value from input/ouput member.
 //
 // @param inOutTy : Type of this input/output member
+// @param loadTy : Type of load instruction
 // @param addrSpace : Address space
-// @param indexOperands : Index operands to process (if empty, all indices have been processed)
+// @param indexOperands : Index operands to process.
 // @param maxLocOffset : Max+1 location offset if variable index has been encountered
 // @param inOutMetaVal : Metadata of this input/output member
 // @param locOffset : Relative location offset of this input/output member
@@ -1507,14 +1589,16 @@ Value *SpirvLowerGlobal::loadDynamicIndexedMembers(Type *inOutTy, unsigned addrS
 // @param auxInterpValue : Auxiliary value of interpolation (valid for fragment shader): - Sample ID for
 // "InterpLocSample" - Offset from the center of the pixel for "InterpLocCenter" - Vertex no. (0 ~ 2) for
 // "InterpLocCustom"
-Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, unsigned addrSpace, ArrayRef<Value *> indexOperands,
-                                         unsigned maxLocOffset, Constant *inOutMetaVal, Value *locOffset,
-                                         Value *vertexIdx, unsigned interpLoc, Value *auxInterpValue,
+Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, Type *loadTy, unsigned addrSpace,
+                                         ArrayRef<Value *> indexOperands, unsigned maxLocOffset, Constant *inOutMetaVal,
+                                         Value *locOffset, Value *vertexIdx, unsigned interpLoc, Value *auxInterpValue,
                                          bool isPerVertexDimension) {
   assert(m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval ||
-         m_shaderStage == ShaderStageFragment);
+         m_shaderStage == ShaderStageMesh || m_shaderStage == ShaderStageFragment);
 
-  if (indexOperands.empty()) {
+  // indexOperands can be empty with mismatch of types, if zero-index GEP was removed and global is used directly by
+  // load.
+  if (indexOperands.empty() && inOutTy == loadTy) {
     // All indices have been processed
     return addCallInstForInOutImport(inOutTy, addrSpace, inOutMetaVal, locOffset, maxLocOffset, nullptr, vertexIdx,
                                      interpLoc, auxInterpValue, isPerVertexDimension);
@@ -1532,8 +1616,7 @@ Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, unsigned addrSpace, Arra
     auto elemTy = inOutTy->getArrayElementType();
 
     if (inOutMeta.IsBuiltIn) {
-      assert(indexOperands.size() == 1);
-      auto elemIdx = indexOperands.front();
+      auto elemIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
       return addCallInstForInOutImport(elemTy, addrSpace, elemMeta, locOffset, inOutTy->getArrayNumElements(), elemIdx,
                                        vertexIdx, interpLoc, auxInterpValue, isPerVertexDimension);
     }
@@ -1547,12 +1630,12 @@ Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, unsigned addrSpace, Arra
     if (inOutMeta.PerVertexDimension) {
       // The input is a pervertex variable. The location offset is 0.
       assert(inOutMeta.InterpMode == InterpModeCustom);
-      auxInterpValue = indexOperands.front();
+      auxInterpValue = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
       elemLocOffset = m_builder->getInt32(0);
     } else {
       // elemLocOffset = locOffset + stride * elemIdx
       unsigned stride = cast<ConstantInt>(inOutMetaVal->getOperand(0))->getZExtValue();
-      auto elemIdx = indexOperands.front();
+      auto elemIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
       elemLocOffset = m_builder->CreateMul(m_builder->getInt32(stride), elemIdx);
       elemLocOffset = m_builder->CreateAdd(locOffset, elemLocOffset);
 
@@ -1563,27 +1646,31 @@ Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, unsigned addrSpace, Arra
       }
     }
 
-    return loadInOutMember(elemTy, addrSpace, indexOperands.drop_front(), maxLocOffset, elemMeta, elemLocOffset,
-                           vertexIdx, interpLoc, auxInterpValue, inOutMeta.PerVertexDimension);
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return loadInOutMember(elemTy, loadTy, addrSpace, indexOperands, maxLocOffset, elemMeta, elemLocOffset, vertexIdx,
+                           interpLoc, auxInterpValue, inOutMeta.PerVertexDimension);
   }
 
   if (inOutTy->isStructTy()) {
     // Struct type
-    unsigned memberIdx = cast<ConstantInt>(indexOperands.front())->getZExtValue();
+    unsigned memberIdx = indexOperands.empty() ? 0 : cast<ConstantInt>(indexOperands.front())->getZExtValue();
 
     auto memberTy = inOutTy->getStructElementType(memberIdx);
     auto memberMeta = cast<Constant>(inOutMetaVal->getOperand(memberIdx));
 
-    return loadInOutMember(memberTy, addrSpace, indexOperands.drop_front(), maxLocOffset, memberMeta, locOffset,
-                           vertexIdx, interpLoc, auxInterpValue, isPerVertexDimension);
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return loadInOutMember(memberTy, loadTy, addrSpace, indexOperands, maxLocOffset, memberMeta, locOffset, vertexIdx,
+                           interpLoc, auxInterpValue, isPerVertexDimension);
   }
 
   if (inOutTy->isVectorTy()) {
     // Vector type
-    assert(indexOperands.size() == 1);
-
     Type *loadTy = cast<VectorType>(inOutTy)->getElementType();
-    Value *compIdx = indexOperands.front();
+    Value *compIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
 
     return addCallInstForInOutImport(loadTy, addrSpace, inOutMetaVal, locOffset, maxLocOffset, compIdx, vertexIdx,
                                      interpLoc, auxInterpValue, isPerVertexDimension);
@@ -1597,18 +1684,21 @@ Value *SpirvLowerGlobal::loadInOutMember(Type *inOutTy, unsigned addrSpace, Arra
 // Inserts instructions to store value to output member.
 //
 // @param outputTy : Type of this output member
+// @param storeTy : Type of store instruction
 // @param storeValue : Value stored to output member
 // @param indexOperands : Index operands to process (if empty, all indices have been processed)
 // @param maxLocOffset : Max+1 location offset if variable index has been encountered
 // @param outputMetaVal : Metadata of this output member
 // @param locOffset : Relative location offset of this output member
 // @param vertexOrPrimitiveIdx : Input array outermost index used for vertex indexing
-void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Value *storeValue, ArrayRef<Value *> indexOperands,
-                                         unsigned maxLocOffset, Constant *outputMetaVal, Value *locOffset,
-                                         Value *vertexOrPrimitiveIdx) {
-  assert(m_shaderStage == ShaderStageTessControl);
+void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Type *storeTy, Value *storeValue,
+                                         ArrayRef<Value *> indexOperands, unsigned maxLocOffset,
+                                         Constant *outputMetaVal, Value *locOffset, Value *vertexOrPrimitiveIdx) {
+  assert(m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageMesh);
 
-  if (indexOperands.empty()) {
+  // indexOperands can be empty with mismatch of types, if zero-index GEP was removed and global is used directly by
+  // store.
+  if (indexOperands.empty() && outputTy == storeTy) {
     // All indices have been processed
     return addCallInstForOutputExport(storeValue, outputMetaVal, locOffset, maxLocOffset, InvalidValue, 0, nullptr,
                                       vertexOrPrimitiveIdx, InvalidValue);
@@ -1626,9 +1716,9 @@ void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Value *storeValue, Arra
 
     if (outputMeta.IsBuiltIn) {
       assert(!locOffset);
-      assert(indexOperands.size() == 1);
+      assert(indexOperands.empty() || indexOperands.size() == 1);
 
-      auto elemIdx = indexOperands.front();
+      auto elemIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
       return addCallInstForOutputExport(storeValue, elemMeta, nullptr, outputTy->getArrayNumElements(), InvalidValue, 0,
                                         elemIdx, vertexOrPrimitiveIdx, InvalidValue);
     }
@@ -1639,7 +1729,7 @@ void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Value *storeValue, Arra
 
     // elemLocOffset = locOffset + stride * elemIdx
     unsigned stride = cast<ConstantInt>(outputMetaVal->getOperand(0))->getZExtValue();
-    auto elemIdx = indexOperands.front();
+    auto elemIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
     Value *elemLocOffset = m_builder->CreateMul(m_builder->getInt32(stride), elemIdx);
     elemLocOffset = m_builder->CreateAdd(locOffset, elemLocOffset);
 
@@ -1649,25 +1739,31 @@ void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Value *storeValue, Arra
       maxLocOffset = cast<ConstantInt>(locOffset)->getZExtValue() + stride * outputTy->getArrayNumElements();
     }
 
-    return storeOutputMember(elemTy, storeValue, indexOperands.drop_front(), maxLocOffset, elemMeta, elemLocOffset,
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return storeOutputMember(elemTy, storeTy, storeValue, indexOperands, maxLocOffset, elemMeta, elemLocOffset,
                              vertexOrPrimitiveIdx);
   }
 
   if (outputTy->isStructTy()) {
     // Structure type
-    unsigned memberIdx = cast<ConstantInt>(indexOperands.front())->getZExtValue();
+    unsigned memberIdx = indexOperands.empty() ? 0 : cast<ConstantInt>(indexOperands.front())->getZExtValue();
 
     auto memberTy = outputTy->getStructElementType(memberIdx);
     auto memberMeta = cast<Constant>(outputMetaVal->getOperand(memberIdx));
 
-    return storeOutputMember(memberTy, storeValue, indexOperands.drop_front(), maxLocOffset, memberMeta, locOffset,
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return storeOutputMember(memberTy, storeTy, storeValue, indexOperands, maxLocOffset, memberMeta, locOffset,
                              vertexOrPrimitiveIdx);
   }
 
   if (outputTy->isVectorTy()) {
     // Vector type
-    assert(indexOperands.size() == 1);
-    auto compIdx = indexOperands.front();
+    assert(indexOperands.empty() || indexOperands.size() == 1);
+    auto compIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
 
     return addCallInstForOutputExport(storeValue, outputMetaVal, locOffset, maxLocOffset, InvalidValue, 0, compIdx,
                                       vertexOrPrimitiveIdx, InvalidValue);
@@ -1677,13 +1773,449 @@ void SpirvLowerGlobal::storeOutputMember(Type *outputTy, Value *storeValue, Arra
 }
 
 // =====================================================================================================================
+// Loads indexed value from task payload.
+//
+// @param indexedTy : Current indexed type in processing when we traverse the index operands
+// @param loadTy : Type of load instruction
+// @param indexOperands : Index operands to process
+// @param metadata : Metadata corresponding to current indexed type
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+// @returns : The indexed value loaded from task payload
+Value *SpirvLowerGlobal::loadIndexedValueFromTaskPayload(Type *indexedTy, Type *loadTy, ArrayRef<Value *> indexOperands,
+                                                         Constant *metadata, Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh);
+
+  // indexOperands can be empty with mismatch of types, if zero-index GEP was removed and global is used directly by
+  // load.
+  if (indexOperands.empty() && indexedTy == loadTy) {
+    // All indices have been processed
+    return loadValueFromTaskPayload(indexedTy, metadata, extraByteOffset);
+  }
+
+  if (indexedTy->isArrayTy()) {
+    // Array type
+    assert(metadata->getNumOperands() == 3);
+
+    auto elemMeta = cast<Constant>(metadata->getOperand(2));
+    auto elemTy = indexedTy->getArrayElementType();
+
+    // extraByteOffset += stride * elemIdx
+    unsigned stride = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    auto elemIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(stride), elemIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(stride), elemIdx);
+    }
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return loadIndexedValueFromTaskPayload(elemTy, loadTy, indexOperands, elemMeta, extraByteOffset);
+  } else if (indexedTy->isStructTy()) {
+    // Structure type
+    ShaderBlockMetadata structMeta = {};
+    structMeta.U64All = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    if (structMeta.offset > 0) {
+      if (extraByteOffset)
+        extraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(structMeta.offset));
+      else
+        extraByteOffset = m_builder->getInt32(structMeta.offset);
+    }
+
+    auto membersMeta = cast<Constant>(metadata->getOperand(1));
+    unsigned memberIdx = indexOperands.empty() ? 0 : cast<ConstantInt>(indexOperands.front())->getZExtValue();
+
+    auto memberTy = indexedTy->getStructElementType(memberIdx);
+    auto memberMeta = isa<ConstantAggregateZero>(membersMeta)
+                          ? cast<ConstantAggregateZero>(membersMeta)->getStructElement(memberIdx)
+                          : cast<Constant>(membersMeta->getOperand(memberIdx));
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return loadIndexedValueFromTaskPayload(memberTy, loadTy, indexOperands, memberMeta, extraByteOffset);
+  } else if (indexedTy->isVectorTy()) {
+    // Vector type
+    assert(indexOperands.empty() || indexOperands.size() == 1);
+    auto compTy = indexedTy->getScalarType();
+
+    // extraByteOffset += compByteSize * compIdx
+    unsigned compByteSize = indexedTy->getScalarSizeInBits() / 8;
+    auto compIdx = indexOperands.empty() ? m_builder->getInt32(0) : indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx);
+    }
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return loadIndexedValueFromTaskPayload(compTy, loadTy, indexOperands, metadata, extraByteOffset);
+  }
+
+  llvm_unreachable("Should never be called!");
+}
+
+// =====================================================================================================================
+// Loads value from task payload.
+//
+// @param storeValue : Value to store
+// @param metadata : Metadata corresponding to the task payload
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+// @returns : The value loaded from task payload
+Value *SpirvLowerGlobal::loadValueFromTaskPayload(Type *loadTy, Constant *metadata, Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh);
+
+  Value *loadValue = UndefValue::get(loadTy);
+
+  if (loadTy->isArrayTy()) {
+    // Array type
+    assert(metadata->getNumOperands() == 3);
+
+    unsigned stride = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    auto elemMeta = cast<Constant>(metadata->getOperand(2));
+    auto elemTy = loadTy->getArrayElementType();
+
+    for (unsigned elemIdx = 0; elemIdx < loadTy->getArrayNumElements(); ++elemIdx) {
+      // Handle array elements recursively
+
+      // elemExtraByteOffset = extraByteOffset + stride * elemIdx
+      Value *elemExtraByteOffset = nullptr;
+      if (extraByteOffset)
+        elemExtraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(stride * elemIdx));
+      else
+        elemExtraByteOffset = m_builder->getInt32(stride * elemIdx);
+      Value *elem = loadValueFromTaskPayload(elemTy, elemMeta, elemExtraByteOffset);
+
+      loadValue = m_builder->CreateInsertValue(loadValue, elem, elemIdx);
+    }
+  } else if (loadTy->isStructTy()) {
+    // Structure type
+    ShaderBlockMetadata structMeta = {};
+    structMeta.U64All = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    if (structMeta.offset > 0) {
+      if (extraByteOffset)
+        extraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(structMeta.offset));
+      else
+        extraByteOffset = m_builder->getInt32(structMeta.offset);
+    }
+
+    auto membersMeta = cast<Constant>(metadata->getOperand(1));
+
+    for (unsigned memberIdx = 0; memberIdx < loadTy->getStructNumElements(); ++memberIdx) {
+      // Handle structure member recursively
+      auto memberMeta = cast<Constant>(membersMeta->getOperand(memberIdx));
+      Type *memberTy = loadTy->getStructElementType(memberIdx);
+      Value *member = loadValueFromTaskPayload(memberTy, memberMeta, extraByteOffset);
+
+      loadValue = m_builder->CreateInsertValue(loadValue, member, memberIdx);
+    }
+  } else {
+    // Normal scalar or vector type
+    assert(loadTy->isSingleValueType());
+
+    ShaderBlockMetadata meta = {};
+    meta.U64All = cast<ConstantInt>(metadata)->getZExtValue();
+
+    Value *byteOffset = nullptr;
+    if (extraByteOffset)
+      byteOffset = m_builder->CreateAdd(m_builder->getInt32(meta.offset), extraByteOffset);
+    else
+      byteOffset = m_builder->getInt32(meta.offset);
+    loadValue = m_builder->CreateReadTaskPayload(loadTy, byteOffset);
+  }
+
+  return loadValue;
+}
+
+// =====================================================================================================================
+// Stores indexed value to task payload.
+//
+// @param indexedTy : Current indexed type in processing when we traverse the index operands
+// @param storeTy : Type of store instruction
+// @param storeValue : Value to store
+// @param indexOperands : Index operands to process
+// @param metadata : Metadata corresponding to current indexed type
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+void SpirvLowerGlobal::storeIndexedValueToTaskPayload(Type *indexedTy, Type *storeTy, Value *storeValue,
+                                                      ArrayRef<Value *> indexOperands, Constant *metadata,
+                                                      Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask);
+
+  // indexOperands can be empty with mismatch of types, if zero-index GEP was removed and global is used directly by
+  // store.
+  if (indexOperands.empty() && indexedTy == storeTy) {
+    // All indices have been processed
+    return storeValueToTaskPayload(storeValue, metadata, extraByteOffset);
+  }
+
+  auto zero = m_builder->getInt32(0);
+
+  if (indexedTy->isArrayTy()) {
+    // Array type
+    assert(metadata->getNumOperands() == 3);
+
+    auto elemMeta = cast<Constant>(metadata->getOperand(2));
+    auto elemTy = indexedTy->getArrayElementType();
+
+    // extraByteOffset += stride * elemIdx
+    unsigned stride = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    auto elemIdx = indexOperands.empty() ? zero : indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(stride), elemIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(stride), elemIdx);
+    }
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return storeIndexedValueToTaskPayload(elemTy, storeTy, storeValue, indexOperands, elemMeta, extraByteOffset);
+  } else if (indexedTy->isStructTy()) {
+    // Structure type
+    ShaderBlockMetadata structMeta = {};
+    structMeta.U64All = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    if (structMeta.offset > 0) {
+      if (extraByteOffset)
+        extraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(structMeta.offset));
+      else
+        extraByteOffset = m_builder->getInt32(structMeta.offset);
+    }
+
+    auto membersMeta = cast<Constant>(metadata->getOperand(1));
+    unsigned memberIdx = indexOperands.empty() ? 0 : cast<ConstantInt>(indexOperands.front())->getZExtValue();
+
+    auto memberTy = indexedTy->getStructElementType(memberIdx);
+    auto memberMeta = isa<ConstantAggregateZero>(membersMeta)
+                          ? cast<ConstantAggregateZero>(membersMeta)->getStructElement(memberIdx)
+                          : cast<Constant>(membersMeta->getOperand(memberIdx));
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return storeIndexedValueToTaskPayload(memberTy, storeTy, storeValue, indexOperands, memberMeta, extraByteOffset);
+  } else if (indexedTy->isVectorTy()) {
+    // Vector type
+    assert(indexOperands.empty() || indexOperands.size() == 1);
+    auto compTy = indexedTy->getScalarType();
+
+    // extraByteOffset += compByteSize * compIdx
+    unsigned compByteSize = indexedTy->getScalarSizeInBits() / 8;
+    auto compIdx = indexOperands.empty() ? zero : indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx);
+    }
+
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+
+    return storeIndexedValueToTaskPayload(compTy, storeTy, storeValue, indexOperands, metadata, extraByteOffset);
+  }
+
+  llvm_unreachable("Should never be called!");
+}
+
+// =====================================================================================================================
+// Stores value to task payload.
+//
+// @param storeValue : Value to store
+// @param metadata : Metadata corresponding to the task payload
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+void SpirvLowerGlobal::storeValueToTaskPayload(Value *storeValue, Constant *metadata, Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask);
+
+  auto storeTy = storeValue->getType();
+
+  if (storeTy->isArrayTy()) {
+    // Array type
+    assert(metadata->getNumOperands() == 3);
+
+    unsigned stride = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    auto elemMeta = cast<Constant>(metadata->getOperand(2));
+
+    for (unsigned elemIdx = 0; elemIdx < storeTy->getArrayNumElements(); ++elemIdx) {
+      // Handle array elements recursively
+      Value *elem = m_builder->CreateExtractValue(storeValue, elemIdx);
+
+      // elemExtraByteOffset = extraByteOffset + stride * elemIdx
+      Value *elemExtraByteOffset = nullptr;
+      if (extraByteOffset)
+        elemExtraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(stride * elemIdx));
+      else
+        elemExtraByteOffset = m_builder->getInt32(stride * elemIdx);
+      storeValueToTaskPayload(elem, elemMeta, elemExtraByteOffset);
+    }
+  } else if (storeTy->isStructTy()) {
+    // Structure type
+    ShaderBlockMetadata structMeta = {};
+    structMeta.U64All = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    if (structMeta.offset > 0) {
+      if (extraByteOffset)
+        extraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(structMeta.offset));
+      else
+        extraByteOffset = m_builder->getInt32(structMeta.offset);
+    }
+
+    auto membersMeta = cast<Constant>(metadata->getOperand(1));
+
+    for (unsigned memberIdx = 0; memberIdx < storeTy->getStructNumElements(); ++memberIdx) {
+      // Handle structure member recursively
+      auto memberMeta = cast<Constant>(membersMeta->getOperand(memberIdx));
+      Value *member = m_builder->CreateExtractValue(storeValue, memberIdx);
+      storeValueToTaskPayload(member, memberMeta, extraByteOffset);
+    }
+  } else {
+    // Normal scalar or vector type
+    assert(storeTy->isSingleValueType());
+
+    ShaderBlockMetadata meta = {};
+    meta.U64All = cast<ConstantInt>(metadata)->getZExtValue();
+
+    Value *byteOffset = nullptr;
+    if (extraByteOffset)
+      byteOffset = m_builder->CreateAdd(m_builder->getInt32(meta.offset), extraByteOffset);
+    else
+      byteOffset = m_builder->getInt32(meta.offset);
+    m_builder->CreateWriteTaskPayload(storeValue, byteOffset);
+  }
+}
+
+// =====================================================================================================================
+// Does an atomic operation with indexed value in task payload.
+//
+// @param indexedTy : Current indexed type in processing when we traverse the index operands
+// @param atomicInstToHandle : Original atomic instruction to handle
+// @param indexOperands : Index operands to process (if empty, all indices have been processed)
+// @param metadata : Metadata corresponding to current indexed type
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+// @returns : The original value read from  task payload
+Value *SpirvLowerGlobal::atomicOpWithIndexedValueInTaskPayload(Type *indexedTy, Instruction *atomicInstToHandle,
+                                                               ArrayRef<Value *> indexOperands, Constant *metadata,
+                                                               Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask);
+
+  if (indexOperands.empty()) {
+    // All indices have been processed
+    return atomicOpWithValueInTaskPayload(atomicInstToHandle, metadata, extraByteOffset);
+  }
+
+  if (indexedTy->isArrayTy()) {
+    // Array type
+    assert(metadata->getNumOperands() == 3);
+
+    auto elemMeta = cast<Constant>(metadata->getOperand(2));
+    auto elemTy = indexedTy->getArrayElementType();
+
+    // extraByteOffset += stride * elemIdx
+    unsigned stride = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    auto elemIdx = indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(stride), elemIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(stride), elemIdx);
+    }
+
+    return atomicOpWithIndexedValueInTaskPayload(elemTy, atomicInstToHandle, indexOperands.drop_front(), elemMeta,
+                                                 extraByteOffset);
+  } else if (indexedTy->isStructTy()) {
+    // Structure type
+    ShaderBlockMetadata structMeta = {};
+    structMeta.U64All = cast<ConstantInt>(metadata->getOperand(0))->getZExtValue();
+    if (structMeta.offset > 0) {
+      if (extraByteOffset)
+        extraByteOffset = m_builder->CreateAdd(extraByteOffset, m_builder->getInt32(structMeta.offset));
+      else
+        extraByteOffset = m_builder->getInt32(structMeta.offset);
+    }
+
+    auto membersMeta = cast<Constant>(metadata->getOperand(1));
+    unsigned memberIdx = cast<ConstantInt>(indexOperands.front())->getZExtValue();
+
+    auto memberTy = indexedTy->getStructElementType(memberIdx);
+    auto memberMeta = isa<ConstantAggregateZero>(membersMeta)
+                          ? cast<ConstantAggregateZero>(membersMeta)->getStructElement(memberIdx)
+                          : cast<Constant>(membersMeta->getOperand(memberIdx));
+
+    return atomicOpWithIndexedValueInTaskPayload(memberTy, atomicInstToHandle, indexOperands.drop_front(), memberMeta,
+                                                 extraByteOffset);
+  } else if (indexedTy->isVectorTy()) {
+    // Vector type
+    assert(indexOperands.size() == 1);
+    auto compTy = indexedTy->getScalarType();
+
+    // extraByteOffset += compByteSize * compIdx
+    unsigned compByteSize = indexedTy->getScalarSizeInBits() / 8;
+    auto compIdx = indexOperands.front();
+    if (extraByteOffset) {
+      extraByteOffset =
+          m_builder->CreateAdd(extraByteOffset, m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx));
+    } else {
+      extraByteOffset = m_builder->CreateMul(m_builder->getInt32(compByteSize), compIdx);
+    }
+
+    return atomicOpWithIndexedValueInTaskPayload(compTy, atomicInstToHandle, indexOperands.drop_front(), metadata,
+                                                 extraByteOffset);
+  }
+
+  llvm_unreachable("Should never be called!");
+}
+
+// =====================================================================================================================
+// Does an atomic operation with value in task payload.
+//
+// @param atomicInstToHandle : Original atomic instruction to handle
+// @param metadata : Metadata corresponding to the task payload
+// @param extraByteOffset : Extra byte offset resulting from indexed access of part of task payload (could be null)
+// @returns : The original value read from task payload
+Value *SpirvLowerGlobal::atomicOpWithValueInTaskPayload(Instruction *atomicInstToHandle, Constant *metadata,
+                                                        Value *extraByteOffset) {
+  assert(m_shaderStage == ShaderStageTask);
+
+  AtomicRMWInst *atomicRmw = dyn_cast<AtomicRMWInst>(atomicInstToHandle);
+  AtomicCmpXchgInst *cmpXchg = dyn_cast<AtomicCmpXchgInst>(atomicInstToHandle);
+  assert((atomicRmw && !cmpXchg) || (!atomicRmw && cmpXchg)); // Must be atomicrmw or cmpxchg, but not both
+
+  ShaderBlockMetadata meta = {};
+  meta.U64All = cast<ConstantInt>(metadata)->getZExtValue();
+
+  Value *byteOffset = nullptr;
+  if (extraByteOffset)
+    byteOffset = m_builder->CreateAdd(m_builder->getInt32(meta.offset), extraByteOffset);
+  else
+    byteOffset = m_builder->getInt32(meta.offset);
+
+  if (cmpXchg) {
+    // NOTE: In cmpxchg instruction in LLVM returns a structure-typed result {<value>, i1}, we don't care about the
+    // first member <value>.
+    auto atomicCall = m_builder->CreateTaskPayloadAtomicCompareSwap(
+        cmpXchg->getSuccessOrdering(), cmpXchg->getNewValOperand(), cmpXchg->getCompareOperand(), byteOffset);
+    return m_builder->CreateInsertValue(UndefValue::get(atomicInstToHandle->getType()), atomicCall, 0);
+  }
+
+  return m_builder->CreateTaskPayloadAtomic(atomicRmw->getOperation(), atomicRmw->getOrdering(),
+                                            atomicRmw->getValOperand(), byteOffset);
+}
+
+// =====================================================================================================================
 // Lowers buffer blocks.
 void SpirvLowerGlobal::lowerBufferBlock() {
   SmallVector<GlobalVariable *, 8> globalsToRemove;
 
-  // Represent the users of the global variables, expect a bitCast, a GEP or a select used by GEPs
+  // Represent the users of the global variables, expect a bitCast, a load, a store, a GEP or a select used by GEPs
   struct ReplaceInstsInfo {
+    // TODO: Remove this when LLPC will switch fully to opaque pointers.
+    // remove bitCastInst.
     BitCastInst *bitCastInst;                         // The user is a bitCast
+    Instruction *loadStoreInst;                       // The user is a load or a store.
     SelectInst *selectInst;                           // The user is a select
     SmallVector<GetElementPtrInst *> getElemPtrInsts; // The user is a GEP. If the user is a select, we store its users.
   };
@@ -1744,10 +2276,14 @@ void SpirvLowerGlobal::lowerBufferBlock() {
             // We have a user of the global, expect a GEP, a bitcast or a select.
             if (auto *getElemPtr = dyn_cast<GetElementPtrInst>(inst)) {
               replaceInstsInfo.getElemPtrInsts.push_back(getElemPtr);
+              // TODO: Remove this when LLPC will switch fully to opaque pointers.
+              // Remove else if with bitcast
             } else if (auto *bitCast = dyn_cast<BitCastInst>(inst)) {
               // We need to modify the bitcast if we did not find a GEP.
               assert(bitCast->getOperand(0) == &global);
               replaceInstsInfo.bitCastInst = bitCast;
+            } else if (isa<LoadInst>(inst) || isa<StoreInst>(inst)) {
+              replaceInstsInfo.loadStoreInst = inst;
             } else {
               // The users of the select must be a GEP.
               SelectInst *selectInst = cast<SelectInst>(inst);
@@ -1766,6 +2302,8 @@ void SpirvLowerGlobal::lowerBufferBlock() {
         }
 
         for (const auto &replaceInstsInfo : instructionsToReplace) {
+          // TODO: Remove this when LLPC will switch fully to opaque pointers.
+          // For opaque pointers BitCast Instruction will not be created.
           if (replaceInstsInfo.bitCastInst) {
             // All bitcasts recorded here are for GEPs that indexed by 0, 0 into the arrayed resource, and LLVM
             // has been clever enough to realise that doing a GEP of 0, 0 is actually a no-op (because the pointer
@@ -1780,6 +2318,20 @@ void SpirvLowerGlobal::lowerBufferBlock() {
               m_builder->CreateInvariantStart(bufferDesc);
 
             replaceInstsInfo.bitCastInst->replaceUsesOfWith(&global, m_builder->CreateBitCast(bufferDesc, blockType));
+          } else if (replaceInstsInfo.loadStoreInst) {
+            // All load or store recorded here are for GEPs that indexed by 0, 0 into the arrayed resource. Opaque
+            // pointers are removing zero-index GEPs and BitCast with pointer to pointer cast.
+            m_builder->SetInsertPoint(replaceInstsInfo.loadStoreInst);
+            unsigned bufferFlags = global.isConstant() ? 0 : lgc::Builder::BufferFlagWritten;
+
+            Value *const bufferDesc = m_builder->CreateLoadBufferDesc(descSet, binding, m_builder->getInt32(0),
+                                                                      bufferFlags, m_builder->getInt8Ty());
+
+            // If the global variable is a constant, the data it points to is invariant.
+            if (global.isConstant())
+              m_builder->CreateInvariantStart(bufferDesc);
+
+            replaceInstsInfo.loadStoreInst->replaceUsesOfWith(&global, bufferDesc);
           } else {
             assert(!replaceInstsInfo.getElemPtrInsts.empty());
 
@@ -1788,29 +2340,40 @@ void SpirvLowerGlobal::lowerBufferBlock() {
               assert(getElemPtr->getNumIndices() >= 2);
               SmallVector<Value *, 8> indices;
 
+              // Types of Global Variable and GEP can be different, these may happen when zero-index elimination
+              // occurred. For opaque pointers this is quite often. If types are not equal it means leading zeros where
+              // removed and we can assume that BlockIndex is '0' (since second index is describing BlockIndex).
+              bool isBlockIndexZero = getElemPtr->getSourceElementType() != global.getValueType();
+              bool gepsLeadingZerosEliminated = isBlockIndexZero;
+
               for (Value *const index : getElemPtr->indices())
                 indices.push_back(index);
 
-              // The first index should always be zero.
-              assert(isa<ConstantInt>(indices[0]) && cast<ConstantInt>(indices[0])->getZExtValue() == 0);
+              // Verify GEPs indices if zero-index elimination did not occurred.
+              assert(gepsLeadingZerosEliminated ||
+                     (isa<ConstantInt>(indices[0]) && cast<ConstantInt>(indices[0])->getZExtValue() == 0));
 
-              // The second index is the block index.
-              Value *const blockIndex = indices[1];
+              // Get block index from the second gep index, if it is not zero.
+              Value *const blockIndex = isBlockIndexZero ? m_builder->getInt32(0) : indices[1];
 
-              bool isNonUniform = false;
+              bool isNonUniform = isShaderStageInMask(
+                  m_shaderStage,
+                  m_context->getPipelineContext()->getPipelineOptions()->forceNonUniformResourceIndexStageMask);
 
-              // Run the users of the GEP to check for any nonuniform calls.
-              for (User *const user : getElemPtr->users()) {
-                CallInst *const call = dyn_cast<CallInst>(user);
-                // If the user is not a call or the call is the function pointer call, bail.
-                if (!call)
-                  continue;
-                auto callee = call->getCalledFunction();
-                if (!callee)
-                  continue;
-                // If the call is our non uniform decoration, record we are non uniform.
-                isNonUniform = callee->getName().startswith(gSPIRVName::NonUniform);
-                break;
+              if (!isNonUniform) {
+                // Run the users of the GEP to check for any nonuniform calls.
+                for (User *const user : getElemPtr->users()) {
+                  CallInst *const call = dyn_cast<CallInst>(user);
+                  // If the user is not a call or the call is the function pointer call, bail.
+                  if (!call)
+                    continue;
+                  auto callee = call->getCalledFunction();
+                  if (!callee)
+                    continue;
+                  // If the call is our non uniform decoration, record we are non uniform.
+                  isNonUniform = callee->getName().startswith(gSPIRVName::NonUniform);
+                  break;
+                }
               }
               if (!isNonUniform) {
                 // Run the users of the block index to check for any nonuniform calls.
@@ -1863,7 +2426,6 @@ void SpirvLowerGlobal::lowerBufferBlock() {
                 assert(resMetaNode);
                 descSets[1] = mdconst::dyn_extract<ConstantInt>(resMetaNode1->getOperand(0))->getZExtValue();
                 bindings[1] = mdconst::dyn_extract<ConstantInt>(resMetaNode1->getOperand(1))->getZExtValue();
-
                 if (!nextGlobalIdx) {
                   std::swap(descSets[0], descSets[1]);
                   std::swap(bindings[0], bindings[1]);
@@ -1885,18 +2447,26 @@ void SpirvLowerGlobal::lowerBufferBlock() {
                 newSelect = m_builder->CreateSelect(select->getCondition(), bitCasts[0], bitCasts[1]);
 
               Value *base = newSelect ? newSelect : bitCasts[0];
-              // We need to remove the block index from the original GEP indices so that we can use them.
-              indices[1] = indices[0];
+              // We need to remove the block index from the original GEP indices so that we can use them, but first we
+              // have to check if it was not removed already by zero-index elimination.
+              if (!gepsLeadingZerosEliminated)
+                indices[1] = indices[0];
 
               ArrayRef<Value *> newIndices(indices);
-              newIndices = newIndices.drop_front(1);
+              // Drop first index only if it was not removed earlier by zero-index elimination while creating GEP
+              // instructions.
+              if (!gepsLeadingZerosEliminated)
+                newIndices = newIndices.drop_front(1);
 
               Value *newGetElemPtr = nullptr;
+              // If zero-index elimination removed leading zeros from OldGEP indices then we need to use OldGEP Source
+              // type as a Source type for newGEP. In other cases use global variable array element type.
+              Type *newGetElemType = gepsLeadingZerosEliminated ? getElemPtr->getSourceElementType() : elementType;
 
               if (getElemPtr->isInBounds())
-                newGetElemPtr = m_builder->CreateInBoundsGEP(elementType, base, newIndices);
+                newGetElemPtr = m_builder->CreateInBoundsGEP(newGetElemType, base, newIndices);
               else
-                newGetElemPtr = m_builder->CreateGEP(elementType, base, newIndices);
+                newGetElemPtr = m_builder->CreateGEP(newGetElemType, base, newIndices);
 
               getElemPtr->replaceAllUsesWith(newGetElemPtr);
               getElemPtr->eraseFromParent();
@@ -2076,27 +2646,34 @@ void SpirvLowerGlobal::cleanupReturnBlock() {
 // "InterpLocSample" - Offset from the center of the pixel for "InterpLocCenter" - Vertex no. (0 ~ 2) for
 // "InterpLocCustom"
 // @param callInst : "Call" instruction
-void SpirvLowerGlobal::interpolateInputElement(unsigned interpLoc, Value *auxInterpValue, CallInst &callInst) {
-  GetElementPtrInst *getElemPtr = cast<GetElementPtrInst>(callInst.getArgOperand(0));
-
-  assert(cast<ConstantInt>(getElemPtr->getOperand(1))->isZero() && "Non-zero GEP first index\n");
+// @param indexOperands : indices of GEP instruction
+// @param gv : Global Variable instruction
+void SpirvLowerGlobal::interpolateInputElement(unsigned interpLoc, Value *auxInterpValue, CallInst &callInst,
+                                               GlobalVariable *gv, ArrayRef<Value *> indexOperands) {
+  assert(indexOperands.empty() || cast<ConstantInt>(indexOperands.front())->isZero() && "Non-zero GEP first index\n");
 
   m_builder->SetInsertPoint(&callInst);
 
-  std::vector<Value *> indexOperands;
-  for (auto &index : getElemPtr->indices())
-    indexOperands.push_back(m_builder->CreateZExtOrTrunc(index, m_builder->getInt32Ty()));
+  auto inputTy = gv->getValueType();
 
-  auto input = cast<GlobalVariable>(getElemPtr->getPointerOperand());
-  auto inputTy = input->getValueType();
-
-  MDNode *metaNode = input->getMetadata(gSPIRVMD::InOut);
+  MDNode *metaNode = gv->getMetadata(gSPIRVMD::InOut);
   assert(metaNode);
   auto inputMeta = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
 
-  if (getElemPtr->hasAllConstantIndices()) {
-    auto loadValue = loadInOutMember(inputTy, SPIRAS_Input, makeArrayRef(indexOperands).drop_front(), 0, inputMeta,
-                                     nullptr, nullptr, interpLoc, auxInterpValue, false);
+  auto hasAllConstantIndices = [](ArrayRef<Value *> &indexOperands) {
+    // if indexOperands is empty then add_of will return TRUE.
+    return std::all_of(indexOperands.begin(), indexOperands.end(), [](auto &idx) {
+      if (isa<ConstantInt>(idx))
+        return true;
+      return false;
+    });
+  };
+
+  if (hasAllConstantIndices(indexOperands)) {
+    if (!indexOperands.empty())
+      indexOperands = indexOperands.drop_front();
+    auto loadValue = loadInOutMember(inputTy, callInst.getFunctionType()->getReturnType(), SPIRAS_Input, indexOperands,
+                                     0, inputMeta, nullptr, nullptr, interpLoc, auxInterpValue, false);
 
     m_interpCalls.insert(&callInst);
     callInst.replaceAllUsesWith(loadValue);
@@ -2128,8 +2705,3 @@ void SpirvLowerGlobal::interpolateInputElement(unsigned interpLoc, Value *auxInt
 }
 
 } // namespace Llpc
-
-// =====================================================================================================================
-// Initializes the pass of SPIR-V lowering operations for globals.
-INITIALIZE_PASS(LegacySpirvLowerGlobal, DEBUG_TYPE, "Lower SPIR-V globals (global variables, inputs, and outputs)",
-                false, false)

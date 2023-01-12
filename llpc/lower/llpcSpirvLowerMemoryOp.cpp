@@ -45,20 +45,6 @@ using namespace Llpc;
 namespace Llpc {
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerMemoryOp::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering memory operations.
-ModulePass *createLegacySpirvLowerMemoryOp() {
-  return new LegacySpirvLowerMemoryOp();
-}
-
-// =====================================================================================================================
-LegacySpirvLowerMemoryOp::LegacySpirvLowerMemoryOp() : ModulePass(ID) {
-}
-
-// =====================================================================================================================
 // Executes this SPIR-V lowering pass on the specified LLVM module.
 //
 // @param [in/out] module : LLVM module to be run on
@@ -103,14 +89,6 @@ bool SpirvLowerMemoryOp::runImpl(Module &module) {
   LLVM_DEBUG(dbgs() << "After the pass Spirv-Lower-Memory-Op " << module);
 
   return true;
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-bool LegacySpirvLowerMemoryOp::runOnModule(Module &module) {
-  return Impl.runImpl(module);
 }
 
 // =====================================================================================================================
@@ -373,8 +351,15 @@ void SpirvLowerMemoryOp::expandStoreInst(StoreInst *storeInst, ArrayRef<GetEleme
     auto storeBlock = checkStoreBlock->splitBasicBlock(storeInst);
     auto endStoreBlock = storeBlock->splitBasicBlock(storeInst);
 
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 445640
+    // Old version of the code
     Instruction *checkStoreInsertPos = &checkStoreBlock->getInstList().back();
     Instruction *storeInsertPos = &storeBlock->getInstList().front();
+#else
+    // New version of the code (also handles unknown version, which we treat as latest)
+    Instruction *checkStoreInsertPos = &checkStoreBlock->back();
+    Instruction *storeInsertPos = &storeBlock->front();
+#endif
 
     auto getElemPtrCountVal = isType64 ? ConstantInt::get(Type::getInt64Ty(*m_context), getElemPtrCount)
                                        : ConstantInt::get(Type::getInt32Ty(*m_context), getElemPtrCount);
@@ -432,7 +417,3 @@ void SpirvLowerMemoryOp::expandStoreInst(StoreInst *storeInst, ArrayRef<GetEleme
 }
 
 } // namespace Llpc
-
-// =====================================================================================================================
-// Initializes the pass of SPIR-V lowering the memory operations.
-INITIALIZE_PASS(LegacySpirvLowerMemoryOp, DEBUG_TYPE, "Lower SPIR-V memory operations", false, false)

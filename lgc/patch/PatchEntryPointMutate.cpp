@@ -65,6 +65,7 @@
 #include "lgc/util/AddressExtender.h"
 #include "lgc/util/BuilderBase.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/AliasAnalysis.h" // for MemoryEffects
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -85,16 +86,6 @@ opt<bool> InRegEsGsLdsSize("inreg-esgs-lds-size", desc("For GS on-chip, add esGs
 } // namespace llvm
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacyPatchEntryPointMutate::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of LLVM patching operations for entry-point mutation
-ModulePass *lgc::createLegacyPatchEntryPointMutate() {
-  return new LegacyPatchEntryPointMutate();
-}
-
-// =====================================================================================================================
 PatchEntryPointMutate::PatchEntryPointMutate() : m_hasTs(false), m_hasGs(false) {
 }
 
@@ -112,21 +103,6 @@ PatchEntryPointMutate::UserDataArg::UserDataArg(llvm::Type *argTy, const llvm::T
 PatchEntryPointMutate::UserDataArg::UserDataArg(llvm::Type *argTy, const llvm::Twine &name,
                                                 UserDataMapping userDataValue, unsigned *argIndex)
     : UserDataArg(argTy, name, static_cast<unsigned>(userDataValue), argIndex) {
-}
-
-// =====================================================================================================================
-LegacyPatchEntryPointMutate::LegacyPatchEntryPointMutate() : ModulePass(ID) {
-}
-
-// =====================================================================================================================
-// Executes this LLVM patching pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPatchEntryPointMutate::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  PipelineShadersResult &pipelineShaders = getAnalysis<LegacyPipelineShaders>().getResult();
-  return m_impl.runImpl(module, pipelineShaders, pipelineState);
 }
 
 // =====================================================================================================================
@@ -414,6 +390,10 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     if (func.isDeclaration())
       continue;
 
+    // Only entrypoint and amd_gfx functions use user data, others don't use.
+    if (!isShaderEntryPoint(&func) && (func.getCallingConv() != CallingConv::AMDGPU_Gfx))
+      continue;
+
     ShaderStage stage = getShaderStage(&func);
     auto userDataUsage = getUserDataUsage(stage);
 
@@ -623,15 +603,9 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     for (unsigned idx = 0; idx != userDataUsage->specialUserData.size(); ++idx) {
       auto &specialUserData = userDataUsage->specialUserData[idx];
       if (!specialUserData.users.empty()) {
-        Value *arg = nullptr;
-        if (specialUserData.entryArgIdx == 0) {
-          // This is the case that no arg was created for this value. That can happen, for example when
-          // ViewIndex is used but is not enabled in pipeline state. So we need to handle it. We just replace
-          // it with UndefValue.
-          arg = UndefValue::get(specialUserData.users[0]->getType());
-        } else {
-          arg = getFunctionArgument(&func, specialUserData.entryArgIdx);
-        }
+        assert(specialUserData.entryArgIdx != 0);
+        Value *arg = getFunctionArgument(&func, specialUserData.entryArgIdx);
+
         for (Instruction *&inst : specialUserData.users) {
           if (inst && inst->getFunction() == &func) {
             Value *replacementVal = arg;
@@ -843,13 +817,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
 // =====================================================================================================================
 // Set Attributes on new function
 void PatchEntryPointMutate::setFuncAttrs(Function *entryPoint) {
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 409358
-  // Old version of the code
-  AttrBuilder builder;
-#else
-  // New version of the code (also handles unknown version, which we treat as latest)
   AttrBuilder builder(entryPoint->getContext());
-#endif
   if (m_shaderStage == ShaderStageFragment) {
     auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
     SpiPsInputAddr spiPsInputAddr = {};
@@ -928,23 +896,30 @@ void PatchEntryPointMutate::setFuncAttrs(Function *entryPoint) {
       builder.addAttribute("amdgpu-lds-spill-limit-dwords", std::to_string(shaderOptions->ldsSpillLimitDwords));
   }
 
+  if (shaderOptions->disableCodeSinking)
+    builder.addAttribute("disable-code-sinking");
+
   if (shaderOptions->nsaThreshold != 0)
     builder.addAttribute("amdgpu-nsa-threshold", std::to_string(shaderOptions->nsaThreshold));
 
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396807
-  // Old version of the code
-  AttributeList::AttrIndex attribIdx = AttributeList::AttrIndex(AttributeList::FunctionIndex);
-  entryPoint->addAttributes(attribIdx, builder);
-#else
-  // New version of the code (also handles unknown version, which we treat as
-  // latest)
+  // Disable backend heuristics which would allow shaders to have lower occupancy. Heed the favorLatencyHiding tuning
+  // option instead.
+  builder.addAttribute("amdgpu-memory-bound", shaderOptions->favorLatencyHiding ? "true" : "false");
+  builder.addAttribute("amdgpu-wave-limiter", "false");
+
   entryPoint->addFnAttrs(builder);
-#endif
 
   // NOTE: Remove "readnone" attribute for entry-point. If GS is empty, this attribute will allow
   // LLVM optimization to remove sendmsg(GS_DONE). It is unexpected.
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 440919
+  // Old version of the code
   if (entryPoint->hasFnAttribute(Attribute::ReadNone))
     entryPoint->removeFnAttr(Attribute::ReadNone);
+#else
+  // New version of the code (also handles unknown version, which we treat as
+  // latest)
+  entryPoint->setMemoryEffects(MemoryEffects::unknown());
+#endif
 }
 
 // =====================================================================================================================
@@ -1041,6 +1016,25 @@ uint64_t PatchEntryPointMutate::generateEntryPointArgTys(ShaderInputs *shaderInp
     argTys.push_back(userDataArg.argTy);
     argNames.push_back(userDataArg.name);
     userDataIdx += dwordSize;
+  }
+
+  if (m_pipelineState->getTargetInfo().getGpuWorkarounds().gfx11.waUserSgprInitBug) {
+    // Add dummy user data to bring the total to 16 SGPRS if hardware workaround
+    // is required
+
+    // Only applies to wave32
+    // TODO: Can we further exclude PS if LDS_GROUP_SIZE == 0
+    if (m_pipelineState->getShaderWaveSize(m_shaderStage) == 32 &&
+        (m_shaderStage == ShaderStageCompute || m_shaderStage == ShaderStageFragment ||
+         m_shaderStage == ShaderStageMesh)) {
+      unsigned userDataLimit = m_shaderStage == ShaderStageMesh ? 8 : 16;
+
+      while (userDataIdx < userDataLimit) {
+        argTys.push_back(builder.getInt32Ty());
+        argNames.push_back(("dummyInit" + Twine(userDataIdx)).str());
+        userDataIdx += 1;
+      }
+    }
   }
 
   intfData->userDataCount = userDataIdx;
@@ -1226,26 +1220,56 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
                                                 UserDataMapping::MeshPipeStatsBuf,
                                                 &intfData->entryArgIdxs.mesh.pipeStatsBuf));
     }
+  } else if (m_shaderStage == ShaderStageFragment) {
+    if (m_pipelineState->getInputAssemblyState().enableMultiView &&
+        m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs.viewIndex) {
+      // NOTE: Only add special user data of view index when multi-view is enabled and gl_ViewIndex is used in fragment
+      // shader.
+      specialUserDataArgs.push_back(
+          UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.fs.viewIndex));
+    }
   }
 
   // Allocate register for stream-out buffer table, to go before the user data node args (unlike all the ones
   // above, which go after the user data node args).
   if (userDataUsage->usesStreamOutTable || userDataUsage->isSpecialUserDataUsed(UserDataMapping::StreamOutTable)) {
-    if (enableNgg || !m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader)->inOutUsage.enableXfb) {
+    if (enableNgg || !m_pipelineState->hasShaderStage(ShaderStageCopyShader) && m_pipelineState->enableXfb()) {
       // If no NGG, stream out table will be set to copy shader's user data entry, we should not set it duplicately.
       switch (m_shaderStage) {
       case ShaderStageVertex:
         userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
                                            &intfData->entryArgIdxs.vs.streamOutData.tablePtr));
+        if (m_pipelineState->enableSwXfb()) {
+          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
+          // stream-out control buffer address.
+          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
+                                                    UserDataMapping::StreamOutControlBuf,
+                                                    &intfData->entryArgIdxs.vs.streamOutData.controlBufPtr));
+        }
         break;
       case ShaderStageTessEval:
         userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
                                            &intfData->entryArgIdxs.tes.streamOutData.tablePtr));
+        if (m_pipelineState->enableSwXfb()) {
+          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
+          // stream-out control buffer address.
+          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
+                                                    UserDataMapping::StreamOutControlBuf,
+                                                    &intfData->entryArgIdxs.tes.streamOutData.controlBufPtr));
+        }
         break;
       case ShaderStageGeometry:
         if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 10) {
           // Allocate dummy stream-out register for geometry shader
           userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "dummyStreamOut"));
+        } else if (m_pipelineState->enableSwXfb()) {
+          userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
+                                             &intfData->entryArgIdxs.gs.streamOutData.tablePtr));
+          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
+          // stream-out control buffer address.
+          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
+                                                    UserDataMapping::StreamOutControlBuf,
+                                                    &intfData->entryArgIdxs.gs.streamOutData.controlBufPtr));
         }
         break;
       default:
@@ -1515,9 +1539,9 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
                                 &userDataUsage->spillTable.entryArgIdx);
 
   // Figure out how many sgprs we have available for userDataArgs.
-  // We have s0-s31 (s0-s15 for <=GFX8, or for a compute shader on any chip) for everything, so take off the number
+  // We have s0-s31 (s0-s15 for <=GFX8, or for a compute/task shader on any chip) for everything, so take off the number
   // of registers used by specialUserDataArgs.
-  unsigned userDataEnd = m_shaderStage == ShaderStageCompute
+  unsigned userDataEnd = (m_shaderStage == ShaderStageCompute || m_shaderStage == ShaderStageTask)
                              ? InterfaceData::MaxCsUserDataCount
                              : m_pipelineState->getTargetInfo().getGpuProperty().maxUserDataCount;
 
@@ -1636,7 +1660,3 @@ bool PatchEntryPointMutate::UserDataUsage::isSpecialUserDataUsed(UserDataMapping
   unsigned index = static_cast<unsigned>(kind) - static_cast<unsigned>(UserDataMapping::GlobalTable);
   return specialUserData.size() > index && !specialUserData[index].users.empty();
 }
-
-// =====================================================================================================================
-// Initializes the pass of LLVM patching operations for entry-point mutation.
-INITIALIZE_PASS(LegacyPatchEntryPointMutate, DEBUG_TYPE, "Patch LLVM for entry-point mutation", false, false)

@@ -146,22 +146,19 @@ public:
   // Get the LgcContext
   LgcContext *getLgcContext() const { return m_builderContext; }
 
-  // Set the current shader stage, clamp shader stage to the ShaderStageCompute
-  void setShaderStage(ShaderStage stage) { m_shaderStage = stage > ShaderStageCompute ? ShaderStageCompute : stage; }
-
   // -----------------------------------------------------------------------------------------------------------------
   // Methods to set shader modes (FP modes, tessellation modes, fragment modes, workgroup size) for the current
   // shader that come from the input language. The structs passed to the methods are declared in Pipeline.h.
   // For a particular shader stage, these methods must be called before any Builder::Create* calls that
   // generate IR.
 
-  // Set the common shader mode for the current shader, containing hardware FP round and denorm modes.
+  // Set the common shader mode for the given shader stage, containing hardware FP round and denorm modes.
   // The client should always zero-initialize the struct before setting it up, in case future versions
   // add more fields. A local struct variable can be zero-initialized with " = {}".
-  void setCommonShaderMode(const CommonShaderMode &commonShaderMode);
+  void setCommonShaderMode(ShaderStage shaderStage, const CommonShaderMode &commonShaderMode);
 
-  // Get the common shader mode for the current shader.
-  const CommonShaderMode &getCommonShaderMode();
+  // Get the common shader mode for the given shader stage.
+  const CommonShaderMode &getCommonShaderMode(ShaderStage shaderStage);
 
   // Set the tessellation mode. This can be called in multiple shaders, and the values are merged
   // together -- a zero value in one call is overridden by a non-zero value in another call. LLPC needs
@@ -219,14 +216,15 @@ public:
   };
 
   // Create code to calculate the dot product of two integer vectors, with optional accumulator, using hardware support
-  // where available.
-  // Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is saturated
-  // if there is an accumulator. The component type of input vectors can have 8-bit/16-bit/32-bit and i32/i16/i8 result.
+  // where available. The factor inputs are always <N x iM> of the same type, N can be arbitrary and M must be 4, 8, 16,
+  // 32, or 64 Use a value of 0 for no accumulation and the value type is consistent with the result type. The result is
+  // saturated if there is an accumulator. Only the final addition to the accumulator needs to be saturated.
+  // Intermediate overflows of the dot product can lead to an undefined result.
   //
-  // @param vector1 : The integer vector 1
-  // @param vector2 : The integer vector 2
+  // @param vector1 : The integer Vector 1
+  // @param vector2 : The integer Vector 2
   // @param accumulator : The accumulator to the scalar of dot product
-  // @param flags : Bit 0 is "first vector is signed" and bit 1 is "second vector is signed"
+  // @param flags : The first bit marks whether Vector 1 is signed and the second bit marks whether Vector 2 is signed
   // @param instName : Name to give instruction(s)
   virtual llvm::Value *CreateIntegerDotProduct(llvm::Value *vector1, llvm::Value *vector2, llvm::Value *accumulator,
                                                unsigned flags, const llvm::Twine &instName = "") = 0;
@@ -703,13 +701,17 @@ public:
     BufferFlagNonConst = 8,   // Non-const buffer: Find a DescriptorBuffer/DescriptorBufferCompact descriptor
                               //  entry, rather than DescriptorConstBuffer/DescriptorConstBufferCompact/InlineBuffer
     BufferFlagShaderResource = 16, // Flag to find a Descriptor Resource
-    BufferFlagSampler = 32         // Flag to find Descriptor Sampler
+    BufferFlagSampler = 32,        // Flag to find Descriptor Sampler
+    BufferFlagAddress = 64         // Flag to return an i64 address of the descriptor
   };
 
   // Get the type of pointer returned by CreateLoadBufferDesc.
   llvm::PointerType *getBufferDescTy(llvm::Type *pointeeTy);
 
   // Create a load of a buffer descriptor.
+  //
+  // If descSet = -1, this is an internal user data, which is a plain 64-bit pointer, flags must be 'BufferFlagAddress'
+  // i64 address is returned.
   //
   // @param descSet : Descriptor set
   // @param binding : Descriptor binding
@@ -1107,6 +1109,7 @@ public:
   virtual llvm::Value *CreateImageBvhIntersectRay(llvm::Value *nodePtr, llvm::Value *extent, llvm::Value *origin,
                                                   llvm::Value *direction, llvm::Value *invDirection,
                                                   llvm::Value *imageDesc, const llvm::Twine &instName = "");
+
 #endif
 
   // -----------------------------------------------------------------------------------------------------------------
@@ -1224,12 +1227,21 @@ public:
                                                   unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
                                                   InOutInfo outputInfo) = 0;
 
+  // Get the type of a built-in -- static edition of the method below, so you can use it without a Builder object.
+  //
+  // @param builtIn : Built-in kind, one of the BuiltIn* constants
+  // @param inOutInfo : Extra input/output info (shader-defined array length)
+  // @param context : LLVMContext
+  static llvm::Type *getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo, llvm::LLVMContext &context);
+
   // Get the type of a built-in. Where the built-in has a shader-defined array length (ClipDistance,
   // CullDistance, SampleMask), inOutInfo.GetArraySize() is used as the array size.
   //
   // @param builtIn : Built-in kind, one of the BuiltIn* constants
   // @param inOutInfo : Extra input/output info (shader-defined array length)
-  llvm::Type *getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo);
+  llvm::Type *getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo) {
+    return getBuiltInTy(builtIn, inOutInfo, getContext());
+  }
 
   // Create a read of barycoord input value.
   // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
@@ -1697,9 +1709,6 @@ protected:
 
   // Get a constant of FP or vector of FP type from the given APFloat, converting APFloat semantics where necessary
   llvm::Constant *getFpConstant(llvm::Type *ty, llvm::APFloat value);
-
-  bool m_isBuilderRecorder = false;               // Whether this is a BuilderRecorder
-  ShaderStage m_shaderStage = ShaderStageInvalid; // Current shader stage being built.
 
   //
   // @param matrixType : The matrix type to transpose

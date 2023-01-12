@@ -56,29 +56,6 @@ extern opt<bool> InRegEsGsLdsSize;
 using namespace lgc;
 using namespace llvm;
 
-char LegacyPatchCopyShader::ID = 0;
-
-// =====================================================================================================================
-// Create pass to generate copy shader if required.
-ModulePass *lgc::createLegacyPatchCopyShader() {
-  return new LegacyPatchCopyShader();
-}
-
-// =====================================================================================================================
-LegacyPatchCopyShader::LegacyPatchCopyShader() : llvm::ModulePass(ID) {
-}
-
-// =====================================================================================================================
-// Run the pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPatchCopyShader::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  PipelineShadersResult &pipelineShaders = getAnalysis<LegacyPipelineShaders>().getResult();
-  return m_impl.runImpl(module, pipelineShaders, pipelineState);
-}
-
 // =====================================================================================================================
 // Run the pass on the specified LLVM module.
 //
@@ -160,10 +137,20 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
     //   void copyShader(
     //     i32 vertexIndex)
     //
+    // GFX11+:
+    //   void copyShader(
+    //     i32 inreg globalTable,
+    //     i32 inreg streamOutTable,
+    //     i32 inreg streamOutControlBuf,
+    //     i32 vertexId)
     if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 10) {
       argTys = {int32Ty};
       argInReg = {false};
       argNames = {"vertexId"};
+    } else {
+      argTys = {int32Ty, int32Ty, int32Ty, int32Ty};
+      argInReg = {true, true, true, false};
+      argNames = {"globalTable", "streamOutTable", "streamOutControlBuf", "vertexId"};
     }
   }
 
@@ -211,6 +198,8 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
       // If NGG, esGsLdsSize is not used
       intfData->userDataUsage.gs.copyShaderEsGsLdsSize = InvalidValue;
       intfData->userDataUsage.gs.copyShaderStreamOutTable = 1;
+      if (m_pipelineState->enableSwXfb())
+        intfData->userDataUsage.gs.copyShaderStreamOutControlBuf = 2;
     }
   }
 
@@ -220,7 +209,7 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
     // If no NGG, the copy shader will become a real HW VS. Set the user data entries in the
     // PAL metadata here.
     m_pipelineState->getPalMetadata()->setUserDataEntry(ShaderStageCopyShader, 0, UserDataMapping::GlobalTable);
-    if (resUsage->inOutUsage.enableXfb) {
+    if (m_pipelineState->enableXfb()) {
       m_pipelineState->getPalMetadata()->setUserDataEntry(
           ShaderStageCopyShader, intfData->userDataUsage.gs.copyShaderStreamOutTable, UserDataMapping::StreamOutTable);
     }
@@ -245,7 +234,7 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
     }
   }
 
-  if (outputStreamCount > 1 && resUsage->inOutUsage.enableXfb) {
+  if (outputStreamCount > 1 && m_pipelineState->enableXfb()) {
     if (!m_pipelineState->getNggControl()->enableNgg) {
       // StreamId = streamInfo[25:24]
       auto streamInfo = getFunctionArgument(entryPoint, CopyShaderUserSgprIdxStreamInfo);
@@ -308,6 +297,8 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
       //   return
       // }
       //
+      assert(gfxIp.major >= 11); // Must be GFX11+
+
       for (unsigned streamId = 0; streamId < MaxGsStreams; ++streamId) {
         if (resUsage->inOutUsage.gs.outLocCount[streamId] > 0)
           exportOutput(streamId, builder);
@@ -395,7 +386,7 @@ void PatchCopyShader::collectGsGenericOutputInfo(Function *gsEntryPoint) {
 void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader);
   auto &builtInUsage = resUsage->builtInUsage.gs;
-  auto &locInfoXfbOutInfoMap = resUsage->inOutUsage.gs.locInfoXfbOutInfoMap;
+  auto &locInfoXfbOutInfoMap = resUsage->inOutUsage.locInfoXfbOutInfoMap;
   auto &outputLocInfoMap = resUsage->inOutUsage.outputLocInfoMap;
 
   // Build the map between new location and output value
@@ -413,7 +404,7 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
     newLocValueMap[newLoc] = outputValue;
   }
 
-  if (resUsage->inOutUsage.enableXfb) {
+  if (m_pipelineState->enableXfb()) {
     // Export XFB output
     if (m_pipelineState->canPackOutput(ShaderStageGeometry)) {
       // With packing locations, we should collect the XFB output value at an original location
@@ -505,14 +496,14 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
   if (builtInUsage.primitiveId)
     builtInPairs.push_back(std::make_pair(BuiltInPrimitiveId, builder.getInt32Ty()));
 
-  const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-  if (builtInUsage.layer || enableMultiView) {
-    // NOTE: If multi-view is enabled, always export gl_ViewIndex rather than gl_Layer.
-    builtInPairs.push_back(std::make_pair(enableMultiView ? BuiltInViewIndex : BuiltInLayer, builder.getInt32Ty()));
-  }
+  if (builtInUsage.layer)
+    builtInPairs.push_back(std::make_pair(BuiltInLayer, builder.getInt32Ty()));
 
   if (builtInUsage.viewportIndex)
     builtInPairs.push_back(std::make_pair(BuiltInViewportIndex, builder.getInt32Ty()));
+
+  if (m_pipelineState->getInputAssemblyState().enableMultiView)
+    builtInPairs.push_back(std::make_pair(BuiltInViewIndex, builder.getInt32Ty()));
 
   if (builtInUsage.primitiveShadingRate)
     builtInPairs.push_back(std::make_pair(BuiltInPrimitiveShadingRate, builder.getInt32Ty()));
@@ -701,6 +692,13 @@ void PatchCopyShader::exportXfbOutput(Value *outputValue, const XfbOutInfo &xfbO
     }
   }
 
+  // Collect transform feedback output export calls, used in SW-emulated stream-out.
+  if (m_pipelineState->enableSwXfb()) {
+    auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader)->inOutUsage;
+    // A transform feedback output export call is expected to be <4 x dword> at most
+    inOutUsage.xfbOutputExpCount += outputValue->getType()->getPrimitiveSizeInBits() > 128 ? 2 : 1;
+  }
+
   Value *args[] = {builder.getInt32(xfbOutInfo.xfbBuffer), builder.getInt32(xfbOutInfo.xfbOffset),
                    builder.getInt32(xfbOutInfo.streamId), outputValue};
 
@@ -720,15 +718,21 @@ void PatchCopyShader::exportBuiltInOutput(Value *outputValue, BuiltInKind builtI
                                           BuilderBase &builder) {
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader);
 
-  if (resUsage->inOutUsage.enableXfb) {
+  if (m_pipelineState->enableXfb()) {
     InOutLocationInfo outLocInfo;
     outLocInfo.setLocation(builtInId);
     outLocInfo.setBuiltIn(true);
     outLocInfo.setStreamId(streamId);
 
-    auto &locInfoXfbOutInfoMap = resUsage->inOutUsage.gs.locInfoXfbOutInfoMap;
+    auto &locInfoXfbOutInfoMap = resUsage->inOutUsage.locInfoXfbOutInfoMap;
     const auto &locInfoXfbOutInfoMapIt = locInfoXfbOutInfoMap.find(outLocInfo);
     if (locInfoXfbOutInfoMapIt != locInfoXfbOutInfoMap.end()) {
+      // Collect transform feedback output export calls, used in SW-emulated stream-out.
+      if (m_pipelineState->enableSwXfb()) {
+        auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader)->inOutUsage;
+        // A transform feedback output export call is expected to be <4 x dword> at most
+        inOutUsage.xfbOutputExpCount += outputValue->getType()->getPrimitiveSizeInBits() > 128 ? 2 : 1;
+      }
 
       const auto &xfbOutInfo = locInfoXfbOutInfoMapIt->second;
       std::string instName(lgcName::OutputExportXfb);
@@ -747,7 +751,3 @@ void PatchCopyShader::exportBuiltInOutput(Value *outputValue, BuiltInKind builtI
     builder.CreateNamedCall(callName, builder.getVoidTy(), args, {});
   }
 }
-
-// =====================================================================================================================
-// Initializes the pass
-INITIALIZE_PASS(LegacyPatchCopyShader, DEBUG_TYPE, "Patch LLVM for copy shader generation", false, false)

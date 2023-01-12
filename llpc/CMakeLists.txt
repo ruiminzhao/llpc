@@ -45,11 +45,11 @@ endif()
 if(ICD_BUILD_LLPC)
     # Set LLVM options and build LLVM
     # Add LGC as an LLVM external project, but only if its CMakeLists.txt exists.
-    set(LLVM_EXTERNAL_PROJECTS lgc)
+    set(LLVM_EXTERNAL_PROJECTS llvm-dialects lgc)
+    set(LLVM_EXTERNAL_LLVM_DIALECTS_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../imported/llvm-dialects)
     set(LLVM_EXTERNAL_LGC_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../lgc)
 
     # Set other LLVM settings.
-    set(LLVM_ENABLE_ASSERTIONS ${CMAKE_BUILD_TYPE_DEBUG} CACHE BOOL Force)
     set(LLVM_TARGETS_TO_BUILD AMDGPU CACHE STRING Force)
     set(LLVM_BUILD_TESTS OFF CACHE BOOL Force)
     set(LLVM_BUILD_TOOLS ${LLPC_BUILD_LLVM_TOOLS} CACHE BOOL Force)
@@ -143,7 +143,7 @@ set_compiler_options(llpc ${LLPC_ENABLE_WERROR})
 
 ### Defines/Includes/Sources ###########################################################################################
 if(ICD_BUILD_LLPC)
-    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${XGL_LLVM_BUILD_PATH}/lib/cmake/llvm)
+    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${XGL_LLVM_BUILD_PATH}/${CMAKE_CFG_INTDIR}/lib/cmake/llvm")
     include(LLVMConfig)
     message(STATUS "LLVM executables: " ${LLVM_TOOLS_BINARY_DIR})
     message(STATUS "LLVM libraries: " ${LLVM_BUILD_LIBRARY_DIR})
@@ -224,6 +224,7 @@ endif()
     target_sources(llpc PRIVATE
         lower/llpcSpirvLower.cpp
         lower/llpcSpirvLowerAccessChain.cpp
+        lower/llpcSpirvLowerCfgMerges.cpp
         lower/llpcSpirvLowerConstImmediateStore.cpp
         lower/llpcSpirvLowerGlobal.cpp
         lower/llpcSpirvLowerInstMetaRemove.cpp
@@ -297,11 +298,7 @@ elseif(WIN32)
     set(BUILD_OS win)
 endif()
 
-if(UNIX)
-    set(LLVM_BIN_DIR ${XGL_LLVM_BUILD_PATH}/bin/)
-elseif(WIN32)
-    set(LLVM_BIN_DIR ${XGL_LLVM_BUILD_PATH}/\$\(Configuration\)/bin/)
-endif()
+set(LLVM_BIN_DIR "${XGL_LLVM_BUILD_PATH}/${CMAKE_CFG_INTDIR}/bin")
 
 endif()
 ### Link Libraries #####################################################################################################
@@ -324,7 +321,7 @@ target_link_libraries(llpc PRIVATE Threads::Threads)
 
 if(LLPC_BUILD_TOOLS)
 ### VFX library for Standalone Compiler ###################################################################################
-if(ICD_BUILD_LLPC)
+if(NOT TARGET vfx)
     set(VFX_ENABLE_WERROR ${LLPC_ENABLE_WERROR} CACHE BOOL "${PROJECT_NAME} override." FORCE)
     add_subdirectory(${PROJECT_SOURCE_DIR}/../tool/vfx ${PROJECT_BINARY_DIR}/../vfx)
 endif()
@@ -386,10 +383,8 @@ target_link_libraries(llpc_standalone_compiler PUBLIC
     spvgen_static
     vfx
     vkgc_headers
+    ${CMAKE_DL_LIBS}
 )
-if(UNIX)
-    target_link_libraries(llpc_standalone_compiler PUBLIC dl)
-endif()
 
 if (NOT LLVM_LINK_LLVM_DYLIB)
     llvm_map_components_to_libnames(llvm_libs

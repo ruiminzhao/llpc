@@ -35,6 +35,12 @@
 #include "lgc/state/PipelineState.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/IRPrintingPasses.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Timer.h"
@@ -46,8 +52,7 @@ using namespace lgc;
 using namespace llvm;
 
 namespace lgc {
-// Create BuilderReplayer pass
-ModulePass *createLegacyBuilderReplayer(Pipeline *pipeline);
+
 ElfLinker *createElfLinkerImpl(PipelineState *pipelineState, llvm::ArrayRef<llvm::MemoryBufferRef> elfs);
 
 } // namespace lgc
@@ -58,15 +63,27 @@ ElfLinker *createElfLinkerImpl(PipelineState *pipelineState, llvm::ArrayRef<llvm
 // in the front-end before a shader is associated with a pipeline.
 //
 // @param func : Shader entry-point function
-// @param stage : Shader stage
+// @param stage : Shader stage or ShaderStageInvalid
 void Pipeline::markShaderEntryPoint(Function *func, ShaderStage stage) {
   // We mark the shader entry-point function by
   // 1. marking it external linkage and DLLExportStorageClass; and
   // 2. adding the shader stage metadata.
   // The shader stage metadata for any other non-inlined functions in the module is added in irLink().
-  func->setLinkage(GlobalValue::ExternalLinkage);
-  func->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
+  if (stage != ShaderStageInvalid) {
+    func->setLinkage(GlobalValue::ExternalLinkage);
+    func->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
+  } else
+    func->setDLLStorageClass(GlobalValue::DefaultStorageClass);
   setShaderStage(func, stage);
+}
+
+// =====================================================================================================================
+// Get a function's shader stage.
+//
+// @param func : Function to check
+// @returns stage : Shader stage, or ShaderStageInvalid if none
+ShaderStage Pipeline::getShaderStage(llvm::Function *func) {
+  return lgc::getShaderStage(func);
 }
 
 // =====================================================================================================================
@@ -76,9 +93,6 @@ void Pipeline::markShaderEntryPoint(Function *func, ShaderStage stage) {
 // @param pipelineLink : Enum saying whether this is a pipeline, unlinked or part-pipeline compile.
 Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineLink) {
   m_pipelineLink = pipelineLink;
-#ifndef NDEBUG
-  unsigned shaderStageMask = 0;
-#endif
 
   // Processing for each shader module before linking.
   IRBuilder<> builder(getContext());
@@ -93,10 +107,7 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
         continue;
       // We have the entry-point (marked as DLLExportStorageClass).
       stage = getShaderStage(&func);
-#ifndef NDEBUG
-      assert((shaderStageMask & (1 << stage)) == 0);
-      shaderStageMask |= 1 << stage;
-#endif
+      m_stageMask |= 1U << stage;
 
       // Rename the entry-point to ensure there is no clash on linking.
       func.setName(Twine(lgcName::EntryPointPrefix) + getShaderStageAbbreviation(static_cast<ShaderStage>(stage)) +
@@ -107,9 +118,6 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
     if (stage == ShaderStageInvalid) {
       stage = ShaderStageCompute;
       m_computeLibrary = true;
-#ifndef NDEBUG
-      shaderStageMask |= 1 << stage;
-#endif
     }
 
     // Mark all other function definitions in the module with the same shader stage.
@@ -118,13 +126,6 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
         setShaderStage(&func, stage);
     }
   }
-
-#ifndef NDEBUG
-  // Assert that the front-end's call to setShaderStageMask was correct. (We want the front-end to call it
-  // before calling any builder calls in case it is using direct BuilderImpl and one of the builder calls needs
-  // the shader stage mask.)
-  assert(shaderStageMask == getShaderStageMask());
-#endif
 
   // The front-end was using a BuilderRecorder; record pipeline state into IR metadata.
   record(modules[0]);
@@ -173,36 +174,22 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
 //                 timers[0]: patch passes
 //                 timers[1]: LLVM optimizations
 //                 timers[2]: codegen
-// @param newPassManager : Whether to use the new pass manager or not.
 // @returns : True for success.
 //           False if irLink asked for an "unlinked" shader or part-pipeline, and there is some reason why the
 //           module cannot be compiled that way.  The client typically then does a whole-pipeline compilation
 //           instead. The client can call getLastError() to get a textual representation of the error, for
 //           use in logging or in error reporting in a command-line utility.
 bool PipelineState::generate(std::unique_ptr<Module> pipelineModule, raw_pwrite_stream &outStream,
-                             Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, ArrayRef<Timer *> timers,
-                             bool newPassManager) {
+                             Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, ArrayRef<Timer *> timers) {
   m_lastError.clear();
 
-  if (newPassManager)
-    generateWithNewPassManager(std::move(pipelineModule), outStream, std::move(checkShaderCacheFunc), timers);
-  else
-    generateWithLegacyPassManager(std::move(pipelineModule), outStream, std::move(checkShaderCacheFunc), timers);
-
-  // See if there was a recoverable error.
-  return getLastError() == "";
-}
-
-void PipelineState::generateWithNewPassManager(std::unique_ptr<Module> pipelineModule, raw_pwrite_stream &outStream,
-                                               Pipeline::CheckShaderCacheFunc checkShaderCacheFunc,
-                                               ArrayRef<Timer *> timers) {
   unsigned passIndex = 1000;
   Timer *patchTimer = timers.size() >= 1 ? timers[0] : nullptr;
   Timer *optTimer = timers.size() >= 2 ? timers[1] : nullptr;
   Timer *codeGenTimer = timers.size() >= 3 ? timers[2] : nullptr;
 
   // Set up "whole pipeline" passes, where we have a single module representing the whole pipeline.
-  std::unique_ptr<lgc::PassManager> passMgr(lgc::PassManager::Create(getLgcContext()->getTargetMachine()));
+  std::unique_ptr<lgc::PassManager> passMgr(lgc::PassManager::Create(getLgcContext()));
   passMgr->setPassIndex(&passIndex);
   Patch::registerPasses(*passMgr);
   passMgr->registerFunctionAnalysis([&] { return getLgcContext()->getTargetMachine()->getTargetIRAnalysis(); });
@@ -211,13 +198,14 @@ void PipelineState::generateWithNewPassManager(std::unique_ptr<Module> pipelineM
   // Manually add a target-aware TLI pass, so optimizations do not think that we have library functions.
   getLgcContext()->preparePassManager(*passMgr);
 
+  // Ensure m_stageMask is set up in this PipelineState, as Patch::addPasses uses it.
+  readShaderStageMask(&*pipelineModule);
+
   // Manually add a PipelineStateWrapper pass.
   // We were using BuilderRecorder, so we do not give our PipelineState to it.
   // (The first time PipelineStateWrapper is used, it allocates its own PipelineState and populates
   // it by reading IR metadata.)
-  passMgr->registerModuleAnalysis([&] {
-    return PipelineStateWrapper(getLgcContext());
-  });
+  passMgr->registerModuleAnalysis([&] { return PipelineStateWrapper(getLgcContext()); });
 
   if (m_emitLgc) {
     // -emit-lgc: Just write the module.
@@ -242,53 +230,9 @@ void PipelineState::generateWithNewPassManager(std::unique_ptr<Module> pipelineM
     // Run the codegen passes
     codegenPassMgr->run(*pipelineModule);
   }
-}
 
-void PipelineState::generateWithLegacyPassManager(std::unique_ptr<Module> pipelineModule, raw_pwrite_stream &outStream,
-                                                  Pipeline::CheckShaderCacheFunc checkShaderCacheFunc,
-                                                  ArrayRef<Timer *> timers) {
-
-  unsigned passIndex = 1000;
-  Timer *patchTimer = timers.size() >= 1 ? timers[0] : nullptr;
-  Timer *optTimer = timers.size() >= 2 ? timers[1] : nullptr;
-  Timer *codeGenTimer = timers.size() >= 3 ? timers[2] : nullptr;
-
-  // Set up "whole pipeline" passes, where we have a single module representing the whole pipeline.
-  std::unique_ptr<LegacyPassManager> passMgr(LegacyPassManager::Create());
-  passMgr->setPassIndex(&passIndex);
-  passMgr->add(createTargetTransformInfoWrapperPass(getLgcContext()->getTargetMachine()->getTargetIRAnalysis()));
-
-  // Manually add a target-aware TLI pass, so optimizations do not think that we have library functions.
-  getLgcContext()->preparePassManager(&*passMgr);
-
-  // Manually add a PipelineStateWrapper pass.
-  // We were not using BuilderRecorder, so we do not give our PipelineState to it.
-  // (The first time PipelineStateWrapper is used, it allocates its own PipelineState and populates
-  // it by reading IR metadata.)
-  LegacyPipelineStateWrapper *pipelineStateWrapper = new LegacyPipelineStateWrapper(getLgcContext());
-  passMgr->add(pipelineStateWrapper);
-
-  if (m_emitLgc) {
-    // -emit-lgc: Just write the module.
-    passMgr->add(createPrintModulePass(outStream));
-    passMgr->stop();
-  }
-
-  // Get a BuilderReplayer pass.
-  ModulePass *replayerPass = createLegacyBuilderReplayer(this);
-
-  // Patching.
-  LegacyPatch::addPasses(this, *passMgr, replayerPass, patchTimer, optTimer, std::move(checkShaderCacheFunc),
-                         getLgcContext()->getOptimizationLevel());
-
-  // Add pass to clear pipeline state from IR
-  passMgr->add(createLegacyPipelineStateClearer());
-
-  // Code generation.
-  getLgcContext()->addTargetPasses(*passMgr, codeGenTimer, outStream);
-
-  // Run the "whole pipeline" passes.
-  passMgr->run(*pipelineModule);
+  // See if there was a recoverable error.
+  return getLastError() == "";
 }
 
 // =====================================================================================================================

@@ -34,6 +34,8 @@
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
+#include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/PostDominators.h"
 
 namespace lgc {
 
@@ -41,13 +43,28 @@ namespace lgc {
 // Pass to prepare the pipeline ABI
 class PatchPreparePipelineAbi final : public Patch, public llvm::PassInfoMixin<PatchPreparePipelineAbi> {
 public:
+  // A collection of handler functions to get the analysis info of the given function
+  struct FunctionAnalysisHandlers {
+    // Function to get the post dominator tree of the given function
+    std::function<llvm::PostDominatorTree &(llvm::Function &)> getPostDomTree;
+    // Function to get the cycle info of the given function
+    std::function<llvm::CycleInfo &(llvm::Function &)> getCycleInfo;
+  };
+
   PatchPreparePipelineAbi();
 
   llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
 
-  bool runImpl(llvm::Module &module, PipelineShadersResult &pipelineShaders, PipelineState *pipelineState);
+  bool runImpl(llvm::Module &module, PipelineShadersResult &pipelineShaders, PipelineState *pipelineState,
+               FunctionAnalysisHandlers &analysisHandlers);
 
   static llvm::StringRef name() { return "Patch LLVM for preparing pipeline ABI"; }
+
+  static std::pair<llvm::Value *, llvm::Value *> readTessFactors(PipelineState *pipelineState, llvm::Value *relPatchId,
+                                                                 llvm::IRBuilder<> &builder);
+  static void writeTessFactors(PipelineState *pipelineState, llvm::Value *tfBufferDesc, llvm::Value *tfBufferBase,
+                               llvm::Value *relPatchId, llvm::Value *outerTf, llvm::Value *innerTf,
+                               llvm::IRBuilder<> &builder);
 
 private:
   void mergeShader(llvm::Module &module);
@@ -56,8 +73,12 @@ private:
 
   void addAbiMetadata(llvm::Module &module);
 
+  void storeTessFactors(llvm::Function *entryPoint);
+
   PipelineState *m_pipelineState;           // Pipeline state
   PipelineShadersResult *m_pipelineShaders; // API shaders in the pipeline
+  FunctionAnalysisHandlers
+      *m_analysisHandlers; // A collection of handler functions to get the analysis info of the given function
 
   bool m_hasVs;   // Whether the pipeline has vertex shader
   bool m_hasTcs;  // Whether the pipeline has tessellation control shader
@@ -67,27 +88,6 @@ private:
   bool m_hasMesh; // Whether the pipeline has mesh shader
 
   GfxIpVersion m_gfxIp; // Graphics IP version info
-};
-
-// =====================================================================================================================
-// Pass to prepare the pipeline ABI
-class LegacyPatchPreparePipelineAbi final : public llvm::ModulePass {
-public:
-  static char ID; // NOLINT
-  LegacyPatchPreparePipelineAbi();
-
-  bool runOnModule(llvm::Module &module) override;
-
-  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-    analysisUsage.addRequired<LegacyPipelineShaders>();
-  }
-
-private:
-  LegacyPatchPreparePipelineAbi(const LegacyPatchPreparePipelineAbi &) = delete;
-  LegacyPatchPreparePipelineAbi &operator=(const LegacyPatchPreparePipelineAbi &) = delete;
-
-  PatchPreparePipelineAbi m_impl;
 };
 
 } // namespace lgc

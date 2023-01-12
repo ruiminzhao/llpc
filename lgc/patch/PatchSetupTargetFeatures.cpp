@@ -40,48 +40,6 @@
 using namespace llvm;
 using namespace lgc;
 
-namespace lgc {
-
-// =====================================================================================================================
-// Pass to set up target features on shader entry-points
-class LegacyPatchSetupTargetFeatures : public LegacyPatch {
-public:
-  static char ID;
-  LegacyPatchSetupTargetFeatures() : LegacyPatch(ID) {}
-
-  void getAnalysisUsage(AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-  }
-
-  bool runOnModule(Module &module) override;
-
-  LegacyPatchSetupTargetFeatures(const LegacyPatchSetupTargetFeatures &) = delete;
-  LegacyPatchSetupTargetFeatures &operator=(const LegacyPatchSetupTargetFeatures &) = delete;
-
-private:
-  PatchSetupTargetFeatures m_impl;
-};
-
-char LegacyPatchSetupTargetFeatures::ID = 0;
-
-} // namespace lgc
-
-// =====================================================================================================================
-// Create pass to set up target features
-ModulePass *lgc::createLegacyPatchSetupTargetFeatures() {
-  return new LegacyPatchSetupTargetFeatures();
-}
-
-// =====================================================================================================================
-// Run the pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPatchSetupTargetFeatures::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  return m_impl.runImpl(module, pipelineState);
-}
-
 // =====================================================================================================================
 // Run the pass on the specified LLVM module.
 //
@@ -126,13 +84,7 @@ void PatchSetupTargetFeatures::setupTargetFeatures(Module *module) {
       continue;
 
     std::string targetFeatures(globalFeatures);
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 409358
-    // Old version of the code
-    AttrBuilder builder;
-#else
-    // New version of the code (also handles unknown version, which we treat as latest)
     AttrBuilder builder(module->getContext());
-#endif
 
     ShaderStage shaderStage = lgc::getShaderStage(&*func);
 
@@ -190,19 +142,15 @@ void PatchSetupTargetFeatures::setupTargetFeatures(Module *module) {
 
       targetFeatures += ",+wavefrontsize" + std::to_string(waveSize);
 
-      // Allow driver setting for WGP by forcing backend to set 0
-      // which is then OR'ed with the driver set value
-      targetFeatures += ",+cumode";
+      if (m_pipelineState->getShaderWgpMode(shaderStage))
+        targetFeatures += ",-cumode";
+      else
+        targetFeatures += ",+cumode";
     }
 
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 414671
-    // Old version of the code
-#else
-    // New version of the code (also handles unknown version, which we treat as latest)
     // Enable flat scratch for gfx10.3+
     if (gfxIp.major == 10 && gfxIp.minor >= 3)
       targetFeatures += ",+enable-flat-scratch";
-#endif
 
     if (m_pipelineState->getTargetInfo().getGpuProperty().supportsXnack) {
       // Enable or disable xnack depending on whether page migration is enabled.
@@ -238,18 +186,6 @@ void PatchSetupTargetFeatures::setupTargetFeatures(Module *module) {
 
     builder.addAttribute("target-features", targetFeatures);
 
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396807
-    // Old version of the code
-    AttributeList::AttrIndex attribIdx = AttributeList::AttrIndex(AttributeList::FunctionIndex);
-    func->addAttributes(attribIdx, builder);
-#else
-    // New version of the code (also handles unknown version, which we treat as
-    // latest)
     func->addFnAttrs(builder);
-#endif
   }
 }
-
-// =====================================================================================================================
-// Initializes the pass
-INITIALIZE_PASS(LegacyPatchSetupTargetFeatures, DEBUG_TYPE, "Patch LLVM to set up target features", false, false)

@@ -45,14 +45,8 @@
 namespace llvm {
 
 class MDString;
-class ModulePass;
 class NamedMDNode;
-class PassRegistry;
 class Timer;
-
-void initializeLegacyPipelineShadersPass(PassRegistry &);
-void initializeLegacyPipelineStateClearerPass(PassRegistry &);
-void initializeLegacyPipelineStateWrapperPass(PassRegistry &);
 
 } // namespace llvm
 
@@ -62,17 +56,6 @@ class ElfLinker;
 class PalMetadata;
 class PipelineState;
 class TargetInfo;
-
-llvm::ModulePass *createLegacyPipelineStateClearer();
-
-// Initialize passes in state directory
-//
-// @param passRegistry : Pass registry
-inline static void initializeStatePasses(llvm::PassRegistry &passRegistry) {
-  initializeLegacyPipelineShadersPass(passRegistry);
-  initializeLegacyPipelineStateClearerPass(passRegistry);
-  initializeLegacyPipelineStateWrapperPass(passRegistry);
-}
 
 // Resource node type used to ask to find any buffer node, whether constant or not.
 static constexpr ResourceNodeType DescriptorAnyBuffer = ResourceNodeType::Count;
@@ -118,6 +101,13 @@ struct NggControl {
   Util::Abi::PrimShaderCbLayout primShaderTable; // Primitive shader table (only some registers are used)
 };
 
+// Represents transform feedback state metadata
+struct XfbStateMetadata {
+  bool enableXfb;                                               // Whether transform feedback is active
+  std::array<unsigned, MaxTransformFeedbackBuffers> xfbStrides; // The strides of each XFB buffer.
+  std::array<int, MaxGsStreams> streamXfbBuffers;               // The stream-out XFB buffers bit mask per stream.
+};
+
 // =====================================================================================================================
 // The middle-end implementation of PipelineState, a subclass of Pipeline.
 class PipelineState final : public Pipeline {
@@ -131,9 +121,6 @@ public:
 
   // Set the resource mapping nodes for the pipeline
   void setUserDataNodes(llvm::ArrayRef<ResourceNode> nodes) override final;
-
-  // Set shader stage mask
-  void setShaderStageMask(unsigned mask) override final { m_stageMask = mask; }
 
   // Set whether pre-rasterization part has a geometry shader
   // NOTE: Only applicable in the part pipeline compilation mode.
@@ -173,8 +160,7 @@ public:
 
   // Generate pipeline module
   bool generate(std::unique_ptr<llvm::Module> pipelineModule, llvm::raw_pwrite_stream &outStream,
-                CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers,
-                bool newPassManager) override final;
+                CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers) override final;
 
   // Create an ELF linker object for linking unlinked shader/part-pipeline ELFs into a pipeline ELF using the
   // pipeline state
@@ -201,6 +187,9 @@ public:
   // -----------------------------------------------------------------------------------------------------------------
   // Other methods
 
+  // Set shader stage mask
+  void setShaderStageMask(unsigned mask) { m_stageMask = mask; }
+
   // Get the embedded ShaderModes object
   ShaderModes *getShaderModes() { return &m_shaderModes; }
 
@@ -224,10 +213,10 @@ public:
   void record(llvm::Module *module);
 
   // Accessors for shader stage mask
-  unsigned getShaderStageMask() const { return m_stageMask; }
+  unsigned getShaderStageMask();
   bool getPreRasterHasGs() const { return m_preRasterHasGs; }
-  bool hasShaderStage(ShaderStage stage) const { return (getShaderStageMask() >> stage) & 1; }
-  bool isGraphics() const;
+  bool hasShaderStage(ShaderStage stage) { return (getShaderStageMask() >> stage) & 1; }
+  bool isGraphics();
   bool isComputeLibrary() const { return m_computeLibrary; }
   ShaderStage getLastVertexProcessingStage() const;
   ShaderStage getPrevShaderStage(ShaderStage shaderStage) const;
@@ -282,6 +271,9 @@ public:
   // ring is on-chip.
   bool isGsOnChip() const { return m_gsOnChip; }
 
+  // Determine whether can use tessellation factor optimization
+  bool canOptimizeTessFactor();
+
   // Gets wave size for the specified shader stage
   unsigned getShaderWaveSize(ShaderStage stage);
   // Gets wave size for the merged shader stage
@@ -298,6 +290,9 @@ public:
     m_waveSize[stage] = waveSize;
   }
 
+  // Whether WGP mode is enabled for the given shader stage
+  bool getShaderWgpMode(ShaderStage stage) const;
+
   // Get NGG control settings
   NggControl *getNggControl() { return &m_nggControl; }
 
@@ -306,6 +301,9 @@ public:
 
   // Checks if row export for mesh shader is enabled or not
   bool enableMeshRowExport() const;
+
+  // Checks if SW-emulated stream-out should be enabled
+  bool enableSwXfb();
 
   // Gets resource usage of the specified shader stage
   ResourceUsage *getShaderResourceUsage(ShaderStage shaderStage);
@@ -354,6 +352,32 @@ public:
 
   // Get name of built-in
   static llvm::StringRef getBuiltInName(BuiltInKind builtIn);
+
+  // Set transform feedback state metadata
+  void setXfbStateMetadata(llvm::Module *module);
+
+  // Get XFB state metadata
+  const XfbStateMetadata &getXfbStateMetadata() const { return m_xfbStateMetadata; }
+
+  // Get XFB state metadata
+  XfbStateMetadata &getXfbStateMetadata() { return m_xfbStateMetadata; }
+
+  // Check if transform feedback is active
+  bool enableXfb() const { return m_xfbStateMetadata.enableXfb; }
+
+  // Get transform feedback strides
+  const std::array<unsigned, MaxTransformFeedbackBuffers> &getXfbBufferStrides() const {
+    return m_xfbStateMetadata.xfbStrides;
+  }
+
+  // Get transform feedback strides
+  std::array<unsigned, MaxTransformFeedbackBuffers> &getXfbBufferStrides() { return m_xfbStateMetadata.xfbStrides; }
+
+  // Get transform feedback buffers used for each stream
+  const std::array<int, MaxGsStreams> &getStreamXfbBuffers() const { return m_xfbStateMetadata.streamXfbBuffers; }
+
+  // Get transform feedback buffers used for each stream
+  std::array<int, MaxGsStreams> &getStreamXfbBuffers() { return m_xfbStateMetadata.streamXfbBuffers; }
 
   // -----------------------------------------------------------------------------------------------------------------
   // Utility method templates to read and write IR metadata, used by PipelineState and ShaderModes
@@ -434,17 +458,6 @@ public:
   }
 
 private:
-  // NOTE: These two functions are temporarily used to generate pipeline modules
-  // with and without using the new pass manager. Once the switch to the new pass
-  // manager is done, these functions will be removed and we'll use a single
-  // generate function.
-  // Generate pipeline module
-  void generateWithNewPassManager(std::unique_ptr<llvm::Module> pipelineModule, llvm::raw_pwrite_stream &outStream,
-                                  CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers);
-  // Generate pipeline module
-  void generateWithLegacyPassManager(std::unique_ptr<llvm::Module> pipelineModule, llvm::raw_pwrite_stream &outStream,
-                                     CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers);
-
   // Read shaderStageMask from IR
   void readShaderStageMask(llvm::Module *module);
 
@@ -479,8 +492,8 @@ private:
   void recordGraphicsState(llvm::Module *module);
   void readGraphicsState(llvm::Module *module);
 
-  std::string m_lastError;   // Error to be reported by getLastError()
-  bool m_emitLgc = false;    // Whether -emit-lgc is on
+  std::string m_lastError; // Error to be reported by getLastError()
+  bool m_emitLgc = false;  // Whether -emit-lgc is on
   // Whether generating pipeline or unlinked part-pipeline
   PipelineLink m_pipelineLink = PipelineLink::WholePipeline;
   unsigned m_stageMask = 0;                             // Mask of active shader stages
@@ -514,6 +527,7 @@ private:
   unsigned m_subgroupSize[ShaderStageCountInternal] = {};                      // Per-shader subgroup size
   bool m_inputPackState[ShaderStageGfxCount] = {};  // The input packable state per shader stage
   bool m_outputPackState[ShaderStageGfxCount] = {}; // The output packable state per shader stage
+  XfbStateMetadata m_xfbStateMetadata = {};         // Transform feedback state metadata
 };
 
 // =====================================================================================================================
@@ -540,28 +554,6 @@ public:
   PipelineStateWrapper(PipelineState *pipelineState);
   Result run(llvm::Module &module, llvm::ModuleAnalysisManager &);
   static llvm::AnalysisKey Key; // NOLINT
-
-private:
-  LgcContext *m_builderContext = nullptr;                  // LgcContext for allocating PipelineState
-  PipelineState *m_pipelineState = nullptr;                // Cached pipeline state
-  std::unique_ptr<PipelineState> m_allocatedPipelineState; // Pipeline state allocated by this pass
-};
-
-// =====================================================================================================================
-// Wrapper pass for the pipeline state in the middle-end
-class LegacyPipelineStateWrapper : public llvm::ImmutablePass {
-public:
-  LegacyPipelineStateWrapper(LgcContext *builderContext = nullptr);
-
-  bool doFinalization(llvm::Module &module) override;
-
-  // Get (create if necessary) the PipelineState from this wrapper pass.
-  PipelineState *getPipelineState(llvm::Module *module);
-
-  // Set the PipelineState.
-  void setPipelineState(PipelineState *pipelineState) { m_pipelineState = pipelineState; }
-
-  static char ID; // ID of this pass
 
 private:
   LgcContext *m_builderContext = nullptr;                  // LgcContext for allocating PipelineState

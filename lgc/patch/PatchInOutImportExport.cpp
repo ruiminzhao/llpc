@@ -51,27 +51,9 @@ using namespace lgc;
 namespace lgc {
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacyPatchInOutImportExport::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of LLVM patching operations for input import and output export
-ModulePass *createLegacyPatchInOutImportExport() {
-  return new LegacyPatchInOutImportExport();
-}
-
-// =====================================================================================================================
 PatchInOutImportExport::PatchInOutImportExport() : m_lds(nullptr) {
   memset(&m_gfxIp, 0, sizeof(m_gfxIp));
   initPerShader();
-}
-
-// =====================================================================================================================
-LegacyPatchInOutImportExport::LegacyPatchInOutImportExport() : ModulePass(ID) {
-}
-
-// =====================================================================================================================
-LegacyPatchInOutImportExport::~LegacyPatchInOutImportExport() {
 }
 
 // =====================================================================================================================
@@ -85,23 +67,10 @@ void PatchInOutImportExport::initPerShader() {
   m_sampleMask = nullptr;
   m_viewportIndex = nullptr;
   m_layer = nullptr;
+  m_viewIndex = nullptr;
   m_threadId = nullptr;
 
   m_attribExports.clear();
-}
-
-// =====================================================================================================================
-// Executes this LLVM patching pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPatchInOutImportExport::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  PipelineShadersResult &pipelineShaders = getAnalysis<LegacyPipelineShaders>().getResult();
-  auto getPDT = [&](Function &f) -> PostDominatorTree & {
-    return getAnalysis<PostDominatorTreeWrapperPass>(f).getPostDomTree();
-  };
-  return m_impl.runImpl(module, pipelineShaders, pipelineState, getPDT);
 }
 
 // =====================================================================================================================
@@ -172,6 +141,12 @@ bool PatchInOutImportExport::runImpl(Module &module, PipelineShadersResult &pipe
       BUF_FORMAT_32_32_32_FLOAT_GFX10,
       BUF_FORMAT_32_32_32_32_FLOAT_GFX10,
   };
+  static const std::array<unsigned char, 4> BufferFormatsGfx11 = {
+      BUF_FORMAT_32_FLOAT,
+      BUF_FORMAT_32_32_FLOAT_GFX11,
+      BUF_FORMAT_32_32_32_FLOAT_GFX11,
+      BUF_FORMAT_32_32_32_32_FLOAT_GFX11,
+  };
 
   switch (m_gfxIp.major) {
   default:
@@ -179,6 +154,9 @@ bool PatchInOutImportExport::runImpl(Module &module, PipelineShadersResult &pipe
     break;
   case 10:
     m_buffFormats = &BufferFormatsGfx10;
+    break;
+  case 11:
+    m_buffFormats = &BufferFormatsGfx11;
     break;
   }
 
@@ -189,8 +167,6 @@ bool PatchInOutImportExport::runImpl(Module &module, PipelineShadersResult &pipe
     if (entryPoint) {
       processFunction(*entryPoint, static_cast<ShaderStage>(shaderStage), inputCallees, otherCallees,
                       getPostDominatorTree);
-      if (shaderStage == ShaderStageTessControl)
-        storeTessFactors();
     }
   }
 
@@ -306,7 +282,7 @@ void PatchInOutImportExport::processShader() {
   bool useThreadId = (m_hasGs && (m_pipelineState->isGsOnChip() || m_gfxIp.major >= 9));
 
   // Thread ID will also be used for stream-out buffer export
-  const bool enableXfb = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage.enableXfb;
+  const bool enableXfb = m_pipelineState->enableXfb();
   useThreadId = useThreadId || enableXfb;
 
   if (useThreadId) {
@@ -332,9 +308,9 @@ void PatchInOutImportExport::processShader() {
       // On-chip  | Input Patch | Output Patch | Patch Const | Tess Factor | (LDS)
       //          +-------------+--------------+-------------+-------------+
       //
-      //          +-------------+-------------+
-      // Off-chip | Input Patch | Tess Factor | (LDS)
-      //          +-------------+-------------+
+      //          +-------------+-------------+----------------+------------------+
+      // Off-chip | Input Patch | Tess Factor | HS Patch Count | Special TF Value | (LDS)
+      //          +-------------+-------------+----------------+------------------+
       //          +--------------+-------------+
       //          | Output Patch | Patch Const | (LDS Buffer)
       //          +--------------+-------------+
@@ -408,8 +384,29 @@ void PatchInOutImportExport::processShader() {
       }
 
       calcFactor.tessFactorStride = tessFactorStride;
-
       calcFactor.tessOnChipLdsSize = calcFactor.onChip.tessFactorStart + tessFactorTotalSize;
+
+      if (m_pipelineState->canOptimizeTessFactor()) {
+        //
+        // NOTE: If we are going to optimize TF store, we need additional on-chip LDS size. The required size is
+        // 2 dwords per HS wave (1 dword all-ones flag and 1 dword all-zeros flag) plus an extra dword to count
+        // actual HS patches. The layout is as follow:
+        //
+        // +----------------+--------+--------+-----+--------+--------+
+        // | HS Patch Count | All 1s | All 0s | ... | All 1s | All 0s |
+        // +----------------+--------+--------+-----+--------+--------+
+        //                  |<---- Wave 0 --->|     |<---- Wave N --->|
+        //
+        assert(m_gfxIp.major >= 11);
+        calcFactor.onChip.hsPatchCountStart = calcFactor.tessOnChipLdsSize; // One dword to store actual HS wave count
+        calcFactor.onChip.specialTfValueStart = calcFactor.onChip.hsPatchCountStart + 1;
+
+        const unsigned maxNumHsWaves =
+            Gfx9::MaxHsThreadsPerSubgroup / m_pipelineState->getMergedShaderWaveSize(ShaderStageTessControl);
+        calcFactor.specialTfValueSize = maxNumHsWaves * 2;
+
+        calcFactor.tessOnChipLdsSize += 1 + calcFactor.specialTfValueSize;
+      }
 
 #if VKI_RAY_TRACING
       // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
@@ -448,6 +445,12 @@ void PatchInOutImportExport::processShader() {
       LLPC_OUTS("\n");
       LLPC_OUTS("Tess factor start: " << calcFactor.onChip.tessFactorStart << " (LDS)\n");
       LLPC_OUTS("Tess factor total size (in dwords): " << tessFactorTotalSize << "\n");
+      LLPC_OUTS("\n");
+      LLPC_OUTS("HS patch count start: " << calcFactor.onChip.hsPatchCountStart << " (LDS)\n");
+      LLPC_OUTS("HS wave count size (in dwords): " << 1 << "\n");
+      LLPC_OUTS("\n");
+      LLPC_OUTS("Special TF value start: " << calcFactor.onChip.specialTfValueStart << " (LDS)\n");
+      LLPC_OUTS("Special TF value size (in dwords): " << calcFactor.specialTfValueSize << "\n");
       LLPC_OUTS("\n");
       LLPC_OUTS("Tess factor stride: " << tessFactorStride << " (");
       switch (m_pipelineState->getShaderModes()->getTessellationMode().primitiveMode) {
@@ -599,10 +602,9 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       const unsigned builtInId = value;
 
       switch (m_shaderStage) {
-      case ShaderStageVertex: {
-        input = patchVsBuiltInInputImport(inputTy, builtInId, builder);
+      case ShaderStageVertex:
+        // Nothing to do
         break;
-      }
       case ShaderStageTessControl: {
         // Builtin Call has different number of operands
         Value *elemIdx = nullptr;
@@ -710,16 +712,18 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
               if (locInfoMapIt == resUsage->inOutUsage.inputLocInfoMap.end()) {
                 // Try the key as the plain location
                 origLocInfo.setComponent(0);
-                locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
                 hasDynIndex = true;
               }
-            } else {
-              locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
             }
           } else {
             origLocInfo.setComponent(cast<ConstantInt>(callInst.getOperand(elemIdxArgIdx))->getZExtValue());
-            locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
+            if (m_shaderStage == ShaderStageFragment && isInterpolantInputImport) {
+              const unsigned interpMode = cast<ConstantInt>(callInst.getOperand(3))->getZExtValue();
+              origLocInfo.setFlat(interpMode == InOutInfo::InterpModeFlat);
+              origLocInfo.setCustom(interpMode == InOutInfo::InterpModeCustom);
+            }
           }
+          locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
           assert(locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end());
 
           loc = locInfoMapIt->second.getLocation();
@@ -1093,25 +1097,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
   } else {
     // Other calls relevant to input/output import/export
     if (callee->isIntrinsic() && callee->getIntrinsicID() == Intrinsic::amdgcn_s_sendmsg) {
-      // NOTE: Implicitly store the value of gl_ViewIndex to GS-VS ring buffer before emit calls.
-      if (m_pipelineState->getInputAssemblyState().enableMultiView) {
-        assert(m_shaderStage == ShaderStageGeometry); // Must be geometry shader
-
-        auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageGeometry)->entryArgIdxs.gs;
-        auto viewIndex = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
-
-        auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
-        const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
-
-        assert(builtInOutLocMap.find(BuiltInViewIndex) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap.find(BuiltInViewIndex)->second;
-
-        auto rasterStream = resUsage->inOutUsage.gs.rasterStream;
-        storeValueToGsVsRing(viewIndex, loc, 0, rasterStream, &callInst);
-      }
-
       unsigned emitStream = InvalidValue;
-
       uint64_t message = cast<ConstantInt>(callInst.getArgOperand(0))->getZExtValue();
       if (message == GsEmitStreaM0 || message == GsEmitStreaM1 || message == GsEmitStreaM2 ||
           message == GsEmitStreaM3) {
@@ -1120,6 +1106,26 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       }
 
       if (emitStream != InvalidValue) {
+        assert(m_shaderStage == ShaderStageGeometry); // Must be geometry shader
+
+        // NOTE: Implicitly store the value of view index to GS-VS ring buffer for raster stream if multi-view is
+        // enabled. Copy shader will read the value from GS-VS ring and export it to vertex position data.
+        if (m_pipelineState->getInputAssemblyState().enableMultiView) {
+          auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
+          auto rasterStream = resUsage->inOutUsage.gs.rasterStream;
+
+          if (emitStream == rasterStream) {
+            auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageGeometry)->entryArgIdxs.gs;
+            auto viewIndex = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+
+            const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+            assert(builtInOutLocMap.find(BuiltInViewIndex) != builtInOutLocMap.end());
+            unsigned loc = builtInOutLocMap.find(BuiltInViewIndex)->second;
+
+            storeValueToGsVsRing(viewIndex, loc, 0, rasterStream, &callInst);
+          }
+        }
+
         // Increment emit vertex counter
         auto emitCounterPair = m_pipelineSysValues.get(m_entryPoint)->getEmitCounterPtr();
         auto emitCounterTy = emitCounterPair.first;
@@ -1155,7 +1161,7 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
 
   Instruction *insertPos = &retInst;
 
-  const bool enableXfb = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage.enableXfb;
+  const bool enableXfb = m_pipelineState->enableXfb();
   if (m_shaderStage == ShaderStageCopyShader && enableXfb) {
     if (!m_pipelineState->getNggControl()->enableNgg) {
       // NOTE: For copy shader, if transform feedback is enabled for multiple streams, the following processing doesn't
@@ -1232,11 +1238,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
 
     auto &inOutUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage;
 
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-
     if (m_shaderStage == ShaderStageVertex) {
       auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex)->builtInUsage.vs;
-      auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageVertex)->entryArgIdxs.vs;
 
       usePosition = builtInUsage.position;
       usePointSize = builtInUsage.pointSize;
@@ -1246,14 +1249,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       useShadingRate = builtInUsage.primitiveShadingRate;
       clipDistanceCount = builtInUsage.clipDistance;
       cullDistanceCount = builtInUsage.cullDistance;
-
-      if (enableMultiView) {
-        // NOTE: If multi-view is enabled, the exported value of gl_Layer is from gl_ViewIndex.
-        m_layer = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
-      }
     } else if (m_shaderStage == ShaderStageTessEval) {
       auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval)->builtInUsage.tes;
-      auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTessEval)->entryArgIdxs.tes;
 
       usePosition = builtInUsage.position;
       usePointSize = builtInUsage.pointSize;
@@ -1262,11 +1259,6 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       useViewportIndex = builtInUsage.viewportIndex;
       clipDistanceCount = builtInUsage.clipDistance;
       cullDistanceCount = builtInUsage.cullDistance;
-
-      if (enableMultiView) {
-        // NOTE: If multi-view is enabled, the exported value of gl_Layer is from gl_ViewIndex.
-        m_layer = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
-      }
     } else {
       assert(m_shaderStage == ShaderStageCopyShader);
       auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageCopyShader)->builtInUsage.gs;
@@ -1281,19 +1273,23 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       cullDistanceCount = builtInUsage.cullDistance;
     }
 
-    useLayer = enableMultiView || useLayer;
+    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
+    if (enableMultiView) {
+      if (m_shaderStage == ShaderStageVertex) {
+        auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageVertex)->entryArgIdxs.vs;
+        m_viewIndex = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+      } else if (m_shaderStage == ShaderStageTessEval) {
+        auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTessEval)->entryArgIdxs.tes;
+        m_viewIndex = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+      } else {
+        assert(m_shaderStage == ShaderStageCopyShader);
+        assert(m_viewIndex); // Must have been explicitly loaded in copy shader
+      }
+    }
 
     const auto &builtInOutLocs =
         m_shaderStage == ShaderStageCopyShader ? inOutUsage.gs.builtInOutLocs : inOutUsage.builtInOutputLocMap;
     const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-    if (nextStage == ShaderStageFragment) {
-      useLayer |= nextBuiltInUsage.layer || nextBuiltInUsage.viewIndex;
-      if (useLayer && !m_layer) {
-        // Multi-view is disabled and vertex process stages don't use gl_ViewIndex/gl_Layer,
-        // but FS uses them, the value will be zero.
-        m_layer = ConstantInt::get(Type::getInt32Ty(*m_context), 0);
-      }
-    }
 
     // NOTE: If gl_Position is not present in this shader stage, we have to export a dummy one.
     if (!usePosition) {
@@ -1344,8 +1340,7 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
           clipCullDistance.push_back(undef);
       }
 
-      bool miscExport = usePointSize || useLayer || useViewportIndex;
-      miscExport |= useShadingRate;
+      bool miscExport = usePointSize || useLayer || useViewportIndex || useShadingRate || enableMultiView;
       // NOTE: When misc. export is present, gl_ClipDistance[] or gl_CullDistance[] should start from pos2.
       unsigned pos = miscExport ? EXP_TARGET_POS_2 : EXP_TARGET_POS_1;
       Value *args[] = {
@@ -1451,13 +1446,20 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       }
     }
 
-    if (m_gfxIp.major <= 8 && useLayer) {
-      assert(m_layer);
-      addExportInstForBuiltInOutput(m_layer, BuiltInLayer, insertPos);
+    if (m_gfxIp.major <= 8 && (useLayer || enableMultiView)) {
+      if (enableMultiView) {
+        assert(m_viewIndex);
+        addExportInstForBuiltInOutput(m_viewIndex, BuiltInViewIndex, insertPos);
+      }
+
+      if (useLayer) {
+        assert(m_layer);
+        addExportInstForBuiltInOutput(m_layer, BuiltInLayer, insertPos);
+      }
     }
 
     // Export gl_Layer and gl_ViewportIndex before entry-point returns
-    if (m_gfxIp.major >= 9 && (useLayer || useViewportIndex)) {
+    if (m_gfxIp.major >= 9 && (useLayer || useViewportIndex || enableMultiView)) {
       Value *viewportIndexAndLayer = ConstantInt::get(Type::getInt32Ty(*m_context), 0);
 
       if (useViewportIndex) {
@@ -1466,7 +1468,10 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
             m_viewportIndex, ConstantInt::get(Type::getInt32Ty(*m_context), 16), "", insertPos);
       }
 
-      if (useLayer) {
+      if (enableMultiView) {
+        assert(m_viewIndex);
+        viewportIndexAndLayer = BinaryOperator::CreateOr(viewportIndexAndLayer, m_viewIndex, "", insertPos);
+      } else if (useLayer) {
         assert(m_layer);
         viewportIndexAndLayer = BinaryOperator::CreateOr(viewportIndexAndLayer, m_layer, "", insertPos);
       }
@@ -1507,28 +1512,20 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
 
       // NOTE: We have to export gl_Layer via generic outputs as well.
       if (useLayer) {
+        bool hasLayerExport = true;
         if (nextStage == ShaderStageFragment) {
-          unsigned loc = InvalidValue;
-          Value *layer = nullptr;
+          hasLayerExport = nextBuiltInUsage.layer;
+        } else if (nextStage == ShaderStageInvalid) {
+          hasLayerExport = false;
+        }
 
-          if (nextBuiltInUsage.layer) {
-            assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
-            loc = builtInOutLocs.find(BuiltInLayer)->second;
+        if (hasLayerExport) {
+          assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
+          const unsigned loc = builtInOutLocs.find(BuiltInLayer)->second;
 
-            layer = new BitCastInst(m_layer, Type::getFloatTy(*m_context), "", insertPos);
-          }
+          Value *layer = new BitCastInst(m_layer, Type::getFloatTy(*m_context), "", insertPos);
 
-          if (nextBuiltInUsage.viewIndex) {
-            assert(builtInOutLocs.find(BuiltInViewIndex) != builtInOutLocs.end());
-            loc = builtInOutLocs.find(BuiltInViewIndex)->second;
-
-            if (enableMultiView)
-              layer = new BitCastInst(m_layer, Type::getFloatTy(*m_context), "", insertPos);
-            else
-              layer = ConstantFP::get(Type::getFloatTy(*m_context), 0.0f);
-          }
-          if (layer)
-            recordVertexAttribExport(loc, {layer, undef, undef, undef});
+          recordVertexAttribExport(loc, {layer, undef, undef, undef});
         }
       }
     }
@@ -1556,6 +1553,13 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
         inOutUsage.expCount = std::max(inOutUsage.expCount, newLoc + 1); // Update export count
       }
     }
+  } else if (m_shaderStage == ShaderStageTessControl) {
+    // NOTE: We will read back tessellation factors from on-chip LDS in later phases and write them to TF buffer.
+    // Add fence and barrier before the return instruction to make sure they have been stored already.
+    SyncScope::ID syncScope = m_context->getOrInsertSyncScopeID("workgroup");
+    new FenceInst(*m_context, AtomicOrdering::Release, syncScope, insertPos);
+    emitCall("llvm.amdgcn.s.barrier", Type::getVoidTy(*m_context), {}, {}, insertPos);
+    new FenceInst(*m_context, AtomicOrdering::Acquire, syncScope, insertPos);
   } else if (m_shaderStage == ShaderStageGeometry) {
     if (m_gfxIp.major >= 10) {
       // NOTE: Per programming guide, we should do a "s_waitcnt 0,0,0 + s_waitcnt_vscnt 0" before issuing a "done", so
@@ -1661,7 +1665,19 @@ Value *PatchInOutImportExport::performFsFloatInterpolation(BuilderBase &builder,
                                                            Value *coordI, Value *coordJ, Value *primMask) {
   Value *result = nullptr;
   Attribute::AttrKind attribs[] = {Attribute::ReadNone};
-  {
+  if (m_gfxIp.major >= 11) {
+    // llvm.amdgcn.lds.param.load(attr_channel, attr, m0)
+    Value *param =
+        builder.CreateNamedCall("llvm.amdgcn.lds.param.load", builder.getFloatTy(), {channel, attr, primMask}, attribs);
+
+    // tmp = llvm.amdgcn.interp.inreg.p10(p10, coordI, p0)
+    result =
+        builder.CreateNamedCall("llvm.amdgcn.interp.inreg.p10", builder.getFloatTy(), {param, coordI, param}, attribs);
+
+    // llvm.amdgcn.interp.inreg.p2(p20, coordJ, tmp)
+    result =
+        builder.CreateNamedCall("llvm.amdgcn.interp.inreg.p2", builder.getFloatTy(), {param, coordJ, result}, attribs);
+  } else {
     // llvm.amdgcn.interp.p1(coordI, attr_channel, attr, m0)
     result = builder.CreateNamedCall("llvm.amdgcn.interp.p1", builder.getFloatTy(), {coordI, channel, attr, primMask},
                                      attribs);
@@ -1688,7 +1704,19 @@ Value *PatchInOutImportExport::performFsHalfInterpolation(BuilderBase &builder, 
                                                           Value *highHalf) {
   Value *result = nullptr;
   Attribute::AttrKind attribs[] = {Attribute::ReadNone};
-  {
+  if (m_gfxIp.major >= 11) {
+    // llvm.amdgcn.lds.param.load(attr_channel, attr, m0)
+    Value *param =
+        builder.CreateNamedCall("llvm.amdgcn.lds.param.load", builder.getFloatTy(), {channel, attr, primMask}, attribs);
+
+    // tmp = llvm.amdgcn.interp.inreg.p10.f16(p10, coordI, p0, highHalf)
+    result = builder.CreateNamedCall("llvm.amdgcn.interp.inreg.p10.f16", builder.getFloatTy(),
+                                     {param, coordI, param, highHalf}, attribs);
+
+    // llvm.amdgcn.interp.inreg.p2.f16(p20, coordJ, tmp, highHalf)
+    result = builder.CreateNamedCall("llvm.amdgcn.interp.inreg.p2.f16", builder.getHalfTy(),
+                                     {param, coordJ, result, highHalf}, attribs);
+  } else {
     // llvm.amdgcn.interp.p1.f16(coordI, attr_channel, attr, highhalf, m0)
     result = builder.CreateNamedCall("llvm.amdgcn.interp.p1.f16", builder.getFloatTy(),
                                      {coordI, channel, attr, highHalf, primMask}, attribs);
@@ -1715,7 +1743,27 @@ Value *PatchInOutImportExport::performFsParameterLoad(BuilderBase &builder, Valu
                                                       bool highHalf) {
   Value *compValue = nullptr;
 
-  {
+  if (m_gfxIp.major >= 11) {
+    // llvm.amdgcn.lds.param.load(attr_channel, attr, m0)
+    compValue = builder.CreateNamedCall("llvm.amdgcn.lds.param.load", builder.getFloatTy(), {channel, attr, primMask},
+                                        {Attribute::ReadNone});
+    DppCtrl dppCtrl;
+    if (interpParam == INTERP_PARAM_P0)
+      dppCtrl = DppCtrl::DppQuadPerm0000;
+    else if (interpParam == INTERP_PARAM_P10)
+      dppCtrl = DppCtrl::DppQuadPerm1111;
+    else
+      dppCtrl = DppCtrl::DppQuadPerm2222;
+
+    compValue = builder.CreateBitCast(compValue, builder.getInt32Ty());
+    compValue = builder.CreateIntrinsic(Intrinsic::amdgcn_mov_dpp, builder.getInt32Ty(),
+                                        {compValue, builder.getInt32(static_cast<unsigned>(dppCtrl)),
+                                         builder.getInt32(15), builder.getInt32(15), builder.getTrue()});
+    // NOTE: Make mov_dpp and its source instructions run in WQM to make sure the mov_dpp could fetch
+    // correct data from possible inactive lanes.
+    compValue = builder.CreateIntrinsic(Intrinsic::amdgcn_wqm, builder.getInt32Ty(), compValue);
+    compValue = builder.CreateBitCast(compValue, builder.getFloatTy());
+  } else {
     Value *args[] = {
         builder.getInt32(interpParam), // param
         channel,                       // attr_chan
@@ -2071,30 +2119,6 @@ void PatchInOutImportExport::patchMeshGenericOutputExport(Value *output, unsigne
 }
 
 // =====================================================================================================================
-// Patches import calls for built-in inputs of vertex shader.
-//
-// @param inputTy : Type of input value
-// @param builtInId : ID of the built-in variable
-// @param builder : The IR builder to create and insert IR instruction
-Value *PatchInOutImportExport::patchVsBuiltInInputImport(Type *inputTy, unsigned builtInId, BuilderBase &builder) {
-  auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageVertex)->entryArgIdxs.vs;
-
-  switch (builtInId) {
-  // BuiltInVertexIndex, BuiltInInstanceIndex, BuiltInBaseVertex, BuiltInBaseInstance, BuiltInDrawIndex
-  // now handled in InOutBuilder.
-  case BuiltInViewIndex: {
-    if (m_pipelineState->getInputAssemblyState().enableMultiView) {
-      return getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
-    }
-    return builder.getInt32(0);
-  }
-  default:
-    llvm_unreachable("Should never be called!");
-    return UndefValue::get(inputTy);
-  }
-}
-
-// =====================================================================================================================
 // Patches import calls for built-in inputs of tessellation control shader.
 //
 // @param inputTy : Type of input value
@@ -2167,7 +2191,10 @@ Value *PatchInOutImportExport::patchTcsBuiltInInputImport(Type *inputTy, unsigne
     break;
   }
   case BuiltInViewIndex: {
-    input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    if (m_pipelineState->getInputAssemblyState().enableMultiView)
+      input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    else
+      input = builder.getInt32(0);
     break;
   }
   default: {
@@ -2290,7 +2317,10 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
     break;
   }
   case BuiltInViewIndex: {
-    input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    if (m_pipelineState->getInputAssemblyState().enableMultiView)
+      input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    else
+      input = builder.getInt32(0);
     break;
   }
   default: {
@@ -2336,7 +2366,10 @@ Value *PatchInOutImportExport::patchGsBuiltInInputImport(Type *inputTy, unsigned
     break;
   }
   case BuiltInViewIndex: {
-    input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    if (m_pipelineState->getInputAssemblyState().enableMultiView)
+      input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    else
+      input = builder.getInt32(0);
     break;
   }
   // Handle internal-use built-ins
@@ -2536,10 +2569,16 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     input = builder.CreateNot(input);
     break;
   }
+  case BuiltInViewIndex: {
+    if (m_pipelineState->getInputAssemblyState().enableMultiView)
+      input = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
+    else
+      input = builder.getInt32(0);
+    break;
+  }
   case BuiltInPrimitiveId:
   case BuiltInLayer:
-  case BuiltInViewportIndex:
-  case BuiltInViewIndex: {
+  case BuiltInViewportIndex: {
     unsigned loc = InvalidValue;
     const auto prevStage = m_pipelineState->getPrevShaderStage(ShaderStageFragment);
 
@@ -2554,8 +2593,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
       loc = inOutUsage.builtInInputLocMap[builtInId];
     }
 
-    // Emulation for "in int gl_PrimitiveID" or "in int gl_Layer" or "in int gl_ViewportIndex"
-    // or "in int gl_ViewIndex".
+    // Emulation for "in int gl_PrimitiveID" or "in int gl_Layer" or "in int gl_ViewportIndex".
     input = patchFsGenericInputImport(inputTy, loc, nullptr, nullptr, isPerPrimitive, InOutInfo::InterpModeFlat,
                                       nullptr, false, builder);
     break;
@@ -2939,7 +2977,12 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
   case BuiltInLayer: {
     if (!static_cast<bool>(builtInUsage.layer))
       return;
-    m_layer = output;
+
+    // NOTE: Only last vertex processing shader stage has to export the value of gl_Layer.
+    if (!m_hasTs && !m_hasGs) {
+      // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
+      m_layer = output;
+    }
 
     break;
   }
@@ -2947,7 +2990,7 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
     if (!static_cast<bool>(builtInUsage.viewportIndex))
       return;
 
-    // NOTE: Only last non-fragment shader stage has to export the value of gl_ViewportIndex.
+    // NOTE: Only last vertex processing shader stage has to export the value of gl_ViewportIndex.
     if (!m_hasTs && !m_hasGs) {
       if (m_gfxIp.major <= 8)
         addExportInstForBuiltInOutput(output, builtInId, insertPos);
@@ -2996,6 +3039,7 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
   const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
   const auto &builtInUsage = resUsage->builtInUsage.tcs;
   const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto &perPatchBuiltInOutLocMap = resUsage->inOutUsage.perPatchBuiltInOutputLocMap;
 
   switch (builtInId) {
   case BuiltInPosition:
@@ -3042,28 +3086,47 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
   }
   case BuiltInTessLevelOuter:
   case BuiltInTessLevelInner: {
-    const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
     auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
 
     // tessLevelOuter (float[4]) + tessLevelInner (float[2])
     // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + elemIdx
-    uint32_t tessFactorStart = calcFactor.onChip.tessFactorStart;
+    uint32_t tessFactorStart = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)
+                                   ->inOutUsage.tcs.calcFactor.onChip.tessFactorStart;
     if (builtInId == BuiltInTessLevelInner)
       tessFactorStart += 4;
 
+    // Write tessellation factors to on-chip LDS for later TF buffer store
     Value *baseOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
     if (outputTy->isArrayTy()) {
-      // Export the whole tessLevelOuter array
+      // Handle the whole tessLevelOuter array
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
         Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart + i));
         auto elem = builder.CreateExtractValue(output, {i});
         writeValueToLds(false, elem, ldsOffset, builder);
       }
     } else {
-      // Export a single element of tessLevelOuter array
+      // Handle a single element of tessLevelOuter array
       Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart));
       ldsOffset = builder.CreateAdd(ldsOffset, elemIdx, "", insertPos);
       writeValueToLds(false, output, ldsOffset, builder);
+    }
+
+    // Write tessellation factors for TES to read if needed
+    if (perPatchBuiltInOutLocMap.find(builtInId) != perPatchBuiltInOutLocMap.end()) {
+      unsigned loc = perPatchBuiltInOutLocMap.find(builtInId)->second;
+
+      if (outputTy->isArrayTy()) {
+        // Handle the whole tessLevelOuter array
+        for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
+          auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, builder.getInt32(i), nullptr, builder);
+          auto elem = builder.CreateExtractValue(output, {i});
+          writeValueToLds(m_pipelineState->isTessOffChip(), elem, ldsOffset, builder);
+        }
+      } else {
+        // Handle a single element of tessLevelOuter array
+        auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, nullptr, builder);
+        writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
+      }
     }
 
     break;
@@ -3092,7 +3155,9 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
   case BuiltInClipDistance:
   case BuiltInCullDistance: {
     if ((builtInId == BuiltInPosition && !builtInUsage.position) ||
-        (builtInId == BuiltInPointSize && !builtInUsage.pointSize))
+        (builtInId == BuiltInPointSize && !builtInUsage.pointSize) ||
+        (builtInId == BuiltInClipDistance && builtInUsage.clipDistance == 0) ||
+        (builtInId == BuiltInCullDistance && builtInUsage.cullDistance == 0))
       return;
 
     if (isa<UndefValue>(output)) {
@@ -3146,10 +3211,8 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
     if (!static_cast<bool>(builtInUsage.layer))
       return;
 
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-
-    // NOTE: Only last non-fragment shader stage has to export the value of gl_Layer.
-    if (!m_hasGs && !static_cast<bool>(enableMultiView)) {
+    // NOTE: Only last vertex processing shader stage has to export the value of gl_Layer.
+    if (!m_hasGs) {
       // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
       m_layer = output;
     }
@@ -3160,7 +3223,7 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
     if (!static_cast<bool>(builtInUsage.viewportIndex))
       return;
 
-    // NOTE: Only last non-fragment shader stage has to export the value of gl_ViewportIndex.
+    // NOTE: Only last vertex processing shader stage has to export the value of gl_ViewportIndex.
     if (!m_hasGs) {
       if (m_gfxIp.major <= 8)
         addExportInstForBuiltInOutput(output, builtInId, insertPos);
@@ -3411,7 +3474,11 @@ void PatchInOutImportExport::patchCopyShaderBuiltInOutputExport(Value *output, u
   case BuiltInLayer: {
     // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
     m_layer = output;
-
+    break;
+  }
+  case BuiltInViewIndex: {
+    // NOTE: The export of gl_ViewIndex is delayed and is done before entry-point returns.
+    m_viewIndex = output;
     break;
   }
   case BuiltInViewportIndex: {
@@ -3453,7 +3520,7 @@ void PatchInOutImportExport::patchXfbOutputExport(Value *output, unsigned xfbBuf
 
   Value *streamOutBufDesc = m_pipelineSysValues.get(m_entryPoint)->getStreamOutBufDesc(xfbBuffer);
 
-  const auto &xfbStrides = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage.xfbStrides;
+  const auto &xfbStrides = m_pipelineState->getXfbBufferStrides();
   unsigned xfbStride = xfbStrides[xfbBuffer];
 
   auto outputTy = output->getType();
@@ -3468,6 +3535,36 @@ void PatchInOutImportExport::patchXfbOutputExport(Value *output, unsigned xfbBuf
     output = new BitCastInst(output, outputTy, "", insertPos);
   }
   assert(bitWidth == 16 || bitWidth == 32);
+
+  if (m_pipelineState->enableSwXfb() && m_shaderStage == ShaderStageCopyShader) {
+    // NOTE: For NGG, importing GS output from GS-VS ring is represented by a call and the call is replaced with
+    // real instructions when when NGG primitive shader is generated.
+    if (compCount > 4) {
+      CallInst *importCall = cast<CallInst>(output);
+      assert(importCall != nullptr);
+      unsigned location = cast<ConstantInt>(importCall->getArgOperand(0))->getZExtValue();
+
+      // vecX -> vec4 + vec(X - 4)
+      assert(compCount <= 8);
+      Type *loadTy = FixedVectorType::get(Type::getFloatTy(*m_context), 4);
+      Value *args[] = {ConstantInt::get(Type::getInt32Ty(*m_context), location),
+                       ConstantInt::get(Type::getInt32Ty(*m_context), streamId)};
+      output = emitCall(lgcName::NggGsOutputImport + getTypeName(loadTy), loadTy, args,
+                        {Attribute::Speculatable, Attribute::ReadOnly, Attribute::WillReturn}, insertPos);
+      storeValueToStreamOutBuffer(output, xfbBuffer, xfbOffset, xfbStride, streamId, streamOutBufDesc, insertPos);
+
+      loadTy = FixedVectorType::get(Type::getFloatTy(*m_context), (compCount - 4));
+      args[0] = ConstantInt::get(Type::getInt32Ty(*m_context), location + 1);
+      output = emitCall(lgcName::NggGsOutputImport + getTypeName(loadTy), loadTy, args,
+                        {Attribute::Speculatable, Attribute::ReadOnly, Attribute::WillReturn}, insertPos);
+      storeValueToStreamOutBuffer(output, xfbBuffer, xfbOffset + 4 * bitWidth / 8, xfbStride, streamId,
+                                  streamOutBufDesc, insertPos);
+    } else {
+      storeValueToStreamOutBuffer(output, xfbBuffer, xfbOffset, xfbStride, streamId, streamOutBufDesc, insertPos);
+    }
+
+    return;
+  }
 
   if (compCount == 8) {
     // vec8 -> vec4 + vec4
@@ -3635,6 +3732,17 @@ void PatchInOutImportExport::createStreamOutBufferStoreFunction(Value *storeValu
     format = formatTable[compCount - 1][bitWidth == 32];
     break;
   }
+  case 11: {
+    static unsigned char formatTable[5][2] = {
+        {},
+        {BUF_FORMAT_16_FLOAT, BUF_FORMAT_32_FLOAT},
+        {BUF_FORMAT_16_16_FLOAT, BUF_FORMAT_32_32_FLOAT_GFX11},
+        {},
+        {BUF_FORMAT_16_16_16_16_FLOAT_GFX11, BUF_FORMAT_32_32_32_32_FLOAT_GFX11},
+    };
+    format = formatTable[compCount][bitWidth == 32];
+    break;
+  }
   }
 
   // byteOffset = streamOffsets[xfbBuffer] * 4 +
@@ -3787,6 +3895,20 @@ unsigned PatchInOutImportExport::combineBufferLoad(std::vector<Value *> &loadVal
 void PatchInOutImportExport::storeValueToStreamOutBuffer(Value *storeValue, unsigned xfbBuffer, unsigned xfbOffset,
                                                          unsigned xfbStride, unsigned streamId, Value *streamOutBufDesc,
                                                          Instruction *insertPos) {
+  if (m_pipelineState->enableSwXfb()) {
+    // NOTE: For GFX11+, exporting transform feedback outputs is represented by a call and the call is replaced with
+    // real instructions when when NGG primitive shader is generated.
+    auto xfbBufOffset = m_pipelineSysValues.get(m_entryPoint)->getStreamOutBufOffset(xfbBuffer);
+    Value *args[] = {streamOutBufDesc,
+                     xfbBufOffset,
+                     ConstantInt::get(Type::getInt32Ty(*m_context), xfbBuffer),
+                     ConstantInt::get(Type::getInt32Ty(*m_context), xfbOffset),
+                     ConstantInt::get(Type::getInt32Ty(*m_context), streamId),
+                     storeValue};
+    std::string callName = lgcName::NggXfbOutputExport + getTypeName(storeValue->getType());
+    emitCall(callName, Type::getVoidTy(*m_context), args, {}, insertPos);
+    return;
+  }
 
   auto storeTy = storeValue->getType();
 
@@ -3842,11 +3964,11 @@ void PatchInOutImportExport::storeValueToStreamOutBuffer(Value *storeValue, unsi
     writeIndex = CopyShaderUserSgprIdxWriteIndex;
     streamInfo = CopyShaderUserSgprIdxStreamInfo;
 
-    const auto &inoutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage;
+    const auto &xfbStrides = m_pipelineState->getXfbBufferStrides();
     unsigned streamOffset = CopyShaderUserSgprIdxStreamOffset;
 
     for (unsigned i = 0; i < MaxTransformFeedbackBuffers; ++i) {
-      if (inoutUsage.xfbStrides[i] > 0)
+      if (xfbStrides[i] > 0)
         streamOffsets[i] = streamOffset++;
     }
   }
@@ -4356,6 +4478,9 @@ Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Valu
     else if (m_gfxIp.major == 10) {
       coherent.bits.glc = true;
       coherent.bits.dlc = true;
+    } else if (m_gfxIp.major == 11) {
+      // NOTE: dlc depends on MALL NOALLOC which isn't used by now.
+      coherent.bits.glc = true;
     } else
       llvm_unreachable("Not implemented!");
 
@@ -4745,6 +4870,15 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
   unsigned ldsSizePerPatch = inPatchSize + MaxTessFactorsPerPatch;
 
   unsigned ldsSizePerThreadGroup = m_pipelineState->getTargetInfo().getGpuProperty().ldsSizePerThreadGroup;
+  if (m_pipelineState->canOptimizeTessFactor()) {
+    // NOTE: If we are going to optimize TF store, we need additional on-chip LDS size. The required size is
+    // 2 dwords per HS wave (1 dword all-ones flag or 1 dword all-zeros flag) plus an extra dword to
+    // count actual HS patches.
+    assert(m_gfxIp.major >= 11);
+    const unsigned maxNumHsWaves =
+        Gfx9::MaxHsThreadsPerSubgroup / m_pipelineState->getMergedShaderWaveSize(ShaderStageTessControl);
+    ldsSizePerThreadGroup -= 1 + maxNumHsWaves * 2;
+  }
 #if VKI_RAY_TRACING
   ldsSizePerThreadGroup -= rayQueryLdsStackSize; // Exclude LDS space used as ray query stack
 #endif
@@ -4974,44 +5108,39 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
   case BuiltInLayer: {
     assert(m_gfxIp.major <= 8); // For GFX9, gl_ViewportIndex and gl_Layer are packed
 
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-
     Value *layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
 
-    Value *args[] = {
-        ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
-        ConstantInt::get(Type::getInt32Ty(*m_context), 0x4),              // en
-        undef,                                                            // src0
-        undef,                                                            // src1
-        layer,                                                            // src2
-        undef,                                                            // src3
-        ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
-        ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
-    };
-    emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
+    // NOTE: Only export gl_Layer when multi-view is disabled. Otherwise, we will export gl_ViewIndex to vertex position
+    // data.
+    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
+    if (!enableMultiView) {
+      Value *args[] = {
+          ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
+          ConstantInt::get(Type::getInt32Ty(*m_context), 0x4),              // en
+          undef,                                                            // src0
+          undef,                                                            // src1
+          layer,                                                            // src2
+          undef,                                                            // src3
+          ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
+          ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
+      };
+      emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
+    }
 
     // NOTE: We have to export gl_Layer via generic outputs as well.
+    bool hasLayerExport = true;
     if (nextStage == ShaderStageFragment) {
       const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-      unsigned loc = InvalidValue;
-      Value *layer = nullptr;
-      if (nextBuiltInUsage.layer) {
-        assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
-        loc = builtInOutLocs.find(BuiltInLayer)->second;
-        layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
-      }
+      hasLayerExport = nextBuiltInUsage.layer;
+    } else if (nextStage == ShaderStageInvalid) {
+      hasLayerExport = false;
+    }
 
-      if (nextBuiltInUsage.viewIndex) {
-        assert(builtInOutLocs.find(BuiltInViewIndex) != builtInOutLocs.end());
-        loc = builtInOutLocs.find(BuiltInViewIndex)->second;
+    if (hasLayerExport) {
+      assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
+      const unsigned loc = builtInOutLocs.find(BuiltInLayer)->second;
 
-        if (enableMultiView)
-          layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
-        else
-          layer = ConstantFP::get(Type::getFloatTy(*m_context), 0.0f);
-      }
-      if (layer)
-        recordVertexAttribExport(loc, {layer, undef, undef, undef});
+      recordVertexAttribExport(loc, {layer, undef, undef, undef});
     }
 
     break;
@@ -5036,7 +5165,6 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
     bool hasViewportIndexExport = true;
     if (nextStage == ShaderStageFragment) {
       const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-
       hasViewportIndexExport = nextBuiltInUsage.viewportIndex;
     } else if (nextStage == ShaderStageInvalid) {
       hasViewportIndexExport = false;
@@ -5048,6 +5176,25 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
 
       recordVertexAttribExport(loc, {viewportIndex, undef, undef, undef});
     }
+
+    break;
+  }
+  case BuiltInViewIndex: {
+    assert(m_gfxIp.major <= 8); // For GFX9, gl_ViewportIndex and gl_ViewIndex are packed
+
+    Value *viewIndex = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
+
+    Value *args[] = {
+        ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
+        ConstantInt::get(Type::getInt32Ty(*m_context), 0x4),              // en
+        undef,                                                            // src0
+        undef,                                                            // src1
+        viewIndex,                                                        // src2
+        undef,                                                            // src3
+        ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
+        ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
+    };
+    emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
 
     break;
   }
@@ -5468,7 +5615,7 @@ void PatchInOutImportExport::createSwizzleThreadGroupFunction() {
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::NoUnwind);
   func->addFnAttr(Attribute::AlwaysInline);
-  func->addFnAttr(Attribute::ReadNone);
+  func->setDoesNotAccessMemory();
   func->setLinkage(GlobalValue::InternalLinkage);
 
   auto argIt = func->arg_begin();
@@ -5719,7 +5866,37 @@ void PatchInOutImportExport::exportShadingRate(Value *shadingRate, Instruction *
 
   Value *hwShadingRate = nullptr;
 
-  {
+  if (m_gfxIp.major >= 11) {
+    // NOTE: In GFX11, the graphics pipeline is to support VRS rates till 4x4 which includes 2x4 and 4x2 along with
+    // the legacy rates. And 1x4 and 4x1 are not supported, hence clamp 1x4 and 4x1 to 1x2 and 2x1 respectively.
+    // The HW shading rate representations are as following:
+    //     SHADING_RATE_1x1    0x0
+    //     SHADING_RATE_1x2    0x1
+    //     SHADING_RATE_2x1    0x4
+    //     SHADING_RATE_2x2    0x5
+    //     SHADING_RATE_2x4    0x6
+    //     SHADING_RATE_4x2    0x9
+    //     SHADING_RATE_4x4    0xA
+    //
+    // [5:2] = HW rate enum
+    // hwShadingRate = shadingRate & (ShadingRateHorizontal2Pixels | ShadingRateHorizontal4Pixels |
+    //                                 ShadingRateVertical2Pixels | ShadingRateVertical4Pixels)
+    hwShadingRate =
+        builder.CreateAnd(shadingRate, builder.getInt32(ShadingRateHorizontal2Pixels | ShadingRateHorizontal4Pixels |
+                                                        ShadingRateVertical2Pixels | ShadingRateVertical4Pixels));
+
+    // hwShadingRate = hwShadingRate == 1x4 ? 1x2 : hwShadingRate
+    Value *shadingRate1x4 = builder.CreateICmpEQ(hwShadingRate, builder.getInt32(2));
+    hwShadingRate = builder.CreateSelect(shadingRate1x4, builder.getInt32(1), hwShadingRate);
+
+    // hwShadingRate = hwShadingRate == 4x1 ? 2x1 : hwShadingRate
+    Value *shadingRate4x1 = builder.CreateICmpEQ(hwShadingRate, builder.getInt32(8));
+    hwShadingRate = builder.CreateSelect(shadingRate4x1, builder.getInt32(4), hwShadingRate);
+
+    // hwShadingRate = hwShadingRate << 2
+    hwShadingRate = builder.CreateShl(hwShadingRate, 2);
+    hwShadingRate = builder.CreateBitCast(hwShadingRate, builder.getFloatTy());
+  } else {
     // NOTE: The shading rates have different meanings in HW and LGC interface. Current HW only supports 2-pixel mode
     // and 4-pixel mode is not supported. But the spec requires us to accept unsupported rates and clamp them to
     // maxFragmentSize of HW. The mapping is therefore as follow:
@@ -5780,7 +5957,24 @@ Value *PatchInOutImportExport::getShadingRate(Instruction *insertPos) {
   Value *yRate = builder.CreateAnd(ancillary, 0x30);
   yRate = builder.CreateLShr(yRate, 4);
 
-  {
+  if (m_gfxIp.major >= 11) {
+    // NOTE: In GFX11, the graphics pipeline is to support VRS rates till 4x4 which includes 2x4 and 4x2
+    // along with the legacy rates.
+    //
+    // xRate = xRate == 0x1 ? Horizontal2Pixels : (xRate == 0x2 ? Horizontal4Pixels : None)
+    auto xRate2Pixels = builder.CreateICmpEQ(xRate, builder.getInt32(1));
+    auto xRate4Pixels = builder.CreateICmpEQ(xRate, builder.getInt32(2));
+    xRate = builder.CreateSelect(xRate2Pixels, builder.getInt32(ShadingRateHorizontal2Pixels),
+                                 builder.CreateSelect(xRate4Pixels, builder.getInt32(ShadingRateHorizontal4Pixels),
+                                                      builder.getInt32(ShadingRateNone)));
+
+    // yRate = yRate == 0x1 ? Vertical2Pixels : (yRate == 0x2 ? Vertical2Pixels : None)
+    auto yRate2Pixels = builder.CreateICmpEQ(yRate, builder.getInt32(1));
+    auto yRate4Pixels = builder.CreateICmpEQ(yRate, builder.getInt32(2));
+    yRate = builder.CreateSelect(yRate2Pixels, builder.getInt32(ShadingRateVertical2Pixels),
+                                 builder.CreateSelect(yRate4Pixels, builder.getInt32(ShadingRateVertical4Pixels),
+                                                      builder.getInt32(ShadingRateNone)));
+  } else {
     // NOTE: The shading rates have different meanings in HW and LGC interface. Current HW only supports 2-pixel mode
     // and 4-pixel mode is not supported. The mapping is as follow:
     //
@@ -5875,239 +6069,18 @@ void PatchInOutImportExport::exportVertexAttribs(Instruction *insertPos) {
                                builder.getFalse(),                                        // done
                                builder.getFalse()});                                      // src0
     } else {
-      llvm_unreachable("Not implemented!");
+      Value *attribValue = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), 4)); // Always be <4 x float>
+      for (unsigned i = 0; i < 4; ++i)
+        attribValue = builder.CreateInsertElement(attribValue, attribExport.second[i], i);
+      // NOTE: For GFX11+, vertex attributes are exported through memory. This call will be expanded when NGG primitive
+      // shader is generated. The arguments are: buffer descriptor of attribute ring, attribute location, and attribute
+      // export value.
+      emitCall(lgcName::NggAttribExport, builder.getVoidTy(),
+               {m_pipelineSysValues.get(m_entryPoint)->getAttribRingBufDesc(), builder.getInt32(attribExport.first),
+                attribValue},
+               {}, insertPos);
     }
-  }
-}
-
-// =====================================================================================================================
-// Handle the store of tessellation factors.
-//   1. Collect outer and inner tessellation factors;
-//   2. Write tessellation factors to LDS if they are read as inputs by TES;
-//   3. Write tessellation factors to TF buffer.
-void PatchInOutImportExport::storeTessFactors() {
-  assert(m_shaderStage == ShaderStageTessControl); // Must be tessellation control shader
-
-  //
-  // Find the ret instruction as the insert position
-  //
-  Instruction *insertPos = nullptr;
-  for (auto &block : *m_entryPoint) {
-    auto retInst = dyn_cast<ReturnInst>(block.getTerminator());
-    if (retInst) {
-      assert(retInst->getType()->isVoidTy());
-      insertPos = retInst;
-    }
-  }
-  assert(insertPos); // Must have ret instruction
-
-  BuilderBase builder(*m_context);
-  builder.SetInsertPoint(insertPos);
-
-  //
-  // Collect tessellation factors from on-chip LDS
-  //
-  unsigned outerTessFactorCount = 0;
-  unsigned innerTessFactorCount = 0;
-
-  const auto primitiveMode = m_pipelineState->getShaderModes()->getTessellationMode().primitiveMode;
-  switch (primitiveMode) {
-  case PrimitiveMode::Triangles:
-    outerTessFactorCount = 3;
-    innerTessFactorCount = 1;
-    break;
-  case PrimitiveMode::Quads:
-    outerTessFactorCount = 4;
-    innerTessFactorCount = 2;
-    break;
-  case PrimitiveMode::Isolines:
-    outerTessFactorCount = 2;
-    innerTessFactorCount = 0;
-    break;
-  default:
-    llvm_unreachable("Unknown primitive mode!");
-    break;
-  }
-
-  const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
-  auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
-
-  // NOTE: We are going to read back tess factors from on-chip LDS. Make sure they have been stored already.
-  SyncScope::ID workgroupScope = m_context->getOrInsertSyncScopeID("workgroup");
-  builder.CreateFence(AtomicOrdering::Release, workgroupScope);
-  builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-  builder.CreateFence(AtomicOrdering::Acquire, workgroupScope);
-
-  SmallVector<Value *> outerTessFactors, innerTessFactors;
-
-  assert(outerTessFactorCount >= 2 && outerTessFactorCount <= 4);
-  // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch
-  Value *ldsOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
-  ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(calcFactor.onChip.tessFactorStart));
-  auto outerTessFactorVec =
-      readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), outerTessFactorCount), ldsOffset, builder);
-  for (unsigned i = 0; i < outerTessFactorCount; ++i)
-    outerTessFactors.push_back(builder.CreateExtractElement(outerTessFactorVec, i));
-
-  assert(innerTessFactorCount <= 2);
-  if (innerTessFactorCount > 0) {
-    // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + 4
-    Value *ldsOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
-    ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(calcFactor.onChip.tessFactorStart + 4));
-    auto innerTessFactorVec =
-        readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), innerTessFactorCount), ldsOffset, builder);
-    for (unsigned i = 0; i < innerTessFactorCount; ++i)
-      innerTessFactors.push_back(builder.CreateExtractElement(innerTessFactorVec, i));
-  }
-
-  {
-    //
-    // Write tessellation factors to LDS if they are read as inputs by TES
-    //
-    const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
-    const auto &perPatchBuiltInOutLocMap = resUsage->inOutUsage.perPatchBuiltInOutputLocMap;
-
-    auto tessLevelOuterLocIt = perPatchBuiltInOutLocMap.find(BuiltInTessLevelOuter);
-    if (tessLevelOuterLocIt != perPatchBuiltInOutLocMap.end()) {
-      const unsigned loc = tessLevelOuterLocIt->second;
-
-      for (unsigned i = 0; i < outerTessFactorCount; ++i) {
-        auto ldsOffset =
-            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, builder);
-        writeValueToLds(m_pipelineState->isTessOffChip(), outerTessFactors[i], ldsOffset, builder);
-      }
-    }
-
-    auto tessLevelInnerLocIt = perPatchBuiltInOutLocMap.find(BuiltInTessLevelInner);
-    if (tessLevelInnerLocIt != perPatchBuiltInOutLocMap.end()) {
-      const unsigned loc = tessLevelInnerLocIt->second;
-
-      for (unsigned i = 0; i < innerTessFactorCount; ++i) {
-        auto ldsOffset =
-            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, builder);
-        writeValueToLds(m_pipelineState->isTessOffChip(), innerTessFactors[i], ldsOffset, builder);
-      }
-    }
-
-    // NOTE: For isoline, the outer tessellation factors have to be exchanged, which is required by HW.
-    if (primitiveMode == PrimitiveMode::Isolines)
-      std::swap(outerTessFactors[0], outerTessFactors[1]);
-
-    storeTessFactorToBuffer(outerTessFactors, innerTessFactors, insertPos);
-  }
-}
-
-// =====================================================================================================================
-// Write the collected tessellation factors to TF buffer.
-//
-// @param outerTessFactors : The collected outer tessellation factors
-// @param innerTessFactors : The collected inner tessellation factors
-// @param insertPos : Where to insert instructions
-void PatchInOutImportExport::storeTessFactorToBuffer(ArrayRef<Value *> outerTessFactors,
-                                                     ArrayRef<Value *> innerTessFactors, Instruction *insertPos) {
-  assert(m_shaderStage == ShaderStageTessControl);
-
-  // NOTE: Tessellation factors are from tessellation level array and we have:
-  //   (1) Isoline
-  //      tessFactor[0] = gl_TessLevelOuter[1]
-  //      tessFactor[1] = gl_TessLevelOuter[0]
-  //   (2) Triangle
-  //      tessFactor[0] = gl_TessLevelOuter[0]
-  //      tessFactor[1] = gl_TessLevelOuter[1]
-  //      tessFactor[2] = gl_TessLevelOuter[2]
-  //      tessFactor[3] = gl_TessLevelInner[0]
-  //   (3) Quad
-  //      tessFactor[0] = gl_TessLevelOuter[0]
-  //      tessFactor[1] = gl_TessLevelOuter[1]
-  //      tessFactor[2] = gl_TessLevelOuter[2]
-  //      tessFactor[3] = gl_TessLevelOuter[3]
-  //      tessFactor[4] = gl_TessLevelInner[0]
-  //      tessFactor[5] = gl_TessLevelInner[1]
-
-  BuilderBase builder(*m_context);
-  builder.SetInsertPoint(insertPos);
-
-  Value *tfBufferDesc = m_pipelineSysValues.get(m_entryPoint)->getTessFactorBufDesc();
-
-  auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTessControl)->entryArgIdxs.tcs;
-  Value *tfBufferBase = getFunctionArgument(m_entryPoint, entryArgIdxs.tfBufferBase);
-  if (m_pipelineState->isTessOffChip()) {
-    if (m_gfxIp.major <= 8) {
-      // NOTE: Additional 4-byte offset is required for tessellation off-chip mode (pre-GFX9).
-      tfBufferBase =
-          BinaryOperator::CreateAdd(tfBufferBase, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
-    }
-  }
-
-  const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
-  auto relPatchId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
-  Value *tfBufferOffset = builder.CreateMul(relPatchId, builder.getInt32(calcFactor.tessFactorStride * sizeof(float)));
-
-  CoherentFlag coherent = {};
-  coherent.bits.glc = true;
-
-  auto primitiveMode = m_pipelineState->getShaderModes()->getTessellationMode().primitiveMode;
-  if (primitiveMode == PrimitiveMode::Isolines || primitiveMode == PrimitiveMode::Triangles) {
-    // For isoline and triangle, we can combine outer tessellation factors with inner ones
-    FixedVectorType *tfValueTy =
-        FixedVectorType::get(builder.getFloatTy(), outerTessFactors.size() + innerTessFactors.size());
-    Value *tfValue = UndefValue::get(tfValueTy);
-
-    assert(outerTessFactors.size() == 2 || outerTessFactors.size() == 3);
-    for (unsigned i = 0; i < outerTessFactors.size(); ++i)
-      tfValue = builder.CreateInsertElement(tfValue, outerTessFactors[i], i);
-
-    assert(innerTessFactors.size() == 0 || innerTessFactors.size() == 1);
-    for (unsigned i = 0; i < innerTessFactors.size(); ++i)
-      tfValue = builder.CreateInsertElement(tfValue, innerTessFactors[i], outerTessFactors.size() + i);
-
-    builder.CreateIntrinsic(Intrinsic::amdgcn_raw_tbuffer_store, tfValueTy,
-                            {tfValue,                                                             // vdata
-                             tfBufferDesc,                                                        // rsrc
-                             tfBufferOffset,                                                      // voffset
-                             tfBufferBase,                                                        // soffset
-                             builder.getInt32((*m_buffFormats)[tfValueTy->getNumElements() - 1]), // format
-                             builder.getInt32(coherent.u32All)});                                 // glc
-  } else {
-    assert(primitiveMode == PrimitiveMode::Quads);
-
-    FixedVectorType *outerTfValueTy = FixedVectorType::get(builder.getFloatTy(), outerTessFactors.size());
-    Value *outerTfValue = UndefValue::get(outerTfValueTy);
-
-    assert(outerTessFactors.size() == 4);
-    for (unsigned i = 0; i < outerTessFactors.size(); ++i)
-      outerTfValue = builder.CreateInsertElement(outerTfValue, outerTessFactors[i], i);
-
-    FixedVectorType *innerTfValueTy = FixedVectorType::get(builder.getFloatTy(), innerTessFactors.size());
-    Value *innerTfValue = UndefValue::get(innerTfValueTy);
-
-    assert(innerTessFactors.size() == 2);
-    for (unsigned i = 0; i < innerTessFactors.size(); ++i)
-      innerTfValue = builder.CreateInsertElement(innerTfValue, innerTessFactors[i], i);
-
-    builder.CreateIntrinsic(Intrinsic::amdgcn_raw_tbuffer_store, outerTfValueTy,
-                            {outerTfValue,                                                             // vdata
-                             tfBufferDesc,                                                             // rsrc
-                             tfBufferOffset,                                                           // voffset
-                             tfBufferBase,                                                             // soffset
-                             builder.getInt32((*m_buffFormats)[outerTfValueTy->getNumElements() - 1]), // format
-                             builder.getInt32(coherent.u32All)});                                      // glc
-
-    tfBufferOffset =
-        builder.CreateAdd(tfBufferOffset, builder.getInt32(outerTfValueTy->getNumElements() * sizeof(float)));
-    builder.CreateIntrinsic(Intrinsic::amdgcn_raw_tbuffer_store, innerTfValueTy,
-                            {innerTfValue,                                                             // vdata
-                             tfBufferDesc,                                                             // rsrc
-                             tfBufferOffset,                                                           // voffset
-                             tfBufferBase,                                                             // soffset
-                             builder.getInt32((*m_buffFormats)[innerTfValueTy->getNumElements() - 1]), // format
-                             builder.getInt32(coherent.u32All)});                                      // glc
   }
 }
 
 } // namespace lgc
-
-// =====================================================================================================================
-// Initializes the pass of LLVM patching operations for input import and output export.
-INITIALIZE_PASS(LegacyPatchInOutImportExport, DEBUG_TYPE, "Patch LLVM for input import and output export operations",
-                false, false)

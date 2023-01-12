@@ -81,6 +81,13 @@ private:
   llvm::Value *convertToFloat(llvm::Value *value, bool signedness, BuilderBase &builder) const;
   llvm::Value *convertToInt(llvm::Value *value, bool signedness, BuilderBase &builder) const;
 
+  llvm::Value *dualSourceSwizzle(BuilderBase &builder);
+
+  // Colors to be exported for dual-source-blend
+  llvm::SmallVector<llvm::Value *, 4> m_blendSources[2];
+  // Number of color channels for dual-source-blend
+  unsigned m_blendSourceChannels;
+
   llvm::LLVMContext *m_context;   // LLVM context
   PipelineState *m_pipelineState; // The pipeline state
 };
@@ -116,26 +123,6 @@ private:
   ResourceUsage *m_resUsage;                           // The resource usage object from the pipeline state.
   llvm::SmallVector<ColorExportInfo, 8> m_info;        // The color export information for each export.
   llvm::SmallVector<llvm::Value *, 10> m_exportValues; // The value to be exported indexed by the hw render target.
-};
-
-// =====================================================================================================================
-// Pass to lower color export calls
-class LegacyLowerFragColorExport : public llvm::ModulePass {
-public:
-  LegacyLowerFragColorExport();
-  LegacyLowerFragColorExport(const LegacyLowerFragColorExport &) = delete;
-  LegacyLowerFragColorExport &operator=(const LegacyLowerFragColorExport &) = delete;
-
-  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-    analysisUsage.addRequired<LegacyPipelineShaders>();
-  }
-
-  virtual bool runOnModule(llvm::Module &module) override;
-
-  static char ID; // ID of this pass
-private:
-  LowerFragColorExport m_impl;
 };
 
 } // namespace lgc

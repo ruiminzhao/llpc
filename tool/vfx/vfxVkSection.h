@@ -144,6 +144,8 @@ private:
 
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, forceLoopUnrollCount, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, useSiScheduler, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, disableCodeSinking, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, favorLatencyHiding, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, updateDescInElf, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, allowVaryWaveSize, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, enableLoadScalarizer, MemberTypeBool, false);
@@ -164,8 +166,7 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, overrideShaderThreadGroupSizeY, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, overrideShaderThreadGroupSizeZ, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, nsaThreshold, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, aggressiveInvariantLoads, MemberTypeBool, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, disableInvariantLoads, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, aggressiveInvariantLoads, MemberTypeEnum, false);
       return addrTableInitializer;
     }();
     return {addrTable.data(), addrTable.size()};
@@ -373,9 +374,14 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, threadGroupSwizzleMode, MemberTypeEnum, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, reverseThreadGroup, MemberTypeBool, false);
       INIT_MEMBER_NAME_TO_ADDR(SectionPipelineOption, m_extendedRobustness, MemberTypeExtendedRobustness, true);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, forceNonUniformResourceIndexStageMask, MemberTypeInt,
+                                     false);
       // One internal member
 #if VKI_RAY_TRACING
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, internalRtShaders, MemberTypeBool, false);
+#endif
+#if VKI_BUILD_GFX11
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, optimizeTessFactor, MemberTypeBool, false);
 #endif
       return addrTableInitializer;
     }();
@@ -603,12 +609,18 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, outerTileSize, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, dispatchDimSwizzleMode, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableRayQueryCsSwizzle, MemberTypeBool, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableDispatchRaysInnerSwizzle, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableDispatchRaysOuterSwizzle, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, forceInvalidAccelStruct, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableRayTracingCounters, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForIndirect, MemberTypeInt, false);
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForUnified, MemberTypeInt, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableDispatchRaysInnerSwizzle, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableDispatchRaysOuterSwizzle, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, forceInvalidAccelStruct, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableRayTracingCounters, MemberTypeBool, false);
+#if VKI_BUILD_GFX11
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableRayTracingHwTraversalStack, MemberTypeBool, false);
+#endif
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForIndirect, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForUnified, MemberTypeBool, false);
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, maxRayLength, MemberTypeFloat, false);
+#endif
       INIT_MEMBER_NAME_TO_ADDR(SectionRtState, m_exportConfig, MemberTypeRayTracingShaderExportConfig, true);
 #if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
       INIT_MEMBER_NAME_TO_ADDR(SectionRtState, m_gpurtFuncTable, MemberTypeGpurtFuncTable, true);

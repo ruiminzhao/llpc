@@ -97,10 +97,12 @@ cl::list<std::string> InFiles(cl::Positional, cl::OneOrMore, cl::ValueRequired,
                                        "Type of input file is determined by its filename extension:\n"
                                        "  .spv      SPIR-V binary\n"
                                        "  .spvasm   SPIR-V assembly text\n"
+                                       "  .task     GLSL task shader\n"
                                        "  .vert     GLSL vertex shader\n"
                                        "  .tesc     GLSL tessellation control shader\n"
                                        "  .tese     GLSL tessellation evaluation shader\n"
                                        "  .geom     GLSL geometry shader\n"
+                                       "  .mesh     GLSL mesh shader\n"
                                        "  .frag     GLSL fragment shader\n"
                                        "  .comp     GLSL compute shader\n"
                                        "  .pipe     Pipeline info file\n"
@@ -273,6 +275,11 @@ cl::opt<unsigned> OverrideThreadGroupSizeZ("override-threadGroupSizeZ",
 
 // -reverse-thread-group
 cl::opt<bool> ReverseThreadGroup("reverse-thread-group", cl::desc("Reverse thread group ID\n"), cl::init(false));
+
+// -force-non-uniform-resource-index-stage-mask
+cl::opt<unsigned> ForceNonUniformResourceIndexStageMask("force-non-uniform-resource-index-stage-mask",
+                                                        cl::desc("Stage mask to force non uniform resource index\n"),
+                                                        cl::init(0));
 
 // -filter-pipeline-dump-by-type: filter which kinds of pipeline should be disabled.
 cl::opt<unsigned> FilterPipelineDumpByType("filter-pipeline-dump-by-type",
@@ -488,6 +495,13 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
   compileInfo->compPipelineInfo.options.threadGroupSwizzleMode = ThreadGroupSwizzleModeSetting;
   compileInfo->compPipelineInfo.options.reverseThreadGroup = ReverseThreadGroup;
 
+  compileInfo->compPipelineInfo.options.forceNonUniformResourceIndexStageMask = ForceNonUniformResourceIndexStageMask;
+  compileInfo->gfxPipelineInfo.options.forceNonUniformResourceIndexStageMask = ForceNonUniformResourceIndexStageMask;
+#if VKI_RAY_TRACING
+  compileInfo->rayTracePipelineInfo.options.forceNonUniformResourceIndexStageMask =
+      ForceNonUniformResourceIndexStageMask;
+#endif
+
   // Set NGG control settings
   if (ParsedGfxIp.major >= 10) {
     auto &nggState = compileInfo->gfxPipelineInfo.nggState;
@@ -563,7 +577,7 @@ static Error processInputs(ICompiler *compiler, InputSpecGroup &inputSpecs) {
   //
   // Build pipeline
   //
-  Optional<PipelineDumpOptions> dumpOptions = None;
+  Optional<PipelineDumpOptions> dumpOptions;
   if (cl::EnablePipelineDump) {
     dumpOptions.emplace();
     dumpOptions->pDumpDir = cl::PipelineDumpDir.c_str();
@@ -633,14 +647,14 @@ int main(int argc, char *argv[]) {
 #endif
 #endif
 
+  ICompiler *compiler = nullptr;
+  Result result = init(argc, argv, compiler);
+
 #ifdef WIN_OS
   if (AssertToMsgBox) {
     _set_error_mode(_OUT_TO_MSGBOX);
   }
 #endif
-
-  ICompiler *compiler = nullptr;
-  Result result = init(argc, argv, compiler);
 
   // Cleanup code that gets run automatically before returning.
   auto onExit = make_scope_exit([compiler, &result] {

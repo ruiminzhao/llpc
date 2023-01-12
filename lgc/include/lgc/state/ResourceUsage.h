@@ -118,18 +118,27 @@ public:
   bool isBuiltIn() const { return m_data.bits.isBuiltIn; }
   void setBuiltIn(bool isBuiltIn) { m_data.bits.isBuiltIn = isBuiltIn; }
 
+  bool isFlat() const { return m_data.bits.isFlat; }
+  void setFlat(bool isFlat) { m_data.bits.isFlat = isFlat; }
+
+  bool isCustom() const { return m_data.bits.isCustom; }
+  void setCustom(bool isCustom) { m_data.bits.isCustom = isCustom; }
+
   unsigned getStreamId() const { return m_data.bits.streamId; }
   void setStreamId(unsigned streamId) { m_data.bits.streamId = static_cast<uint16_t>(streamId); }
 
   bool operator<(const InOutLocationInfo &rhs) const { return this->getData() < rhs.getData(); }
+  bool operator!=(const InOutLocationInfo &rhs) const { return this->getData() != rhs.getData(); }
 
 private:
   union {
     struct {
       uint16_t isHighHalf : 1; // High half in case of 16-bit attributes
       uint16_t component : 2;  // The component index
-      uint16_t location : 10;  // The location
+      uint16_t location : 8;   // The location
       uint16_t isBuiltIn : 1;  // Whether location is actually built-in ID
+      uint16_t isFlat : 1;     // Whether is flat shading
+      uint16_t isCustom : 1;   // Whether is custom interpolation
       uint16_t streamId : 2;   // Output vertex stream ID
     } bits;
     uint16_t u16All;
@@ -155,6 +164,7 @@ struct ResourceUsage {
   unsigned numSgprsAvailable = UINT32_MAX; // Number of available SGPRs
   unsigned numVgprsAvailable = UINT32_MAX; // Number of available VGPRs
   bool useImages = false;                  // Whether images are used
+  bool useImageOp = false;                 // Whether image instruction is called (for GFX11+, pixel wait sync+)
 
 #if VKI_RAY_TRACING
   bool useRayQueryLdsStack = false; // Whether ray query uses LDS stack
@@ -346,14 +356,12 @@ struct ResourceUsage {
     std::map<unsigned, unsigned> perPrimitiveBuiltInInputLocMap;
     std::map<unsigned, unsigned> perPrimitiveBuiltInOutputLocMap;
 
-    // Transform feedback strides
-    unsigned xfbStrides[MaxTransformFeedbackBuffers] = {};
+    // Map from output location info to the transform feedback info
+    std::map<InOutLocationInfo, XfbOutInfo> locInfoXfbOutInfoMap;
 
-    // Transform feedback enablement
-    bool enableXfb = false;
-
-    // Stream to transform feedback buffers
-    unsigned streamXfbBuffers[MaxGsStreams] = {};
+    // Count of transform feedback output export call (each call is to export <4 x dword> at most), used in SW emulated
+    // stream-out for GFX11+
+    unsigned xfbOutputExpCount = 0;
 
     // Count of mapped location for inputs/outputs (including those special locations to which the built-ins
     // are mapped)
@@ -377,11 +385,13 @@ struct ResourceUsage {
                                            // "hsNumPatch")
         // On-chip calculation factors
         struct {
-          unsigned outPatchStart;   // Offset into LDS where vertices of output patches start
-                                    // (in dword, correspond to "hsOutputBase")
-          unsigned patchConstStart; // Offset into LDS where patch constants start (in dword,
-                                    // correspond to "patchConstBase")
-          unsigned tessFactorStart; // Offset into LDS where tess factor start (in dword)
+          unsigned outPatchStart;       // Offset into LDS where vertices of output patches start
+                                        // (in dword, correspond to "hsOutputBase")
+          unsigned patchConstStart;     // Offset into LDS where patch constants start (in dword,
+                                        // correspond to "patchConstBase")
+          unsigned tessFactorStart;     // Offset into LDS where tess factor start (in dword)
+          unsigned hsPatchCountStart;   // Offset into LDS where count of HS patches start (in dword)
+          unsigned specialTfValueStart; // Offset into LDS where special TF value start (in dword)
         } onChip;
 
         // Off-chip calculation factors
@@ -397,10 +407,10 @@ struct ResourceUsage {
         unsigned outPatchSize; // Size of an output patch output (in dword, correspond to
                                // "patchOutputSize")
 
-        unsigned patchConstSize;   // Size of an output patch constants (in dword)
-        unsigned tessFactorStride; // Size of tess factor stride (in dword)
-
-        unsigned tessOnChipLdsSize; // On-chip LDS size (exclude off-chip LDS buffer) (in dword)
+        unsigned patchConstSize;     // Size of an output patch constants (in dword)
+        unsigned tessFactorStride;   // Size of tess factor stride (in dword)
+        unsigned specialTfValueSize; // Size of special TF value (in dword)
+        unsigned tessOnChipLdsSize;  // On-chip LDS size (exclude off-chip LDS buffer) (in dword)
 #if VKI_RAY_TRACING
         unsigned rayQueryLdsStackSize; // Ray query LDS stack size
 #endif
@@ -418,9 +428,6 @@ struct ResourceUsage {
       // export generic outputs to fragment shader, always from vertex stream 0):
       //   <location, <component, byteSize>>
       std::unordered_map<unsigned, std::vector<unsigned>> genericOutByteSizes[MaxGsStreams];
-
-      // Map from output location info to the transform feedback info
-      std::map<InOutLocationInfo, XfbOutInfo> locInfoXfbOutInfoMap;
 
       // ID of the vertex stream sent to rasterizer
       unsigned rasterStream = 0;
@@ -480,6 +487,7 @@ struct ResourceUsage {
 // Represents stream-out data
 struct StreamOutData {
   unsigned tablePtr;                                   // Table pointer for stream-out
+  unsigned controlBufPtr;                              // Control buffer pointer for stream-out (GFX11+)
   unsigned streamInfo;                                 // Stream-out info (ID, vertex count, enablement)
   unsigned writeIndex;                                 // Write index for stream-out
   unsigned streamOffsets[MaxTransformFeedbackBuffers]; // Stream-out Offset
@@ -507,8 +515,9 @@ struct InterfaceData {
   struct {
     // Geometry shader
     struct {
-      unsigned copyShaderEsGsLdsSize;    // ES -> GS ring LDS size (for copy shader)
-      unsigned copyShaderStreamOutTable; // Stream-out table (for copy shader)
+      unsigned copyShaderEsGsLdsSize;         // ES -> GS ring LDS size (for copy shader)
+      unsigned copyShaderStreamOutTable;      // Stream-out table (for copy shader)
+      unsigned copyShaderStreamOutControlBuf; // Stream-out control buffer (for copy shader)
     } gs;
 
     unsigned spillTable; // Spill table user data map
@@ -586,7 +595,8 @@ struct InterfaceData {
 
       // Fragment shader
       struct {
-        unsigned primMask; // Primitive mask
+        unsigned viewIndex; // View Index
+        unsigned primMask;  // Primitive mask
 
         // Perspective interpolation (I/J)
         struct {

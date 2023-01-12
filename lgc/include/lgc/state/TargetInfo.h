@@ -48,6 +48,9 @@ struct GfxIpVersion {
   bool operator>=(const GfxIpVersion &rhs) const {
     return std::tie(major, minor, stepping) >= std::tie(rhs.major, rhs.minor, rhs.stepping);
   }
+  bool isGfx(unsigned rhsMajor, unsigned rhsMinor) const {
+    return std::tie(major, minor) == std::tie(rhsMajor, rhsMinor);
+  }
 };
 
 // Represents the properties of GPU device.
@@ -145,6 +148,14 @@ struct WorkaroundFlags {
     };
     unsigned u32All;
   } gfx10;
+
+  union {
+    struct {
+      unsigned waUserSgprInitBug : 1;
+      unsigned waAtmPrecedesPos : 1;
+    };
+    unsigned u32All;
+  } gfx11;
 };
 
 // =====================================================================================================================

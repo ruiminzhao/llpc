@@ -141,39 +141,28 @@ protected:
   unsigned m_spirvOpMetaKindId; // Metadata kind ID for "spirv.op"
 private:
   template <spv::Op> void createRayQueryFunc(llvm::Function *func);
+  void createRayQueryProceedFunc(llvm::Function *func);
   llvm::Value *createIntersectSystemValue(llvm::Function *func, unsigned raySystem);
   void createWriteLdsStack(llvm::Function *func);
   void createReadLdsStack(llvm::Function *func);
   void createIntersectMatrix(llvm::Function *func, unsigned builtInId);
   void createIntersectBvh(llvm::Function *func);
   void createSampleGpuTime(llvm::Function *func);
+#if VKI_BUILD_GFX11
+  void createLdsStackInit(llvm::Function *func);
+  void createLdsStackStore(llvm::Function *func);
+#endif
   llvm::Value *getStackArrayIndex(llvm::Value *stackOffset);
   uint32_t getWorkgroupSize() const;
   llvm::Value *createGetInstanceNodeAddr(llvm::Value *instNodePtr, llvm::Value *rayQuery);
   llvm::Value *getDispatchId();
+  llvm::Value *createGetBvhSrd(llvm::Value *expansion, llvm::Value *boxSortMode);
   bool stageNotSupportLds(ShaderStage stage);
   llvm::GlobalVariable *m_ldsStack;        // LDS to hold stack value
   llvm::GlobalVariable *m_ldsUsage;        // LDS usage
   llvm::GlobalVariable *m_stackArray;      // Stack array to hold stack value
   llvm::GlobalVariable *m_prevRayQueryObj; // Previous ray query Object
   llvm::GlobalVariable *m_rayQueryObjGen;  // Ray query Object Id generator
-};
-
-// =====================================================================================================================
-// Represents the pass of SPIR-V lowering ray query.
-class LegacySpirvLowerRayQuery : public llvm::ModulePass {
-public:
-  LegacySpirvLowerRayQuery() : llvm::ModulePass(ID), Impl(false) {}
-  LegacySpirvLowerRayQuery(char &pid) : llvm::ModulePass(pid), Impl(false) {}
-  LegacySpirvLowerRayQuery(bool rayQueryLibrary);
-  virtual bool runOnModule(llvm::Module &module);
-
-  static char ID; // ID of this pass
-private:
-  LegacySpirvLowerRayQuery(const LegacySpirvLowerRayQuery &) = delete;
-  LegacySpirvLowerRayQuery &operator=(const LegacySpirvLowerRayQuery &) = delete;
-
-  SpirvLowerRayQuery Impl;
 };
 
 } // namespace Llpc

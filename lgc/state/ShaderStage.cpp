@@ -55,8 +55,12 @@ void lgc::setShaderStage(Module *module, ShaderStage stage) {
   auto stageMetaNode = MDNode::get(
       module->getContext(), {ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(module->getContext()), stage))});
   for (Function &func : *module) {
-    if (!func.isDeclaration())
-      func.setMetadata(mdKindId, stageMetaNode);
+    if (!func.isDeclaration()) {
+      if (stage != ShaderStageInvalid)
+        func.setMetadata(mdKindId, stageMetaNode);
+      else
+        func.eraseMetadata(mdKindId);
+    }
   }
 }
 
@@ -64,12 +68,15 @@ void lgc::setShaderStage(Module *module, ShaderStage stage) {
 // Set shader stage metadata on a function
 //
 // @param [in/out] func : Function to set shader stage on
-// @param stage : Shader stage to set
+// @param stage : Shader stage to set or ShaderStageInvalid
 void lgc::setShaderStage(Function *func, ShaderStage stage) {
   unsigned mdKindId = func->getContext().getMDKindID(ShaderStageMetadata);
-  auto stageMetaNode = MDNode::get(
-      func->getContext(), {ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(func->getContext()), stage))});
-  func->setMetadata(mdKindId, stageMetaNode);
+  if (stage != ShaderStageInvalid) {
+    auto stageMetaNode = MDNode::get(
+        func->getContext(), {ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(func->getContext()), stage))});
+    func->setMetadata(mdKindId, stageMetaNode);
+  } else
+    func->eraseMetadata(mdKindId);
 }
 
 // =====================================================================================================================
@@ -159,13 +166,7 @@ Function *lgc::addFunctionArgs(Function *oldFunc, Type *retTy, ArrayRef<Type *> 
   if (append) {
     // Old arguments first.
     for (unsigned idx = 0; idx != oldFuncTy->getNumParams(); ++idx)
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396596
-      // Old version of the code
-      argAttrs.push_back(oldAttrList.getParamAttributes(idx));
-#else
-      // New version of the code (also handles unknown version, which we treat as latest)
       argAttrs.push_back(oldAttrList.getParamAttrs(idx));
-#endif
   }
 
   // New arguments.
@@ -176,21 +177,11 @@ Function *lgc::addFunctionArgs(Function *oldFunc, Type *retTy, ArrayRef<Type *> 
   if (!append) {
     // Old arguments.
     for (unsigned idx = 0; idx != argTys.size(); ++idx)
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 396596
-      // Old version of the code
-      argAttrs.push_back(oldAttrList.getParamAttributes(idx));
-  }
-  // Construct new AttributeList and set it on the new function.
-  newFunc->setAttributes(AttributeList::get(oldFunc->getContext(), oldAttrList.getFnAttributes(),
-                                            oldAttrList.getRetAttributes(), argAttrs));
-#else
-      // New version of the code (also handles unknown version, which we treat as latest)
       argAttrs.push_back(oldAttrList.getParamAttrs(idx));
   }
   // Construct new AttributeList and set it on the new function.
   newFunc->setAttributes(
       AttributeList::get(oldFunc->getContext(), oldAttrList.getFnAttrs(), oldAttrList.getRetAttrs(), argAttrs));
-#endif
 
   // Set the shader stage on the new function (implemented with IR metadata).
   setShaderStage(newFunc, getShaderStage(oldFunc));

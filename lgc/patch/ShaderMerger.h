@@ -56,6 +56,8 @@ enum SpecialSgprInput : unsigned {
   // GFX9~GFX10
   SharedScratchOffset,
 
+  // GFX11+
+  waveIdInGroup,
 };
 } // namespace LsHs
 
@@ -76,6 +78,10 @@ enum SpecialSgprInput : unsigned {
   // GFX10+
   MergedGroupInfo, // NGG
 
+  // GFX11+
+  AttribRingBase,
+  FlatScratchLow,
+  FlatScratchHigh,
 };
 } // namespace EsGs
 
@@ -104,14 +110,21 @@ private:
   llvm::FunctionType *generateEsGsEntryPointType(uint64_t *inRegMask) const;
 
   void appendUserData(BuilderBase &builder, llvm::SmallVectorImpl<llvm::Value *> &args, llvm::Function *target,
-                      unsigned &argIdx, llvm::Value *userData, unsigned userDataCount,
+                      unsigned argIdx, llvm::Value *userData, unsigned userDataCount,
                       llvm::ArrayRef<std::pair<unsigned, unsigned>> substitutions = {});
   void appendVertexFetchTypes(std::vector<llvm::Type *> &argTys) const;
-  void appendArguments(llvm::SmallVectorImpl<llvm::Value *> &args, llvm::Argument *begin, llvm::Argument *end) const;
+  void appendArguments(llvm::SmallVectorImpl<llvm::Value *> &args, llvm::ArrayRef<llvm::Argument *> argsToAppend) const;
+
+  void gatherTuningAttributes(llvm::AttrBuilder &tuningAttrs, const llvm::Function *srcEntryPoint) const;
+  void applyTuningAttributes(llvm::Function *dstEntryPoint, const llvm::AttrBuilder &tuningAttrs) const;
 
 #if VKI_RAY_TRACING
   void processRayQueryLdsStack(llvm::Function *entryPoint1, llvm::Function *entryPoint2) const;
 #endif
+
+  void storeTessFactorsWithOpt(llvm::Value *threadIdInWave, llvm::IRBuilder<> &builder);
+  llvm::Value *readValueFromLds(llvm::Type *readTy, llvm::Value *ldsOffset, llvm::IRBuilder<> &builder);
+  void writeValueToLds(llvm::Value *writeValue, llvm::Value *ldsOffset, llvm::IRBuilder<> &builder);
 
   PipelineState *m_pipelineState; // Pipeline state
   llvm::LLVMContext *m_context;   // LLVM context

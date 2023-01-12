@@ -28,8 +28,8 @@
  * @brief LLPC source file: implementation of Builder methods for shader input and output
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
 #include "lgc/LgcContext.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/patch/ShaderInputs.h"
 #include "lgc/state/AbiUnlinked.h"
 #include "lgc/state/PipelineState.h"
@@ -123,7 +123,7 @@ Value *InOutBuilder::CreateReadPerVertexInput(Type *resultTy, unsigned location,
   switch (primType) {
   case PrimitiveType::TriangleList:
     vertexIndex = getInt32((vertexIndexInt + 2) % 3); // 0->2, 1->0, 2->1
-    [[clang::fallthrough]];
+    LLVM_FALLTHROUGH;
     // fall through...
   case PrimitiveType::Point:
   case PrimitiveType::LineList:
@@ -739,55 +739,58 @@ Instruction *InOutBuilder::CreateWriteXfbOutput(Value *valueToWrite, bool isBuil
   unsigned streamId = outputInfo.hasStreamId() ? outputInfo.getStreamId() : 0;
   assert(xfbBuffer < MaxTransformFeedbackBuffers);
   assert(streamId < MaxGsStreams);
-  resUsage->inOutUsage.xfbStrides[xfbBuffer] = xfbStride;
-  resUsage->inOutUsage.enableXfb = true;
-  resUsage->inOutUsage.streamXfbBuffers[streamId] |= 1 << xfbBuffer;
 
-  if (m_shaderStage == ShaderStageGeometry) {
+  if (m_shaderStage == ShaderStageGeometry && getPipelineState()->enableSwXfb()) {
+    // NOTE: For SW-emulated stream-out, we disable GS output packing. This is because
+    // the packing operation might cause a vector components belong to different vectors after the
+    // packing. In handling of SW-emulated stream-out, we expect components of the same vector
+    // should stay in it corresponding to a location all the time.
+    getPipelineState()->setPackOutput(ShaderStageGeometry, false);
+    getPipelineState()->setPackInput(ShaderStageFragment, false);
+  }
 
-    // Mark the XFB output for copy shader generation.
-    XfbOutInfo xfbOutInfo = {};
-    xfbOutInfo.streamId = streamId;
-    xfbOutInfo.xfbBuffer = xfbBuffer;
-    xfbOutInfo.xfbOffset = cast<ConstantInt>(xfbOffset)->getZExtValue();
-    xfbOutInfo.is16bit = valueToWrite->getType()->getScalarSizeInBits() == 16;
+  // Collect the XFB output.
+  XfbOutInfo xfbOutInfo = {};
+  xfbOutInfo.streamId = streamId;
+  xfbOutInfo.xfbBuffer = xfbBuffer;
+  xfbOutInfo.xfbOffset = cast<ConstantInt>(xfbOffset)->getZExtValue();
+  xfbOutInfo.is16bit = valueToWrite->getType()->getScalarSizeInBits() == 16;
 
-    // For packed generic GS output, the XFB output should be scalarized to align with the scalarized GS output
-    if (getPipelineState()->canPackOutput(m_shaderStage) && !isBuiltIn) {
-      Type *elementTy = valueToWrite->getType();
-      unsigned scalarizeBy = 1;
-      if (auto vectorTy = dyn_cast<FixedVectorType>(elementTy)) {
-        scalarizeBy = vectorTy->getNumElements();
-        elementTy = vectorTy->getElementType();
-      }
-      if (elementTy->getPrimitiveSizeInBits() == 64)
-        scalarizeBy *= 2;
-      unsigned xfbOffset = xfbOutInfo.xfbOffset;
-      for (unsigned i = 0; i < scalarizeBy; ++i) {
-        InOutLocationInfo outLocInfo;
-        outLocInfo.setLocation(location);
-        outLocInfo.setStreamId(streamId);
-        outLocInfo.setComponent(i);
-        outLocInfo.setBuiltIn(isBuiltIn);
-        if (i >= 4) {
-          outLocInfo.setLocation(location + 1);
-          outLocInfo.setComponent(i - 4);
-          xfbOutInfo.xfbOffset = xfbOffset + 16;
-        }
-        resUsage->inOutUsage.gs.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
-      }
-    } else {
+  // For packed generic GS output, the XFB output should be scalarized to align with the scalarized GS output
+  if (getPipelineState()->canPackOutput(m_shaderStage) && !isBuiltIn) {
+    Type *elementTy = valueToWrite->getType();
+    unsigned scalarizeBy = 1;
+    if (auto vectorTy = dyn_cast<FixedVectorType>(elementTy)) {
+      scalarizeBy = vectorTy->getNumElements();
+      elementTy = vectorTy->getElementType();
+    }
+    if (elementTy->getPrimitiveSizeInBits() == 64)
+      scalarizeBy *= 2;
+    unsigned xfbOffset = xfbOutInfo.xfbOffset;
+    for (unsigned i = 0; i < scalarizeBy; ++i) {
       InOutLocationInfo outLocInfo;
       outLocInfo.setLocation(location);
-      outLocInfo.setBuiltIn(isBuiltIn);
       outLocInfo.setStreamId(streamId);
-      resUsage->inOutUsage.gs.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
-
-      if (valueToWrite->getType()->getPrimitiveSizeInBits() > 128) {
+      outLocInfo.setComponent(i);
+      outLocInfo.setBuiltIn(isBuiltIn);
+      if (i >= 4) {
         outLocInfo.setLocation(location + 1);
-        xfbOutInfo.xfbOffset += 32;
-        resUsage->inOutUsage.gs.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
+        outLocInfo.setComponent(i - 4);
+        xfbOutInfo.xfbOffset = xfbOffset + 16;
       }
+      resUsage->inOutUsage.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
+    }
+  } else {
+    InOutLocationInfo outLocInfo;
+    outLocInfo.setLocation(location);
+    outLocInfo.setBuiltIn(isBuiltIn);
+    outLocInfo.setStreamId(streamId);
+    resUsage->inOutUsage.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
+
+    if (valueToWrite->getType()->getPrimitiveSizeInBits() > 128) {
+      outLocInfo.setLocation(location + 1);
+      xfbOutInfo.xfbOffset += 32;
+      resUsage->inOutUsage.locInfoXfbOutInfoMap[outLocInfo] = xfbOutInfo;
     }
   }
 
@@ -1191,6 +1194,27 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     Value *localInvocationId =
         ShaderInputs::getInput(ShaderInput::LocalInvocationId, BuilderBase::get(*this), *getLgcContext());
 
+    // On GFX11, it is a single VGPR and we need to extract the three components.
+    if (getPipelineState()->getTargetInfo().getGfxIpVersion().major >= 11) {
+      static const unsigned mask = 0x3ff;
+      Value *unpackedLocalInvocationId = UndefValue::get(FixedVectorType::get(getInt32Ty(), 3));
+
+      // X = PackedId[9:0]
+      unpackedLocalInvocationId =
+          CreateInsertElement(unpackedLocalInvocationId, CreateAnd(localInvocationId, getInt32(mask)), uint64_t(0));
+
+      // Y = PackedId[19:10]
+      localInvocationId = CreateLShr(localInvocationId, getInt32(10));
+      unpackedLocalInvocationId =
+          CreateInsertElement(unpackedLocalInvocationId, CreateAnd(localInvocationId, getInt32(mask)), 1);
+
+      // Z = PackedId[29:20], PackedId[31:30] set to 0 by hardware
+      localInvocationId = CreateLShr(localInvocationId, getInt32(10));
+      unpackedLocalInvocationId = CreateInsertElement(unpackedLocalInvocationId, localInvocationId, 2);
+
+      localInvocationId = unpackedLocalInvocationId;
+    }
+
     // Unused dimensions need zero-initializing.
     if (shaderMode.workgroupSizeZ <= 1) {
       if (shaderMode.workgroupSizeY <= 1)
@@ -1310,6 +1334,10 @@ Value *InOutBuilder::readVsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     return ShaderInputs::getVertexIndex(builder, *getLgcContext());
   case BuiltInInstanceIndex:
     return ShaderInputs::getInstanceIndex(builder, *getLgcContext());
+  case BuiltInViewIndex:
+    if (m_pipelineState->getInputAssemblyState().enableMultiView)
+      return ShaderInputs::getSpecialUserData(UserDataMapping::ViewId, builder);
+    return builder.getInt32(0);
   default:
     // Not handled; caller will handle with lgc.input.import.builtin, which is then lowered in PatchInOutImportExport.
     return nullptr;

@@ -58,8 +58,14 @@
 #include "lgc/state/TargetInfo.h"
 #include "lgc/util/Debug.h"
 #include "llvm/IR/IRPrintingPasses.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -163,11 +169,17 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, T
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
   }
 
+  // Collect image operations
+  if (pipelineState->getTargetInfo().getGfxIpVersion().major >= 11)
+    passMgr.addPass(PatchImageOpCollect());
+
   // Second part of lowering to "AMDGCN-style"
   passMgr.addPass(PatchPreparePipelineAbi());
 
-  const bool canUseNgg = pipelineState->isGraphics() && pipelineState->getTargetInfo().getGfxIpVersion().major == 10 &&
-                         (pipelineState->getOptions().nggFlags & NggFlagDisable) == 0;
+  const bool canUseNgg = pipelineState->isGraphics() &&
+                         ((pipelineState->getTargetInfo().getGfxIpVersion().major == 10 &&
+                           (pipelineState->getOptions().nggFlags & NggFlagDisable) == 0) ||
+                          pipelineState->getTargetInfo().getGfxIpVersion().major >= 11); // Must enable NGG on GFX11+
   if (canUseNgg) {
     if (patchTimer) {
       LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, false);
@@ -226,155 +238,86 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, T
 // @param [in/out] passMgr : Pass manager
 void Patch::registerPasses(lgc::PassManager &passMgr) {
 #define LLPC_PASS(NAME, CLASS) passMgr.registerPass(NAME, CLASS::name());
+#define LLPC_MODULE_ANALYSIS(NAME, CLASS) passMgr.registerPass(NAME, CLASS::name());
 #include "PassRegistry.inc"
 }
 
 // =====================================================================================================================
-// Add whole-pipeline patch passes to pass manager
+// Register all the patching passes into the given pass manager
 //
-// @param pipelineState : Pipeline state
-// @param [in/out] passMgr : Pass manager to add passes to
-// @param replayerPass : BuilderReplayer pass, or nullptr if not needed
-// @param patchTimer : Timer to time patch passes with, nullptr if not timing
-// @param optTimer : Timer to time LLVM optimization passes with, nullptr if not timing
-// @param checkShaderCacheFunc : Callback function to check shader cache
-// @param optLevel : The optimization level uses to adjust the aggressiveness of
-//                   passes and which passes to add.
-void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &passMgr, ModulePass *replayerPass,
-                            Timer *patchTimer, Timer *optTimer, Pipeline::CheckShaderCacheFunc checkShaderCacheFunc,
-                            CodeGenOpt::Level optLevel)
-// Callback function to check shader cache
-{
-  // Start timer for patching passes.
-  if (patchTimer)
-    passMgr.add(LgcContext::createStartStopTimer(patchTimer, true));
-
-  // If using BuilderRecorder rather than BuilderImpl, replay the Builder calls now
-  if (replayerPass)
-    passMgr.add(replayerPass);
-
-  if (raw_ostream *outs = getLgcOuts()) {
-    passMgr.add(
-        createPrintModulePass(*outs, "===============================================================================\n"
-                                     "// LLPC pipeline before-patching results\n"));
+// @param [in/out] passMgr : Pass manager
+void Patch::registerPasses(PassBuilder &passBuilder) {
+#define HANDLE_PASS(NAME, CLASS)                                                                                       \
+  if (innerPipeline.empty() && name == NAME) {                                                                         \
+    passMgr.addPass(CLASS());                                                                                          \
+    return true;                                                                                                       \
   }
 
-  // Build null fragment shader if necessary
-  passMgr.add(createLegacyPatchNullFragShader());
-
-  // Patch resource collecting, remove inactive resources (should be the first preliminary pass)
-  passMgr.add(createLegacyPatchResourceCollect());
-
-  // Patch wave size adjusting heuristic
-  passMgr.add(createLegacyPatchWaveSizeAdjust());
-
-  // Patch workarounds
-  passMgr.add(createLegacyPatchWorkarounds());
-
-  // Generate copy shader if necessary.
-  passMgr.add(createLegacyPatchCopyShader());
-
-  // Lower vertex fetch operations.
-  passMgr.add(createLegacyLowerVertexFetch());
-
-  // Lower fragment export operations.
-  passMgr.add(createLegacyLowerFragColorExport());
-
-  // Run IPSCCP before EntryPointMutate to avoid adding unnecessary arguments to an entry point.
-  passMgr.add(createIPSCCPPass());
-
-  // Patch entry-point mutation (should be done before external library link)
-  passMgr.add(createLegacyPatchEntryPointMutate());
-
-  // Patch workgroup memory initialization.
-  passMgr.add(createLegacyPatchInitializeWorkgroupMemory());
-
-  // Patch input import and output export operations
-  passMgr.add(createLegacyPatchInOutImportExport());
-
-  // Prior to general optimization, do function inlining and dead function removal
-  passMgr.add(createAlwaysInlinerLegacyPass());
-  passMgr.add(createGlobalDCEPass());
-
-  // Patch invariant load metadata before optimizations.
-  passMgr.add(createLegacyPatchInvariantLoads());
-
-  // Patch loop metadata
-  passMgr.add(createLegacyPatchLoopMetadata());
-
-  // Check shader cache
-  auto checkShaderCachePass = createLegacyPatchCheckShaderCache();
-  passMgr.add(checkShaderCachePass);
-  checkShaderCachePass->setCallbackFunction(std::move(checkShaderCacheFunc));
-
-  // Stop timer for patching passes and start timer for optimization passes.
-  if (patchTimer) {
-    passMgr.add(LgcContext::createStartStopTimer(patchTimer, false));
-    passMgr.add(LgcContext::createStartStopTimer(optTimer, true));
+#define HANDLE_ANALYSIS(NAME, CLASS, IRUNIT)                                                                           \
+  if (innerPipeline.empty() && name == "require<" NAME ">") {                                                          \
+    passMgr.addPass(RequireAnalysisPass<CLASS, IRUNIT>());                                                             \
+    return true;                                                                                                       \
+  }                                                                                                                    \
+  if (innerPipeline.empty() && name == "invalidate<" NAME ">") {                                                       \
+    passMgr.addPass(InvalidateAnalysisPass<CLASS>());                                                                  \
+    return true;                                                                                                       \
   }
 
-  // Add some optimization passes
-  addOptimizationPasses(passMgr, optLevel);
+  auto checkNameWithParams = [](StringRef name, StringRef passName, StringRef &params) -> bool {
+    params = name;
+    if (!params.consume_front(passName))
+      return false;
+    if (params.empty())
+      return true;
+    if (!params.consume_front("<"))
+      return false;
+    if (!params.consume_back(">"))
+      return false;
+    return true;
+  };
 
-  // Stop timer for optimization passes and restart timer for patching passes.
-  if (patchTimer) {
-    passMgr.add(LgcContext::createStartStopTimer(optTimer, false));
-    passMgr.add(LgcContext::createStartStopTimer(patchTimer, true));
-  }
+#define HANDLE_PASS_WITH_PARSER(NAME, CLASS)                                                                           \
+  if (innerPipeline.empty() && checkNameWithParams(name, NAME, params))                                                \
+    return CLASS::parsePass(params, passMgr);
 
-  // Patch buffer operations (must be after optimizations)
-  passMgr.add(createLegacyPatchBufferOp());
-  passMgr.add(createInstructionCombiningPass(2));
+  passBuilder.registerPipelineParsingCallback(
+      [=](StringRef name, ModulePassManager &passMgr, ArrayRef<PassBuilder::PipelineElement> innerPipeline) {
+        StringRef params;
+#define LLPC_PASS(NAME, CLASS) /* */
+#define LLPC_MODULE_PASS HANDLE_PASS
+#define LLPC_MODULE_PASS_WITH_PARSER HANDLE_PASS_WITH_PARSER
+#define LLPC_MODULE_ANALYSIS(NAME, CLASS) HANDLE_ANALYSIS(NAME, CLASS, Module)
+#include "PassRegistry.inc"
 
-  // Fully prepare the pipeline ABI (must be after optimizations)
-  passMgr.add(createLegacyPatchPreparePipelineAbi());
+        return false;
+      });
 
-  const bool canUseNgg = pipelineState->isGraphics() && pipelineState->getTargetInfo().getGfxIpVersion().major == 10 &&
-                         (pipelineState->getOptions().nggFlags & NggFlagDisable) == 0;
-  if (canUseNgg) {
-    // Stop timer for patching passes and restart timer for optimization passes.
-    if (patchTimer) {
-      passMgr.add(LgcContext::createStartStopTimer(patchTimer, false));
-      passMgr.add(LgcContext::createStartStopTimer(optTimer, true));
-    }
+  passBuilder.registerPipelineParsingCallback(
+      [=](StringRef name, FunctionPassManager &passMgr, ArrayRef<PassBuilder::PipelineElement> innerPipeline) {
+        StringRef params;
+        (void)params;
+#define LLPC_PASS(NAME, CLASS) /* */
+#define LLPC_FUNCTION_PASS HANDLE_PASS
+#define LLPC_FUNCTION_PASS_WITH_PARSER HANDLE_PASS_WITH_PARSER
+#include "PassRegistry.inc"
 
-    // Extra optimizations after NGG primitive shader creation
-    passMgr.add(createAlwaysInlinerLegacyPass());
-    passMgr.add(createGlobalDCEPass());
-    passMgr.add(createPromoteMemoryToRegisterPass());
-    passMgr.add(createAggressiveDCEPass());
-    passMgr.add(createInstructionCombiningPass());
-    passMgr.add(createCFGSimplificationPass());
+        return false;
+      });
 
-    // Stop timer for optimization passes and restart timer for patching passes.
-    if (patchTimer) {
-      passMgr.add(LgcContext::createStartStopTimer(optTimer, false));
-      passMgr.add(LgcContext::createStartStopTimer(patchTimer, true));
-    }
-  }
+  passBuilder.registerPipelineParsingCallback(
+      [=](StringRef name, LoopPassManager &passMgr, ArrayRef<PassBuilder::PipelineElement> innerPipeline) {
+        StringRef params;
+        (void)params;
+#define LLPC_PASS(NAME, CLASS) /* */
+#define LLPC_LOOP_PASS HANDLE_PASS
+#define LLPC_LOOP_PASS_WITH_PARSER HANDLE_PASS_WITH_PARSER
+#include "PassRegistry.inc"
 
-  passMgr.add(createLegacyPatchImageDerivatives());
+        return false;
+      });
 
-  // Set up target features in shader entry-points.
-  // NOTE: Needs to be done after post-NGG function inlining, because LLVM refuses to inline something
-  // with conflicting attributes. Attributes could conflict on GFX10 because PatchSetupTargetFeatures
-  // adds a target feature to determine wave32 or wave64.
-  passMgr.add(createLegacyPatchSetupTargetFeatures());
-
-  // Include LLVM IR as a separate section in the ELF binary
-  if (pipelineState->getOptions().includeIr)
-    passMgr.add(createLegacyPatchLlvmIrInclusion());
-
-  // Stop timer for patching passes.
-  if (patchTimer)
-    passMgr.add(LgcContext::createStartStopTimer(patchTimer, false));
-
-  // Dump the result
-  if (raw_ostream *outs = getLgcOuts()) {
-    passMgr.add(
-        createPrintModulePass(*outs, "===============================================================================\n"
-                                     "// LLPC pipeline patching results\n"));
-  }
+#undef HANDLE_PASS
+#undef HANDLE_PASS_WITH_PARSER
 }
 
 // =====================================================================================================================
@@ -390,7 +333,13 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
   FunctionPassManager fpm;
   fpm.addPass(InstCombinePass(1));
   fpm.addPass(SimplifyCFGPass());
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 444780
+  // Old version of the code
   fpm.addPass(SROAPass());
+#else
+  // New version of the code (also handles unknown version, which we treat as latest)
+  fpm.addPass(SROAPass(SROAOptions::ModifyCFG));
+#endif
   fpm.addPass(EarlyCSEPass(true));
   fpm.addPass(SpeculativeExecutionPass(/* OnlyIfDivergentTarget = */ true));
   fpm.addPass(CorrelatedValuePropagationPass());
@@ -402,11 +351,7 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
   fpm.addPass(ReassociatePass());
   LoopPassManager lpm;
   lpm.addPass(LoopRotatePass());
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 418547
-  lpm.addPass(LICMPass());
-#else
   lpm.addPass(LICMPass(LICMOptions()));
-#endif
   fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm), true));
   fpm.addPass(SimplifyCFGPass());
   fpm.addPass(InstCombinePass(1));
@@ -442,60 +387,6 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
   fpm2.addPass(DivRemPairsPass());
   fpm2.addPass(SimplifyCFGPass());
   passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm2)));
-}
-
-// =====================================================================================================================
-// Add optimization passes to pass manager
-//
-// @param [in/out] passMgr : Pass manager to add passes to
-// @param optLevel : The optimization level uses to adjust the aggressiveness of
-//                   passes and which passes to add.
-void LegacyPatch::addOptimizationPasses(legacy::PassManager &passMgr, CodeGenOpt::Level optLevel) {
-  LLPC_OUTS("PassManager optimization level = " << optLevel << "\n");
-
-  passMgr.add(createForceFunctionAttrsLegacyPass());
-  passMgr.add(createInstructionCombiningPass(1));
-  passMgr.add(createCFGSimplificationPass());
-  passMgr.add(createSROAPass());
-  passMgr.add(createEarlyCSEPass(true));
-  passMgr.add(createSpeculativeExecutionIfHasBranchDivergencePass());
-  passMgr.add(createCorrelatedValuePropagationPass());
-  passMgr.add(createCFGSimplificationPass());
-  passMgr.add(createAggressiveInstCombinerPass());
-  passMgr.add(createInstructionCombiningPass(1));
-  passMgr.add(createLegacyPatchPeepholeOpt());
-  passMgr.add(createCFGSimplificationPass());
-  passMgr.add(createReassociatePass());
-  passMgr.add(createLoopRotatePass());
-  passMgr.add(createLICMPass());
-  passMgr.add(createCFGSimplificationPass());
-  passMgr.add(createInstructionCombiningPass(1));
-  passMgr.add(createIndVarSimplifyPass());
-  passMgr.add(createLoopIdiomPass());
-  passMgr.add(createLoopDeletionPass());
-  passMgr.add(createSimpleLoopUnrollPass(optLevel));
-  passMgr.add(createScalarizerPass());
-  passMgr.add(createLegacyPatchLoadScalarizer());
-  passMgr.add(createInstSimplifyLegacyPass());
-  passMgr.add(createNewGVNPass());
-  passMgr.add(createBitTrackingDCEPass());
-  passMgr.add(createInstructionCombiningPass(1));
-  passMgr.add(createCorrelatedValuePropagationPass());
-  passMgr.add(createAggressiveDCEPass());
-  passMgr.add(createLoopRotatePass());
-  passMgr.add(createCFGSimplificationPass(SimplifyCFGOptions()
-                                              .bonusInstThreshold(1)
-                                              .forwardSwitchCondToPhi(true)
-                                              .convertSwitchToLookupTable(true)
-                                              .needCanonicalLoops(true)
-                                              .sinkCommonInsts(true)));
-  passMgr.add(createLoopUnrollPass(optLevel));
-  // uses DivergenceAnalysis
-  passMgr.add(createLegacyPatchReadFirstLane());
-  passMgr.add(createInstructionCombiningPass(1));
-  passMgr.add(createConstantMergePass());
-  passMgr.add(createDivRemPairsPass());
-  passMgr.add(createCFGSimplificationPass());
 }
 
 // =====================================================================================================================

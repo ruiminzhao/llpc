@@ -242,14 +242,7 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
   if (hasRayTracingShaderStage(stageMask))
     stageMask = ShaderStageComputeBit;
 #endif
-  unsigned lgcStageMask = 0;
-  const auto stages = maskToShaderStages(stageMask);
-  for (ShaderStage stage : make_filter_range(stages, isNativeStage)) {
-    if (isShaderStageInMask(stage, stageMask))
-      lgcStageMask |= 1 << getLgcShaderStage(stage);
-  }
   if (pipeline) {
-    pipeline->setShaderStageMask(lgcStageMask);
     pipeline->set128BitCacheHash(get128BitCacheHashCode(),
                                  VersionTuple(LLPC_INTERFACE_MAJOR_VERSION, LLPC_INTERFACE_MINOR_VERSION));
     pipeline->setClient("Vulkan");
@@ -339,50 +332,62 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
       options.shadowDescriptorTable = ShadowDescTablePtrHigh;
   }
 
-  if (isGraphics() && getGfxIpVersion().major >= 10) {
-    // Only set NGG options for a GFX10+ graphics pipeline.
-    auto pipelineInfo = reinterpret_cast<const GraphicsPipelineBuildInfo *>(getPipelineBuildInfo());
-    const auto &nggState = pipelineInfo->nggState;
-    if (!nggState.enableNgg)
-      options.nggFlags |= NggFlagDisable;
-    else {
-      options.nggFlags = (nggState.enableGsUse ? NggFlagEnableGsUse : 0) |
-                         (nggState.forceCullingMode ? NggFlagForceCullingMode : 0) |
-                         (nggState.compactMode == NggCompactDisable ? NggFlagCompactDisable : 0) |
-                         (nggState.enableVertexReuse ? NggFlagEnableVertexReuse : 0) |
-                         (nggState.enableBackfaceCulling ? NggFlagEnableBackfaceCulling : 0) |
-                         (nggState.enableFrustumCulling ? NggFlagEnableFrustumCulling : 0) |
-                         (nggState.enableBoxFilterCulling ? NggFlagEnableBoxFilterCulling : 0) |
-                         (nggState.enableSphereCulling ? NggFlagEnableSphereCulling : 0) |
-                         (nggState.enableSmallPrimFilter ? NggFlagEnableSmallPrimFilter : 0) |
-                         (nggState.enableCullDistanceCulling ? NggFlagEnableCullDistanceCulling : 0);
-      options.nggBackfaceExponent = nggState.backfaceExponent;
+  if (isGraphics()) {
+    options.enableUberFetchShader =
+        reinterpret_cast<const GraphicsPipelineBuildInfo *>(getPipelineBuildInfo())->enableUberFetchShader;
+    if (getGfxIpVersion().major >= 10) {
+      // Only set NGG options for a GFX10+ graphics pipeline.
+      auto pipelineInfo = reinterpret_cast<const GraphicsPipelineBuildInfo *>(getPipelineBuildInfo());
+      const auto &nggState = pipelineInfo->nggState;
+#if VKI_BUILD_GFX11
+      if (!nggState.enableNgg && getGfxIpVersion().major < 11) // GFX11+ must enable NGG
+#else
+      if (!nggState.enableNgg)
+#endif
+        options.nggFlags |= NggFlagDisable;
+      else {
+        options.nggFlags = (nggState.enableGsUse ? NggFlagEnableGsUse : 0) |
+                           (nggState.forceCullingMode ? NggFlagForceCullingMode : 0) |
+                           (nggState.compactMode == NggCompactDisable ? NggFlagCompactDisable : 0) |
+                           (nggState.enableVertexReuse ? NggFlagEnableVertexReuse : 0) |
+                           (nggState.enableBackfaceCulling ? NggFlagEnableBackfaceCulling : 0) |
+                           (nggState.enableFrustumCulling ? NggFlagEnableFrustumCulling : 0) |
+                           (nggState.enableBoxFilterCulling ? NggFlagEnableBoxFilterCulling : 0) |
+                           (nggState.enableSphereCulling ? NggFlagEnableSphereCulling : 0) |
+                           (nggState.enableSmallPrimFilter ? NggFlagEnableSmallPrimFilter : 0) |
+                           (nggState.enableCullDistanceCulling ? NggFlagEnableCullDistanceCulling : 0);
+        options.nggBackfaceExponent = nggState.backfaceExponent;
 
-      // Use a static cast from Vkgc NggSubgroupSizingType to LGC NggSubgroupSizing, and static assert that
-      // that is valid.
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::Auto) == NggSubgroupSizing::Auto, "Mismatch");
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::MaximumSize) ==
-                        NggSubgroupSizing::MaximumSize,
-                    "Mismatch");
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::HalfSize) == NggSubgroupSizing::HalfSize,
-                    "Mismatch");
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::OptimizeForVerts) ==
-                        NggSubgroupSizing::OptimizeForVerts,
-                    "Mismatch");
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::OptimizeForPrims) ==
-                        NggSubgroupSizing::OptimizeForPrims,
-                    "Mismatch");
-      static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::Explicit) == NggSubgroupSizing::Explicit,
-                    "Mismatch");
-      options.nggSubgroupSizing = static_cast<NggSubgroupSizing>(nggState.subgroupSizing);
+        // Use a static cast from Vkgc NggSubgroupSizingType to LGC NggSubgroupSizing, and static assert that
+        // that is valid.
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::Auto) == NggSubgroupSizing::Auto,
+                      "Mismatch");
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::MaximumSize) ==
+                          NggSubgroupSizing::MaximumSize,
+                      "Mismatch");
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::HalfSize) == NggSubgroupSizing::HalfSize,
+                      "Mismatch");
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::OptimizeForVerts) ==
+                          NggSubgroupSizing::OptimizeForVerts,
+                      "Mismatch");
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::OptimizeForPrims) ==
+                          NggSubgroupSizing::OptimizeForPrims,
+                      "Mismatch");
+        static_assert(static_cast<NggSubgroupSizing>(NggSubgroupSizingType::Explicit) == NggSubgroupSizing::Explicit,
+                      "Mismatch");
+        options.nggSubgroupSizing = static_cast<NggSubgroupSizing>(nggState.subgroupSizing);
 
-      options.nggVertsPerSubgroup = nggState.vertsPerSubgroup;
-      options.nggPrimsPerSubgroup = nggState.primsPerSubgroup;
+        options.nggVertsPerSubgroup = nggState.vertsPerSubgroup;
+        options.nggPrimsPerSubgroup = nggState.primsPerSubgroup;
+      }
     }
   }
 
   options.allowNullDescriptor = getPipelineOptions()->extendedRobustness.nullDescriptor;
   options.disableImageResourceCheck = getPipelineOptions()->disableImageResourceCheck;
+#if VKI_BUILD_GFX11
+  options.optimizeTessFactor = getPipelineOptions()->optimizeTessFactor;
+#endif
   options.enableInterpModePatch = getPipelineOptions()->enableInterpModePatch;
   options.pageMigrationEnabled = getPipelineOptions()->pageMigrationEnabled;
   options.resourceLayoutScheme = static_cast<lgc::ResourceLayoutScheme>(getPipelineOptions()->resourceLayoutScheme);
@@ -420,10 +425,16 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
     shaderOptions.allowReZ = shaderInfo->options.allowReZ;
     shaderOptions.forceLateZ = shaderInfo->options.forceLateZ;
 
-    if (shaderInfo->options.vgprLimit != 0 && shaderInfo->options.vgprLimit != UINT_MAX)
-      shaderOptions.vgprLimit = shaderInfo->options.vgprLimit;
-    else
-      shaderOptions.vgprLimit = VgprLimit;
+    shaderOptions.vgprLimit = shaderInfo->options.vgprLimit;
+
+    if (shaderOptions.vgprLimit == UINT_MAX)
+      shaderOptions.vgprLimit = 0;
+
+    if (VgprLimit != 0) {
+      if (VgprLimit < shaderOptions.vgprLimit || shaderOptions.vgprLimit == 0) {
+        shaderOptions.vgprLimit = VgprLimit;
+      }
+    }
 
     if (ScalarizeWaterfallDescriptorLoads.getNumOccurrences() > 0) {
       shaderOptions.scalarizeWaterfallLoads = ScalarizeWaterfallDescriptorLoads;
@@ -434,10 +445,16 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
         shaderOptions.scalarizeWaterfallLoads = true;
     }
 
-    if (shaderInfo->options.sgprLimit != 0 && shaderInfo->options.sgprLimit != UINT_MAX)
-      shaderOptions.sgprLimit = shaderInfo->options.sgprLimit;
-    else
-      shaderOptions.sgprLimit = SgprLimit;
+    shaderOptions.sgprLimit = shaderInfo->options.sgprLimit;
+
+    if (shaderOptions.sgprLimit == UINT_MAX)
+      shaderOptions.sgprLimit = 0;
+
+    if (SgprLimit != 0) {
+      if (SgprLimit < shaderOptions.sgprLimit || shaderOptions.sgprLimit == 0) {
+        shaderOptions.sgprLimit = SgprLimit;
+      }
+    }
 
     if (shaderInfo->options.maxThreadGroupsPerComputeUnit != 0)
       shaderOptions.maxThreadGroupsPerComputeUnit = shaderInfo->options.maxThreadGroupsPerComputeUnit;
@@ -485,6 +502,8 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
     }
 
     shaderOptions.useSiScheduler = EnableSiScheduler || shaderInfo->options.useSiScheduler;
+    shaderOptions.disableCodeSinking = shaderInfo->options.disableCodeSinking;
+    shaderOptions.favorLatencyHiding = shaderInfo->options.favorLatencyHiding;
     shaderOptions.updateDescInElf = shaderInfo->options.updateDescInElf;
     shaderOptions.unrollThreshold = shaderInfo->options.unrollThreshold;
     // A non-zero command line -force-loop-unroll-count value overrides the shaderInfo option value.
@@ -528,8 +547,18 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
     shaderOptions.nsaThreshold = shaderInfo->options.nsaThreshold;
 
-    shaderOptions.aggressiveInvariantLoads = shaderInfo->options.aggressiveInvariantLoads;
-    shaderOptions.disableInvariantLoads = shaderInfo->options.disableInvariantLoads;
+    static_assert(static_cast<InvariantLoadsOption>(InvariantLoads::Auto) == InvariantLoadsOption::Auto, "Mismatch");
+    static_assert(static_cast<InvariantLoadsOption>(InvariantLoads::EnableOptimization) ==
+                      InvariantLoadsOption::EnableOptimization,
+                  "Mismatch");
+    static_assert(static_cast<InvariantLoadsOption>(InvariantLoads::DisableOptimization) ==
+                      InvariantLoadsOption::DisableOptimization,
+                  "Mismatch");
+    static_assert(static_cast<InvariantLoadsOption>(InvariantLoads::ClearInvariants) ==
+                      InvariantLoadsOption::ClearInvariants,
+                  "Mismatch");
+    shaderOptions.aggressiveInvariantLoads =
+        static_cast<InvariantLoadsOption>(shaderInfo->options.aggressiveInvariantLoads);
 
     pipeline->setShaderOptions(getLgcShaderStage(static_cast<ShaderStage>(stage)), shaderOptions);
   }
@@ -545,6 +574,7 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 // @param stageMask : Bitmap of shader stages
 void PipelineContext::setUserDataInPipeline(Pipeline *pipeline, Util::MetroHash64 *hasher, unsigned stageMask) const {
   auto resourceMapping = getResourceMapping();
+  auto pipelineLayoutApiHash = getPipelineLayoutApiHash();
 
   if (hasher) {
     // If there is only a single shader in stageMask (the common cases of just FS and just VS), then specify that
@@ -553,7 +583,7 @@ void PipelineContext::setUserDataInPipeline(Pipeline *pipeline, Util::MetroHash6
     // TODO: Improve the API here to let us pass the mask.
     const auto shaderStages = maskToShaderStages(stageMask);
     ShaderStage userDataStage = shaderStages.size() == 1 ? shaderStages[0] : ShaderStageInvalid;
-    PipelineDumper::updateHashForResourceMappingInfo(resourceMapping, hasher, userDataStage);
+    PipelineDumper::updateHashForResourceMappingInfo(resourceMapping, pipelineLayoutApiHash, hasher, userDataStage);
   }
   if (!pipeline)
     return; // Only hashing

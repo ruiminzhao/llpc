@@ -228,7 +228,6 @@ private:
   LLVMContext *m_context;
   lgc::Builder *m_builder;
   SPIRVModule *m_bm;
-  bool m_enableXfb;
   bool m_enableGatherLodNz;
   ShaderFloatControlFlags m_fpControlFlags;
   SPIRVFunction *m_entryTarget;
@@ -368,7 +367,7 @@ private:
   void setFastMathFlags(SPIRVValue *bv);
   void setFastMathFlags(Value *val);
   llvm::Value *transShiftLogicalBitwiseInst(SPIRVValue *bv, BasicBlock *bb, Function *f);
-  Instruction *transCmpInst(SPIRVValue *bv, BasicBlock *bb, Function *f);
+  llvm::Value *transCmpInst(SPIRVValue *bv, BasicBlock *bb, Function *f);
 
   void setName(llvm::Value *v, SPIRVValue *bv);
   void setLLVMLoopMetadata(SPIRVLoopMerge *lm, BranchInst *bi);
@@ -384,6 +383,7 @@ private:
                                              const std::function<Value *(Value *)> &createImageOp);
 
   Function *createLibraryEntryFunc();
+
   // ========================================================================================================================
   // Wrapper method for easier access to pipeline options.
   // @returns : Pointer to the pipeline options of the current LLPC context.

@@ -28,7 +28,7 @@
  * @brief LLPC source file: implementation of arithmetic Builder methods
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
@@ -1242,10 +1242,9 @@ Value *ArithBuilder::CreateInsertBitField(Value *base, Value *insert, Value *off
   offset = CreateZExtOrTrunc(offset, base->getType());
   count = CreateZExtOrTrunc(count, base->getType());
 
-  Value *baseXorInsert = CreateXor(CreateShl(insert, offset), base);
   Constant *one = ConstantInt::get(count->getType(), 1);
   Value *mask = CreateShl(CreateSub(CreateShl(one, count), one), offset);
-  Value *result = CreateXor(CreateAnd(baseXorInsert, mask), base);
+  Value *result = CreateOr(CreateAnd(CreateShl(insert, offset), mask), CreateAnd(base, CreateNot(mask)));
   Value *isWholeField = CreateICmpEQ(
       count, ConstantInt::get(count->getType(), count->getType()->getScalarType()->getPrimitiveSizeInBits()));
   return CreateSelect(isWholeField, insert, result, instName);
@@ -1359,12 +1358,10 @@ Value *ArithBuilder::createFMix(Value *x, Value *y, Value *a, const Twine &instN
 Value *ArithBuilder::canonicalize(Value *value) {
   const auto &shaderMode = getShaderModes()->getCommonShaderMode(m_shaderStage);
   auto destTy = value->getType();
-  FpDenormMode denormMode =
-      destTy->getScalarType()->isHalfTy()
-          ? shaderMode.fp16DenormMode
-          : destTy->getScalarType()->isFloatTy()
-                ? shaderMode.fp32DenormMode
-                : destTy->getScalarType()->isDoubleTy() ? shaderMode.fp64DenormMode : FpDenormMode::DontCare;
+  FpDenormMode denormMode = destTy->getScalarType()->isHalfTy()     ? shaderMode.fp16DenormMode
+                            : destTy->getScalarType()->isFloatTy()  ? shaderMode.fp32DenormMode
+                            : destTy->getScalarType()->isDoubleTy() ? shaderMode.fp64DenormMode
+                                                                    : FpDenormMode::DontCare;
   if (denormMode == FpDenormMode::FlushOut || denormMode == FpDenormMode::FlushInOut) {
     // Has to flush denormals, insert canonicalize to make a MUL (* 1.0) forcibly
     value = CreateUnaryIntrinsic(Intrinsic::canonicalize, value);

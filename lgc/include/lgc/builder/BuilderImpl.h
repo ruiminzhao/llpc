@@ -50,6 +50,9 @@ public:
   llvm::Value *CreateIntegerDotProduct(llvm::Value *vector1, llvm::Value *vector2, llvm::Value *accumulator,
                                        unsigned flags, const llvm::Twine &instName = "") override final;
 
+  // Set the current shader stage, clamp shader stage to the ShaderStageCompute
+  void setShaderStage(ShaderStage stage) { m_shaderStage = stage > ShaderStageCompute ? ShaderStageCompute : stage; }
+
 protected:
   // Get the ShaderModes object.
   ShaderModes *getShaderModes() override final;
@@ -112,7 +115,8 @@ protected:
     return BuilderBase::get(*this).CreateMapToInt32(mapFunc, mappedArgs, passthroughArgs);
   }
 
-  PipelineState *m_pipelineState = nullptr; // Pipeline state
+  PipelineState *m_pipelineState = nullptr;       // Pipeline state
+  ShaderStage m_shaderStage = ShaderStageInvalid; // Current shader stage being built.
 
 private:
   BuilderImplBase() = delete;
@@ -410,6 +414,7 @@ public:
   llvm::Value *CreateImageBvhIntersectRay(llvm::Value *nodePtr, llvm::Value *extent, llvm::Value *origin,
                                           llvm::Value *direction, llvm::Value *invDirection, llvm::Value *imageDesc,
                                           const llvm::Twine &instName = "") override final;
+
 #endif
 
 private:
@@ -473,6 +478,12 @@ private:
     IMG_FMT_8_8_8_8_UNORM__GFX10CORE = 56,
     IMG_FMT_GB_GR_UNORM__GFX10CORE = 147,
     IMG_FMT_BG_RG_UNORM__GFX10CORE = 151,
+  };
+
+  enum ImgFmtGfx11 {
+    IMG_FMT_8_8_8_8_UNORM__GFX104PLUS = 42,
+    IMG_FMT_GB_GR_UNORM__GFX104PLUS = 82,
+    IMG_FMT_BG_RG_UNORM__GFX104PLUS = 86,
   };
 
   static const unsigned AtomicOpCompareSwap = 1;

@@ -48,8 +48,11 @@ namespace lgc {
 // Constructor
 //
 // @param pipelineState : Pipeline state
-MeshTaskShader::MeshTaskShader(PipelineState *pipelineState)
-    : m_pipelineState(pipelineState), m_builder(std::make_unique<IRBuilder<>>(pipelineState->getContext())),
+// @param getPostDomTree : Function to get the post dominator tree of the given function
+MeshTaskShader::MeshTaskShader(PipelineState *pipelineState,
+                               PatchPreparePipelineAbi::FunctionAnalysisHandlers *analysisHandlers)
+    : m_pipelineState(pipelineState), m_analysisHandlers(analysisHandlers),
+      m_builder(std::make_unique<IRBuilder<>>(pipelineState->getContext())),
       m_gfxIp(pipelineState->getTargetInfo().getGfxIpVersion()) {
   assert(pipelineState->getTargetInfo().getGfxIpVersion() >= GfxIpVersion({10, 3})); // Must be GFX10.3+
   m_pipelineSysValues.initialize(m_pipelineState);
@@ -83,9 +86,12 @@ unsigned MeshTaskShader::layoutMeshShaderLds(PipelineState *pipelineState, Funct
   //
   // 1. Internal mesh LDS:
   //
-  // +--------------+-----------------+-------------------+-------------------+----------------+-------------------+
-  // | Vertex Count | Primitive Count | Flat Workgroup ID | Primitive Indices | Vertex Outputs | Primitive Outputs |
-  // +--------------+-----------------+-------------------+-------------------+----------------+-------------------+
+  // +--------------+-----------------+--------------------+-------------------+-------------------+
+  // | Vertex Count | Primitive Count | Barrier Completion | Flat Workgroup ID | Primitive Indices | >>>
+  // +--------------+-----------------+--------------------+-------------------+-------------------+
+  //       +----------------+-------------------+
+  //   >>> | Vertex Outputs | Primitive Outputs |
+  //       +----------------+-------------------+
   //
   // 2. Shared variable LDS:
   //
@@ -134,11 +140,20 @@ unsigned MeshTaskShader::layoutMeshShaderLds(PipelineState *pipelineState, Funct
   }
   meshLdsSizeInDwords += ldsRegionSize;
 
+  // Barrier completion
+  ldsRegionSize = 1; // A dword corresponds to barrier completion flag (i32)
+  if (ldsLayout) {
+    printLdsRegionInfo("Barrier Completion", ldsOffsetInDwords, ldsRegionSize);
+    (*ldsLayout)[MeshLdsRegion::BarrierCompletion] = std::make_pair(ldsOffsetInDwords, ldsRegionSize);
+    ldsOffsetInDwords += ldsRegionSize;
+  }
+  meshLdsSizeInDwords += ldsRegionSize;
+
   // Flat workgroup ID
   if (useFlatWorkgroupId(pipelineState)) {
     ldsRegionSize = 1; // A dword corresponds to flat workgroup ID (i32)
     if (ldsLayout) {
-      printLdsRegionInfo("Flat workgroup ID", ldsOffsetInDwords, ldsRegionSize);
+      printLdsRegionInfo("Flat Workgroup ID", ldsOffsetInDwords, ldsRegionSize);
       (*ldsLayout)[MeshLdsRegion::FlatWorkgroupId] = std::make_pair(ldsOffsetInDwords, ldsRegionSize);
       ldsOffsetInDwords += ldsRegionSize;
     }
@@ -303,6 +318,10 @@ GlobalVariable *MeshTaskShader::getOrCreateMeshLds(Module *module, unsigned mesh
 // @param pipelineState : Pipeline state
 // @returns : The flag indicating whether flat workgroup ID is used.
 unsigned MeshTaskShader::useFlatWorkgroupId(PipelineState *pipelineState) {
+  // NOTE: For GFX11+, HW will provide workgroup ID via SGPRs. We don't need flat workgroup ID to do emulation.
+  if (pipelineState->getTargetInfo().getGfxIpVersion().major >= 11)
+    return false;
+
   const auto &builtInUsage = pipelineState->getShaderResourceUsage(ShaderStageMesh)->builtInUsage.mesh;
   return builtInUsage.workgroupId || builtInUsage.globalInvocationId;
 }
@@ -430,19 +449,38 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
   //
   //   if (threadIdInSubgroup == 0) {
   //     Write invalid vertex count (~0) to LDS
-  //     Write flat workgroup ID to LDS
+  //     Write barrier completion flag to LDS (if needBarrierFlag)
+  //     Write flat workgroup ID to LDS (only for GFX10.3)
   //   }
   //
   //   Barrier
-  //   if (threadIdInSubgroup < numMeshThreads) {
-  //     Mesh shader main body (from API shader, lower mesh shader specific calls)
-  //       - SetMeshOutputs -> Write vertex/primitive count to LDS and send message GS_ALLOC_REQ
-  //         (threadIdInSubgroup == 0)
-  //       - SetPrimitiveIndices -> Write primitive connectivity data to LDS
-  //       - SetPrimitiveCulled -> Write null primitive flag to LDS
-  //       - GetMeshInput -> Lower mesh built-in input
-  //       - ReadTaskPayload -> Read task payload from payload ring
-  //       - Write primitive/vertex output -> Write output data to LDS
+  //   if (waveId < numMeshWaves) {
+  //     if (threadIdInSubgroup < numMeshThreads) {
+  //       Mesh shader main body (from API shader)
+  //         1. Handle API barriers (if needBarrierFlag):
+  //           - Flip barrier toggle (barrierToggle = !barrierToggle) when encountering each API barrier
+  //           - Write barrier completion flag to LDS (barrierFlag = barrierToggle ? 0b11 : 0b10)
+  //         2. Lower mesh shader specific calls:
+  //           - SetMeshOutputs -> Write vertex/primitive count to LDS and send message GS_ALLOC_REQ
+  //             (threadIdInSubgroup == 0)
+  //           - SetPrimitiveIndices -> Write primitive connectivity data to LDS
+  //           - SetPrimitiveCulled -> Write null primitive flag to LDS
+  //           - GetMeshInput -> Lower mesh built-in input
+  //           - ReadTaskPayload -> Read task payload from payload ring
+  //           - Write primitive/vertex output -> Write output data to LDS
+  //     }
+  //
+  //     Barrier (if needBarrierFlag)
+  //   } else {
+  //     Extra waves to add additional barriers (if needBarrierFlag):
+  //     do {
+  //       barrierToggle = !barrierToggle
+  //       Barrier
+  //
+  //       Read barrierFlag from LDS:
+  //         barriersCompleted = barrierFlag != 0
+  //         barriersToggle = barrierFlag & 0x1
+  //     } while (!barriersCompleted || barriersToggle == barrierToggle)
   //   }
   //
   //   Barrier
@@ -482,6 +520,9 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
   m_shaderRingEntryIndex = nullptr;
   m_payloadRingEntryOffset = nullptr;
 
+  // Determine if barrier completion flag is needed
+  m_needBarrierFlag = checkNeedBarrierFlag(entryPoint);
+
   auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
   const unsigned waveSize = m_pipelineState->getShaderWaveSize(ShaderStageMesh);
 
@@ -503,35 +544,42 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
                         std::to_string(primAmpFactor) + std::string(",") + std::to_string(flatWorkgroupSize));
 
   const unsigned numWaves = alignTo(flatWorkgroupSize, waveSize) / waveSize;
+  const unsigned numMeshWaves = alignTo(numMeshThreads, waveSize) / waveSize;
 
   // API mesh shader entry block
-  BasicBlock *beginMeshShaderBlock = &entryPoint->getEntryBlock();
-  beginMeshShaderBlock->setName(".beginMeshShader");
+  BasicBlock *apiMeshEntryBlock = &entryPoint->getEntryBlock();
+  apiMeshEntryBlock->setName(".apiMeshEntry");
 
   // API mesh shader exit block
-  BasicBlock *retBlock = nullptr;
+  BasicBlock *apiMeshExitBlock = nullptr;
   for (auto &block : *entryPoint) {
     auto retInst = dyn_cast<ReturnInst>(block.getTerminator());
     if (retInst) {
-      retBlock = &block;
+      apiMeshExitBlock = &block;
       break;
     }
   }
-  assert(retBlock);
-  auto endMeshShaderBlock = retBlock->splitBasicBlock(retBlock->getTerminator(), ".endMeshShader");
+  assert(apiMeshExitBlock);
+  apiMeshExitBlock->setName(".apiMeshExit");
+  auto endMeshWaveBlock = apiMeshExitBlock->splitBasicBlock(apiMeshExitBlock->getTerminator(), ".endApiMeshWave");
 
   // Helper to create basic block
   auto createBlock = [&](const char *blockName, BasicBlock *insertBefore = nullptr) {
     return BasicBlock::Create(entryPoint->getParent()->getContext(), blockName, entryPoint, insertBefore);
   };
 
-  auto entryBlock = createBlock(".entry", beginMeshShaderBlock);
-  auto initPrimitiveIndicesHeaderBlock = createBlock(".initPrimitiveIndicesHeader", beginMeshShaderBlock);
-  auto initPrimitiveIndicesBodyBlock = createBlock(".initPrimitiveIndicesBody", beginMeshShaderBlock);
-  auto endInitPrimitiveIndicesBlock = createBlock(".endInitPrimitiveIndices", beginMeshShaderBlock);
+  auto entryBlock = createBlock(".entry", apiMeshEntryBlock);
+  auto initPrimitiveIndicesHeaderBlock = createBlock(".initPrimitiveIndicesHeader", apiMeshEntryBlock);
+  auto initPrimitiveIndicesBodyBlock = createBlock(".initPrimitiveIndicesBody", apiMeshEntryBlock);
+  auto endInitPrimitiveIndicesBlock = createBlock(".endInitPrimitiveIndices", apiMeshEntryBlock);
 
-  auto writeSpecialValueBlock = createBlock(".writeSpecialValue", beginMeshShaderBlock);
-  auto endWriteSpecialValueBlock = createBlock(".endWriteSpecialValue", beginMeshShaderBlock);
+  auto writeSpecialValueBlock = createBlock(".writeSpecialValue", apiMeshEntryBlock);
+  auto endWriteSpecialValueBlock = createBlock(".endWriteSpecialValue", apiMeshEntryBlock);
+
+  auto beginMeshWaveBlock = createBlock(".beginMeshWave", apiMeshEntryBlock);
+
+  auto beginExtraWaveBlock = createBlock(".beginExtraWave");
+  auto checkMeshOutputCountBlock = createBlock(".checkMeshOutputCount");
 
   auto checkDummyAllocReqBlock = createBlock(".checkDummyAllocReq");
   auto dummyAllocReqBlock = createBlock(".dummyAllocReq");
@@ -555,6 +603,11 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
 
     initWaveThreadInfo(entryPoint);
 
+    if (m_needBarrierFlag) {
+      m_barrierToggle = m_builder->CreateAlloca(m_builder->getInt1Ty(), nullptr, "barrierToggle");
+      m_builder->CreateStore(m_builder->getFalse(), m_barrierToggle);
+    }
+
     m_builder->CreateBr(initPrimitiveIndicesHeaderBlock);
   }
 
@@ -572,6 +625,9 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
           m_builder->CreateAdd(m_waveThreadInfo.threadIdInSubgroup,
                                m_builder->CreateMul(loopIndexPhi, m_builder->getInt32(waveSize)), "primitiveIndex");
     }
+
+    if (m_gfxIp.major >= 11)
+      prepareAttribRingAccess();
 
     auto validPrimitive =
         m_builder->CreateICmpULT(m_waveThreadInfo.primOrVertexIndex, m_builder->getInt32(meshMode.outputPrimitives));
@@ -627,6 +683,12 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
     auto ldsOffset = m_builder->getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::VertexCount));
     writeValueToLds(m_builder->getInt32(InvalidValue), ldsOffset);
 
+    // Write barrier completion flag to LDS if it is required. Otherwise, skip it.
+    if (m_needBarrierFlag) {
+      auto ldsOffset = m_builder->getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::BarrierCompletion));
+      writeValueToLds(m_builder->getInt32(0), ldsOffset);
+    }
+
     // Write flat workgroup ID to LDS if it is required. Otherwise, skip it.
     if (useFlatWorkgroupId(m_pipelineState)) {
       auto ldsOffset = m_builder->getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::FlatWorkgroupId));
@@ -647,22 +709,91 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
     m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
     m_builder->CreateFence(AtomicOrdering::Acquire, syncScope);
 
-    auto validMesh = m_builder->CreateICmpULT(m_waveThreadInfo.threadIdInSubgroup, m_builder->getInt32(numMeshThreads));
-    m_builder->CreateCondBr(validMesh, beginMeshShaderBlock, endMeshShaderBlock);
+    auto validMeshWave = m_builder->CreateICmpULT(m_waveThreadInfo.waveIdInSubgroup, m_builder->getInt32(numMeshWaves));
+    // There could be no extra waves
+    validMeshWave = m_builder->CreateOr(validMeshWave, m_builder->getInt1(numMeshWaves == numWaves));
+    m_builder->CreateCondBr(validMeshWave, beginMeshWaveBlock, beginExtraWaveBlock);
+  }
+
+  // Construct ".beginMeshWave" block
+  {
+    m_builder->SetInsertPoint(beginMeshWaveBlock);
+
+    auto validMeshThread =
+        m_builder->CreateICmpULT(m_waveThreadInfo.threadIdInSubgroup, m_builder->getInt32(numMeshThreads));
+    m_builder->CreateCondBr(validMeshThread, apiMeshEntryBlock, endMeshWaveBlock);
   }
 
   // Lower mesh shader main body
-  lowerMeshShaderBody(beginMeshShaderBlock);
+  lowerMeshShaderBody(apiMeshEntryBlock, apiMeshExitBlock);
 
-  // Construct ".endMeshShader" block
-  Value *vertexCount = nullptr;
-  Value *primitiveCount = nullptr;
+  // Construct ".endMeshWave" block
   {
-    m_builder->SetInsertPoint(endMeshShaderBlock);
+    m_builder->SetInsertPoint(endMeshWaveBlock);
 
     // NOTE: Here, we remove original return instruction from API mesh shader and continue to construct this block
     // with other instructions.
-    endMeshShaderBlock->getTerminator()->eraseFromParent();
+    endMeshWaveBlock->getTerminator()->eraseFromParent();
+
+    if (m_needBarrierFlag) {
+      SyncScope::ID syncScope = entryPoint->getParent()->getContext().getOrInsertSyncScopeID("workgroup");
+      m_builder->CreateFence(AtomicOrdering::Release, syncScope);
+      m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+      m_builder->CreateFence(AtomicOrdering::Acquire, syncScope);
+    }
+
+    m_builder->CreateBr(checkMeshOutputCountBlock);
+  }
+
+  // Construct ".beginExtraWave" block
+  {
+    m_builder->SetInsertPoint(beginExtraWaveBlock);
+
+    if (m_needBarrierFlag) {
+      //
+      // do {
+      //   barrierToggle != barrierToggle
+      //   Barrier
+      // } while (!barriersCompleted || barriersToggle == barrierToggle)
+      //
+
+      // barrierToggle = !barrierToggle
+      Value *barrierToggle = m_builder->CreateLoad(m_builder->getInt1Ty(), m_barrierToggle);
+      barrierToggle = m_builder->CreateNot(barrierToggle);
+      m_builder->CreateStore(barrierToggle, m_barrierToggle);
+
+      m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+
+      auto ldsOffset = m_builder->getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::BarrierCompletion));
+      auto barrierFlag = readValueFromLds(m_builder->getInt32Ty(), ldsOffset);
+
+      // barriersNotCompleted = barrierFlag == 0
+      auto barriersNotCompleted = m_builder->CreateICmpEQ(barrierFlag, m_builder->getInt32(0));
+      // barriersToggle = barrierFlag & 0x1
+      auto barriersToggle = m_builder->CreateAnd(barrierFlag, 0x1);
+      barriersToggle = m_builder->CreateTrunc(barriersToggle, m_builder->getInt1Ty());
+
+      // toggleEqual = barriersToggle == barrierToggle
+      auto toggleEqual = m_builder->CreateICmpEQ(barriersToggle, barrierToggle);
+
+      auto continueToAddBarriers = m_builder->CreateOr(barriersNotCompleted, toggleEqual);
+      m_builder->CreateCondBr(continueToAddBarriers, beginExtraWaveBlock, checkMeshOutputCountBlock);
+    } else {
+      const unsigned numBarriers = m_barriers.size();
+      // NOTEL: Here, we don't need barrier completion flag, but we still find API barriers. To match number of API
+      // barriers, we add additional barriers in extra waves. The number is known.
+      for (unsigned i = 0; i < numBarriers; ++i) {
+        m_builder->CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+      }
+      m_builder->CreateBr(checkMeshOutputCountBlock);
+    }
+  }
+
+  // Construct ".checkMeshOutputCount" block
+  Value *vertexCount = nullptr;
+  Value *primitiveCount = nullptr;
+  {
+    m_builder->SetInsertPoint(checkMeshOutputCountBlock);
 
     SyncScope::ID syncScope = entryPoint->getParent()->getContext().getOrInsertSyncScopeID("workgroup");
     m_builder->CreateFence(AtomicOrdering::Release, syncScope);
@@ -726,6 +857,12 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       m_waveThreadInfo.primOrVertexIndex =
           m_builder->CreateAdd(m_waveThreadInfo.threadIdInSubgroup,
                                m_builder->CreateMul(loopIndexPhi, m_builder->getInt32(waveSize)), "primitiveIndex");
+
+      if (m_gfxIp.major >= 11) {
+        // rowInSubgroup = waveIdInSubgroup + loopIndex
+        m_waveThreadInfo.rowInSubgroup =
+            m_builder->CreateAdd(m_waveThreadInfo.waveIdInSubgroup, loopIndexPhi, "rowInSubgroup");
+      }
     }
 
     auto validPrimitive = m_builder->CreateICmpULT(m_waveThreadInfo.primOrVertexIndex, primitiveCount);
@@ -742,6 +879,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       //
       //   loopIndex = 0
       //   primitiveIndex = threadIdInSubgroup
+      //   rowInSubgroup = waveIdInSubgroup
       //
       //   while (primitiveIndex < primitiveCount) {
       //     Export primitive
@@ -749,6 +887,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       //
       //     loopIndex += numWaves
       //     primitiveIndex += loopIndex * waveSize
+      //     rowInSubgroup += loopIndex
       //   }
       //
       auto loopIndex = m_builder->CreateAdd(loopIndexPhi, m_builder->getInt32(numWaves)); // loopIndex += numWaves
@@ -778,6 +917,12 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       m_waveThreadInfo.primOrVertexIndex =
           m_builder->CreateAdd(m_waveThreadInfo.threadIdInSubgroup,
                                m_builder->CreateMul(loopIndexPhi, m_builder->getInt32(waveSize)), "vertexIndex");
+
+      if (m_gfxIp.major >= 11) {
+        // rowInSubgroup = waveIdInSubgroup + loopIndex
+        m_waveThreadInfo.rowInSubgroup =
+            m_builder->CreateAdd(m_waveThreadInfo.waveIdInSubgroup, loopIndexPhi, "rowInSubgroup");
+      }
     }
 
     auto validVertex = m_builder->CreateICmpULT(m_waveThreadInfo.primOrVertexIndex, vertexCount);
@@ -794,6 +939,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       //
       //   loopIndex = 0
       //   vertexIndex = threadIdInSubgroup
+      //   rowInSubgroup = waveIdInSubgroup
       //
       //   while (vertexIndex < vertexCount) {
       //     Export vertex position data
@@ -801,6 +947,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
       //
       //     loopIndex += numWaves
       //     vertexIndex += loopIndex * waveSize
+      //     rowInSubgroup += loopIndex
       //   }
       //
       auto loopIndex = m_builder->CreateAdd(loopIndexPhi, m_builder->getInt32(numWaves)); // loopIndex += numWaves
@@ -1170,6 +1317,25 @@ void MeshTaskShader::initWaveThreadInfo(Function *entryPoint) {
 
     m_waveThreadInfo.primOrVertexIndex =
         m_waveThreadInfo.threadIdInSubgroup; // Primitive or vertex index is initialized to thread ID in subgroup
+
+    if (m_gfxIp.major >= 11) {
+      // The workgroup ID X and Y are reused via the SGPR of off-chip LDS base in NGG new fast launch mode
+      Value *workgroupIdYX =
+          getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::OffChipLdsBase));
+      // workgroupIdY = workgroupIdXY[31:16]
+      m_waveThreadInfo.workgroupIdY =
+          m_builder->CreateAnd(m_builder->CreateLShr(workgroupIdYX, 16), 0xFFFF, "workgroupIdY");
+      // workgroupIdX = workgroupIdXY[15:0]
+      m_waveThreadInfo.workgroupIdX = m_builder->CreateAnd(workgroupIdYX, 0xFFFF, "workgroupIdX");
+      // workgroupIdZ = attribRingBaseAndWorkgroupIdZ[31:16]
+      Value *workgroupIdZAndAttribRingBase =
+          getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::AttribRingBase));
+      m_waveThreadInfo.workgroupIdZ =
+          m_builder->CreateAnd(m_builder->CreateLShr(workgroupIdZAndAttribRingBase, 16), 0xFFFF, "workgroupIdZ");
+
+      m_waveThreadInfo.rowInSubgroup =
+          m_waveThreadInfo.waveIdInSubgroup; // Row number is initialized to wave ID in subgroup
+    }
   }
 }
 
@@ -1409,9 +1575,18 @@ Function *MeshTaskShader::mutateMeshShaderEntryPoint(Function *entryPoint) {
       "offChipLdsBase",    "sharedScratchOffset", "gsShaderAddrLow", "gsShaderAddrHigh",
   };
 
+  // GFX10 special SGPR input names
+  static const SmallVector<std::string, NumSpecialSgprInputs> SpecialSgprInputNamesGfx11 = {
+      "gsProgramAddrLow", "gsProgramAddrHigh", "mergedGroupInfo",
+      "mergedWaveInfo",   "workgroupIdYX",     "workgroupIdZAndAttribRingBase",
+      "flatScratchLow",   "flatScratchHigh",
+  };
+
   ArrayRef<std::string> specialSgprInputNames;
   if (m_gfxIp.major == 10)
     specialSgprInputNames = makeArrayRef(SpecialSgprInputNamesGfx10);
+  else if (m_gfxIp.major == 11)
+    specialSgprInputNames = makeArrayRef(SpecialSgprInputNamesGfx11);
   assert(specialSgprInputNames.size() == NumSpecialSgprInputs);
 
   // Add special SGPR inputs, prior to existing user data SGPRs
@@ -1454,12 +1629,34 @@ Function *MeshTaskShader::mutateMeshShaderEntryPoint(Function *entryPoint) {
 // =====================================================================================================================
 // Lower mesh shader main body by lowering mesh shader specific calls.
 //
-// @param beginMeshShaderBlock : API mesh shader entry block (before any mutation)
-void MeshTaskShader::lowerMeshShaderBody(BasicBlock *beginMeshShaderBlock) {
-  auto entryPoint = beginMeshShaderBlock->getParent();
+// @param apiMeshEntryBlock : API mesh shader entry block (before any mutation)
+// @param apiMeshExitBlock : API mesh shader exit block (before any mutation)`
+void MeshTaskShader::lowerMeshShaderBody(BasicBlock *apiMeshEntryBlock, BasicBlock *apiMeshExitBlock) {
+  auto entryPoint = apiMeshEntryBlock->getParent();
   assert(getShaderStage(entryPoint) == ShaderStageMesh);
 
   SmallVector<CallInst *, 8> removedCalls;
+
+  // Handle API mesh shader barrier
+  if (m_needBarrierFlag) {
+    // Flip barrier toggle when we encounter a API barrier
+    for (auto barrier : m_barriers) {
+      m_builder->SetInsertPoint(barrier);
+      // barrierToggle = !barrierToggle
+      Value *barrierToggle = m_builder->CreateLoad(m_builder->getInt1Ty(), m_barrierToggle);
+      barrierToggle = m_builder->CreateNot(barrierToggle);
+      m_builder->CreateStore(barrierToggle, m_barrierToggle);
+    }
+
+    // Store barrier completion flag according to barrier toggle
+    m_builder->SetInsertPoint(apiMeshExitBlock->getTerminator());
+    // barrierFlag = barrierToggle ? 0b11 : 0b10
+    Value *barrierToggle = m_builder->CreateLoad(m_builder->getInt1Ty(), m_barrierToggle);
+    Value *barrierFlag = m_builder->CreateSelect(barrierToggle, m_builder->getInt32(3), m_builder->getInt32(2));
+
+    auto ldsOffset = m_builder->getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::BarrierCompletion));
+    writeValueToLds(barrierFlag, ldsOffset);
+  }
 
   // Lower mesh shader calls
   auto module = entryPoint->getParent();
@@ -1503,7 +1700,7 @@ void MeshTaskShader::lowerMeshShaderBody(BasicBlock *beginMeshShaderBlock) {
           unsigned builtIn = cast<ConstantInt>(call->getOperand(0))->getZExtValue();
 
           // NOTE: Mesh shader input lowering is supposed to happen at the beginning of API mesh shader.
-          m_builder->SetInsertPoint(&*beginMeshShaderBlock->getFirstInsertionPt());
+          m_builder->SetInsertPoint(&*apiMeshEntryBlock->getFirstInsertionPt());
 
           auto meshInput = getMeshInput(static_cast<BuiltInKind>(builtIn));
           assert(meshInput->getType() == call->getType());
@@ -1798,22 +1995,30 @@ void MeshTaskShader::exportPrimitive() {
   auto primitiveIndices = readValueFromLds(m_builder->getInt32Ty(), ldsOffset);
 
   // The second dword is primitive payload, which has the following bit layout specified by HW:
-  //   [31:30] = VRS rate Y
-  //   [29:28] = VRS rate X
-  //   [27:24] = Unused
-  //   [23:20] = Viewport index
-  //   [19:17] = Render target slice index
-  //   [16:0]  = Pipeline primitive ID
+  //
+  //   +------------+------------+---------+----------------+----------------+------------------+
+  //   | VRS Rate Y | VRS Rate X | Unused  | Viewport Index | RT Slice Index | Pipeline Prim ID |
+  //   | [31:30]    | [29:28]    | [27:24] | [23:20]        | [19:17]        | [16:0]           |
+  //   +------------+------------+---------+----------------+----------------+------------------+
+  //
+  // On GFX11, the bit layout is changed:
+  //
+  //   +---------------+---------+----------------+---------+----------------+
+  //   | VRS Rate Enum | Unused  | Viewport Index | Unused  | RT Slice Index |
+  //   | [31:28]       | [27:24] | [23:20]        | [19:13] | [12:0]         |
+  //   +---------------+---------+----------------+---------+----------------+
   Value *primitivePayload = nullptr;
   Value *primitiveId = nullptr;
   if (builtInUsage.primitiveId) {
-    // [16:0] = Pipeline primitive ID
     primitiveId = readMeshBuiltInFromLds(BuiltInPrimitiveId);
-    auto primitiveIdMaskAndShift = m_builder->CreateAnd(primitiveId, 0x1FFFF);
-    if (primitivePayload)
-      primitivePayload = m_builder->CreateOr(primitivePayload, primitiveIdMaskAndShift);
-    else
-      primitivePayload = primitiveIdMaskAndShift;
+    if (m_gfxIp.major < 11) {
+      // [16:0] = Pipeline primitive ID
+      auto primitiveIdMaskAndShift = m_builder->CreateAnd(primitiveId, 0x1FFFF);
+      if (primitivePayload)
+        primitivePayload = m_builder->CreateOr(primitivePayload, primitiveIdMaskAndShift);
+      else
+        primitivePayload = primitiveIdMaskAndShift;
+    }
   }
 
   Value *layer = nullptr;
@@ -1829,10 +2034,15 @@ void MeshTaskShader::exportPrimitive() {
   }
 
   if (enableMultiView || builtInUsage.layer) {
-    // [19:17] = Render target slice index
+    // [19:17] = RT slice index (on GFX11, [12:0] = RT slice index)
     // When multi-view is enabled, the input view index is treated as the output layer.
-    auto layerMaskAndShift = m_builder->CreateAnd(enableMultiView ? viewIndex : layer, 0x7);
-    layerMaskAndShift = m_builder->CreateShl(layerMaskAndShift, 17);
+    Value *layerMaskAndShift = nullptr;
+    if (m_gfxIp.major < 11) {
+      layerMaskAndShift = m_builder->CreateAnd(enableMultiView ? viewIndex : layer, 0x7);
+      layerMaskAndShift = m_builder->CreateShl(layerMaskAndShift, 17);
+    } else {
+      layerMaskAndShift = m_builder->CreateAnd(enableMultiView ? viewIndex : layer, 0x1FFF);
+    }
     if (primitivePayload)
       primitivePayload = m_builder->CreateOr(primitivePayload, layerMaskAndShift);
     else
@@ -1925,15 +2135,6 @@ void MeshTaskShader::exportPrimitive() {
       assert(layer);
       const unsigned exportLoc = inOutUsage.mesh.perPrimitiveBuiltInExportLocs[BuiltInLayer];
       primAttrExports.push_back({startLoc + exportLoc, layer});
-      ++inOutUsage.primExpCount;
-    }
-  }
-
-  if (enableMultiView) {
-    if (inOutUsage.mesh.perPrimitiveBuiltInExportLocs.count(BuiltInViewIndex) > 0) {
-      assert(viewIndex);
-      const unsigned exportLoc = inOutUsage.mesh.perPrimitiveBuiltInExportLocs[BuiltInViewIndex];
-      primAttrExports.push_back({startLoc + exportLoc, viewIndex});
       ++inOutUsage.primExpCount;
     }
   }
@@ -2036,7 +2237,12 @@ void MeshTaskShader::exportVertex() {
     }
   }
 
-  doExport(ExportKind::Pos, posExports);
+  bool waAtmPrecedesPos = false;
+  if (m_gfxIp.major >= 11)
+    waAtmPrecedesPos = m_pipelineState->getTargetInfo().getGpuWorkarounds().gfx11.waAtmPrecedesPos;
+
+  if (!waAtmPrecedesPos)
+    doExport(ExportKind::Pos, posExports);
 
   SmallVector<ExportInfo, 32> vertAttrExports;
 
@@ -2120,6 +2326,13 @@ void MeshTaskShader::exportVertex() {
   }
 
   doExport(ExportKind::VertAttr, vertAttrExports);
+  if (waAtmPrecedesPos) {
+    // Before the first export call of vertex position data, add s_wait_vscnt 0 to make sure the completion of all
+    // attributes being written to the attribute ring buffer
+    m_builder->CreateFence(AtomicOrdering::Release, SyncScope::System);
+
+    doExport(ExportKind::Pos, posExports);
+  }
 }
 
 // =====================================================================================================================
@@ -2227,17 +2440,120 @@ void MeshTaskShader::doExport(ExportKind kind, ArrayRef<ExportInfo> exports) {
     if ((kind == ExportKind::Pos || kind == ExportKind::Prim) && i == exports.size() - 1)
       exportDone = true; // Last export
 
-    m_builder->CreateIntrinsic(Intrinsic::amdgcn_exp, valueTy,
-                               {
-                                   m_builder->getInt32(target + exports[i].index), // tgt
-                                   m_builder->getInt32(validMask),                 // en
-                                   values[0],                                      // src0
-                                   values[1] ? values[1] : undef,                  // src1
-                                   values[2] ? values[2] : undef,                  // src2
-                                   values[3] ? values[3] : undef,                  // src3
-                                   m_builder->getInt1(exportDone),                 // done
-                                   m_builder->getFalse(),                          // vm
-                               });
+    if (m_gfxIp.major >= 11) {
+      if (kind == ExportKind::Pos || kind == ExportKind::Prim) {
+        m_builder->CreateIntrinsic(Intrinsic::amdgcn_exp_row, valueTy,
+                                   {
+                                       m_builder->getInt32(target + exports[i].index), // tgt
+                                       m_builder->getInt32(validMask),                 // en
+                                       values[0],                                      // src0
+                                       values[1] ? values[1] : undef,                  // src1
+                                       values[2] ? values[2] : undef,                  // src2
+                                       values[3] ? values[3] : undef,                  // src3
+                                       m_builder->getInt1(exportDone),                 // done
+                                       m_waveThreadInfo.rowInSubgroup,                 // row number
+                                   });
+      } else {
+        assert(kind == ExportKind::VertAttr || kind == ExportKind::PrimAttr);
+
+        Value *valueToStore = UndefValue::get(FixedVectorType::get(valueTy, 4));
+        for (unsigned j = 0; j < 4; ++j) {
+          if (values[j])
+            valueToStore = m_builder->CreateInsertElement(valueToStore, values[j], j);
+        }
+
+        // ringOffset = attribRingBaseOffset + 32 * exportIndex * 16
+        //            = attribRingBaseOffset + exportIndex * 512
+        unsigned exportIndex = exports[i].index;
+        if (kind == ExportKind::PrimAttr && m_hasNoVertexAttrib) {
+          // NOTE: HW allocates and manages attribute ring based on the register fields: VS_EXPORT_COUNT and
+          // PRIM_EXPORT_COUNT. When VS_EXPORT_COUNT = 0, HW assumes there is still a vertex attribute exported even
+          // though this is not what we want. Hence, we should reserve param0 as a dummy vertex attribute and all
+          // primitive attributes are moved after it.
+          ++exportIndex;
+        }
+        auto ringOffset =
+            m_builder->CreateAdd(m_attribRingBaseOffset, m_builder->getInt32(AttribGranularity * exportIndex));
+
+        CoherentFlag coherent = {};
+        coherent.bits.glc = true;
+
+        m_builder->CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, valueToStore->getType(),
+                                   {valueToStore, m_attribRingBufDesc, m_waveThreadInfo.threadIdInSubgroup,
+                                    m_builder->getInt32(0), ringOffset, m_builder->getInt32(coherent.u32All)});
+      }
+    } else {
+      m_builder->CreateIntrinsic(Intrinsic::amdgcn_exp, valueTy,
+                                 {
+                                     m_builder->getInt32(target + exports[i].index), // tgt
+                                     m_builder->getInt32(validMask),                 // en
+                                     values[0],                                      // src0
+                                     values[1] ? values[1] : undef,                  // src1
+                                     values[2] ? values[2] : undef,                  // src2
+                                     values[3] ? values[3] : undef,                  // src3
+                                     m_builder->getInt1(exportDone),                 // done
+                                     m_builder->getFalse(),                          // vm
+                                 });
+    }
+  }
+}
+
+// =====================================================================================================================
+// Prepare attribute ring access by collecting attribute count, modifying the STRIDE field of attribute ring buffer
+// descriptor, and calculating subgroup's attribute ring base offset.
+void MeshTaskShader::prepareAttribRingAccess() {
+  assert(m_gfxIp.major >= 11); // Must be GFX11+
+
+  // The allocated numbers of vertex/primitive attributes are something as follow:
+  //   1. Generic vertex attributes
+  //   2. Vertex attributes mapped from vertex builtins
+  //   3. Generic primitive attributes
+  //   4. Primitive attributes mapped from primitive builtins
+  const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageMesh)->inOutUsage.mesh;
+  unsigned vertAttribCount = inOutUsage.genericOutputMapLocCount;
+  for (auto &builtInExport : inOutUsage.builtInExportLocs) {
+    const unsigned exportLoc = builtInExport.second;
+    vertAttribCount = std::max(vertAttribCount, exportLoc + 1);
+  }
+
+  unsigned primAttribCount = inOutUsage.perPrimitiveGenericOutputMapLocCount;
+  for (auto &perPrimitiveBuiltInExport : inOutUsage.perPrimitiveBuiltInExportLocs) {
+    const unsigned exportLoc = perPrimitiveBuiltInExport.second;
+    primAttribCount = std::max(primAttribCount, exportLoc + 1);
+  }
+
+  unsigned attribCount = vertAttribCount + primAttribCount;
+  if (attribCount == 0)
+    return; // No attribute export
+
+  // NOTE: HW allocates and manages attribute ring based on the register fields: VS_EXPORT_COUNT and PRIM_EXPORT_COUNT.
+  // When VS_EXPORT_COUNT = 0, HW assumes there is still a vertex attribute exported even though this is not what we
+  // want. Hence, we should reserve param0 as a dummy vertex attribute.
+  if (vertAttribCount == 0) {
+    m_hasNoVertexAttrib = true;
+    ++attribCount; // Count in this dummy vertex attribute
+  }
+
+  // attribRingBase[14:0]
+  auto entryPoint = m_builder->GetInsertBlock()->getParent();
+  Value *attribRingBase =
+      getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::AttribRingBase));
+  attribRingBase = m_builder->CreateAnd(attribRingBase, 0x7FFF);
+  m_attribRingBaseOffset =
+      m_builder->CreateMul(attribRingBase, m_builder->getInt32(AttribGranularity), "attribRingBaseOffset");
+
+  m_attribRingBufDesc = m_pipelineSysValues.get(entryPoint)->getAttribRingBufDesc();
+
+  // Modify the field STRIDE of attribute ring buffer descriptor
+  if (attribCount >= 2) {
+    // STRIDE = WORD1[30:16], STRIDE is multiplied by attribute count
+    auto descWord1 = m_builder->CreateExtractElement(m_attribRingBufDesc, 1);
+    auto stride = m_builder->CreateAnd(m_builder->CreateLShr(descWord1, 16), 0x3FFF);
+    stride = m_builder->CreateMul(stride, m_builder->getInt32(attribCount));
+
+    descWord1 = m_builder->CreateAnd(descWord1, ~0x3FFF0000);                     // Clear STRIDE
+    descWord1 = m_builder->CreateOr(descWord1, m_builder->CreateShl(stride, 16)); // Set new STRIDE
+    m_attribRingBufDesc = m_builder->CreateInsertElement(m_attribRingBufDesc, descWord1, 1);
   }
 }
 
@@ -2282,40 +2598,50 @@ Value *MeshTaskShader::getMeshWorkgroupId() {
   assert(getShaderStage(entryPoint) == ShaderStageMesh); // Must be mesh shader
 
   if (!m_meshWorkgroupId) {
-    // flatWorkgroupId = workgroupId.z * dispatchDims.x * dispatchDims.y +
-    //                   workgroupId.y * dispatchDims.x + workgroupId.x
-    //
-    // workgroupId.z = flatWorkgroupId / dispatchDims.x * dispatchDims.y
-    // workgroupId.y = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) / dispatchDims.x
-    // workgroupId.x = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) -
-    //                 dispatchDims.x * workgroupId.y
-    auto flatWorkgroupId = getMeshFlatWorkgroupId();
+    if (m_gfxIp.major >= 11) {
+      Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder->getInt32Ty(), 3));
+      workgroupId =
+          m_builder->CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdX, static_cast<uint64_t>(0));
+      workgroupId = m_builder->CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdY, 1);
+      workgroupId = m_builder->CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdZ, 2);
 
-    auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageMesh)->entryArgIdxs.mesh;
+      m_meshWorkgroupId = workgroupId;
+    } else {
+      // flatWorkgroupId = workgroupId.z * dispatchDims.x * dispatchDims.y +
+      //                   workgroupId.y * dispatchDims.x + workgroupId.x
+      //
+      // workgroupId.z = flatWorkgroupId / dispatchDims.x * dispatchDims.y
+      // workgroupId.y = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) / dispatchDims.x
+      // workgroupId.x = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) -
+      //                 dispatchDims.x * workgroupId.y
+      auto flatWorkgroupId = getMeshFlatWorkgroupId();
 
-    auto dispatchDims = getFunctionArgument(entryPoint, entryArgIdxs.dispatchDims);
-    auto dispatchDimX = m_builder->CreateExtractElement(dispatchDims, static_cast<uint64_t>(0));
-    auto dispatchDimY = m_builder->CreateExtractElement(dispatchDims, 1);
-    auto dispatchDimXMulY = m_builder->CreateMul(dispatchDimX, dispatchDimY);
+      auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageMesh)->entryArgIdxs.mesh;
 
-    auto workgroupIdZ = m_builder->CreateUDiv(flatWorkgroupId, dispatchDimXMulY);
-    workgroupIdZ = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdZ); // Promoted to SGPR
+      auto dispatchDims = getFunctionArgument(entryPoint, entryArgIdxs.dispatchDims);
+      auto dispatchDimX = m_builder->CreateExtractElement(dispatchDims, static_cast<uint64_t>(0));
+      auto dispatchDimY = m_builder->CreateExtractElement(dispatchDims, 1);
+      auto dispatchDimXMulY = m_builder->CreateMul(dispatchDimX, dispatchDimY);
 
-    auto diff = m_builder->CreateMul(dispatchDimXMulY, workgroupIdZ);
-    diff = m_builder->CreateSub(flatWorkgroupId, diff);
-    auto workgroupIdY = m_builder->CreateUDiv(diff, dispatchDimX);
-    workgroupIdY = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdY); // Promoted to SGPR
+      auto workgroupIdZ = m_builder->CreateUDiv(flatWorkgroupId, dispatchDimXMulY);
+      workgroupIdZ = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdZ); // Promoted to SGPR
 
-    auto workgroupIdX = m_builder->CreateMul(dispatchDimX, workgroupIdY);
-    workgroupIdX = m_builder->CreateSub(diff, workgroupIdX);
-    workgroupIdX = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdX); // Promoted to SGPR
+      auto diff = m_builder->CreateMul(dispatchDimXMulY, workgroupIdZ);
+      diff = m_builder->CreateSub(flatWorkgroupId, diff);
+      auto workgroupIdY = m_builder->CreateUDiv(diff, dispatchDimX);
+      workgroupIdY = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdY); // Promoted to SGPR
 
-    Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder->getInt32Ty(), 3));
-    workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdX, static_cast<uint64_t>(0));
-    workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdY, 1);
-    workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdZ, 2);
+      auto workgroupIdX = m_builder->CreateMul(dispatchDimX, workgroupIdY);
+      workgroupIdX = m_builder->CreateSub(diff, workgroupIdX);
+      workgroupIdX = m_builder->CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdX); // Promoted to SGPR
 
-    m_meshWorkgroupId = workgroupId;
+      Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder->getInt32Ty(), 3));
+      workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdX, static_cast<uint64_t>(0));
+      workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdY, 1);
+      workgroupId = m_builder->CreateInsertElement(workgroupId, workgroupIdZ, 2);
+
+      m_meshWorkgroupId = workgroupId;
+    }
     m_meshWorkgroupId->setName("workgroupId");
   }
 
@@ -2511,7 +2837,60 @@ Value *MeshTaskShader::readMeshBuiltInFromLds(BuiltInKind builtIn) {
 // @param primitiveShadingRate : Primitive shading rate from API
 // @returns : HW-specific shading rate
 Value *MeshTaskShader::convertToHwShadingRate(Value *primitiveShadingRate) {
-  assert(m_gfxIp == GfxIpVersion({10, 3})); // Must be GFX10.3
+  if (m_gfxIp.major >= 11) {
+    // NOTE: In GFX11, the graphics pipeline is to support VRS rates till 4x4 which includes 2x4 and 4x2 along with
+    // the legacy rates. And 1x4 and 4x1 are not supported, hence clamp 1x4 and 4x1 to 1x2 and 2x1 respectively.
+    // The HW shading rate representations are enumerations as following:
+    //
+    //   SHADING_RATE_1x1  0x0
+    //   SHADING_RATE_1x2  0x1
+    //   SHADING_RATE_2x1  0x4
+    //   SHADING_RATE_2x2  0x5
+    //   SHADING_RATE_2x4  0x6
+    //   SHADING_RATE_4x2  0x9
+    //   SHADING_RATE_4x4  0xA
+    //
+    // The shading rate is mapped as follow:
+    //
+    //   HorizontalNone    | VerticalNone    (1x1) = 0b0000 -> 0b0000 = 0x0
+    //   HorizontalNone    | Vertical2Pixels (1x2) = 0b0001 -> 0b0001 = 0x1
+    //   HorizontalNone    | Vertical4Pixels (1x4) = 0b0010 -> 0b0001 = 0x1 (clamped)
+    //   Horizontal2Pixels | VerticalNone    (2x1) = 0b0100 -> 0b0100 = 0x4
+    //   Horizontal2Pixels | Vertical2Pixels (2x2) = 0b0101 -> 0b0101 = 0x5
+    //   Horizontal2Pixels | Vertical4Pixels (2x4) = 0b0110 -> 0b0110 = 0x6
+    //   Horizontal4Pixels | VerticalNone    (4x1) = 0b1000 -> 0b0100 = 0x4 (clamped)
+    //   Horizontal4Pixels | Vertical2Pixels (4x2) = 0b1001 -> 0b1001 = 0x9
+    //   Horizontal4Pixels | Vertical4Pixels (4x4) = 0b1010 -> 0b1010 = 0xA
+    //
+
+    enum : unsigned {
+      HwShadingRate1x1 = 0x0,
+      HwShadingRate1x2 = 0x1,
+      HwShadingRate2x1 = 0x4,
+      HwShadingRate2x2 = 0x5,
+      HwShadingRate2x4 = 0x6,
+      HwShadingRate4x2 = 0x9,
+      HwShadingRate4x4 = 0xA,
+    };
+
+    // hwShadingRate = primitiveShadingRate & (Horizontal2Pixels | Horizontal4Pixels |
+    //                                         Vertical2Pixels | Vertical4Pixels)
+    auto hwShadingRate = m_builder->CreateAnd(
+        primitiveShadingRate, m_builder->getInt32(ShadingRateHorizontal2Pixels | ShadingRateHorizontal4Pixels |
+                                                  ShadingRateVertical2Pixels | ShadingRateVertical4Pixels));
+
+    // hwShadingRate = hwShadingRate == 1x4 ? 1x2 : hwShadingRate
+    Value *isRate1x4 = m_builder->CreateICmpEQ(hwShadingRate, m_builder->getInt32(ShadingRateVertical4Pixels));
+    hwShadingRate = m_builder->CreateSelect(isRate1x4, m_builder->getInt32(HwShadingRate1x2), hwShadingRate);
+
+    // hwShadingRate = hwShadingRate == 4x1 ? 2x1 : hwShadingRate
+    Value *isRate4x1 = m_builder->CreateICmpEQ(hwShadingRate, m_builder->getInt32(ShadingRateHorizontal4Pixels));
+    hwShadingRate = m_builder->CreateSelect(isRate4x1, m_builder->getInt32(HwShadingRate2x1), hwShadingRate);
+
+    return hwShadingRate;
+  }
+
+  assert(m_gfxIp.isGfx(10, 3)); // Must be GFX10.3
 
   // NOTE: The shading rates have different meanings in HW and LGC interface. GFX10.3 HW supports 2-pixel mode
   // and 4-pixel mode is not supported. But the spec requires us to accept unsupported rates and clamp them to
@@ -2526,7 +2905,7 @@ Value *MeshTaskShader::convertToHwShadingRate(Value *primitiveShadingRate) {
   xRate2Pixels = m_builder->CreateICmpNE(xRate2Pixels, m_builder->getInt32(0));
   Value *hwXRate = m_builder->CreateSelect(xRate2Pixels, m_builder->getInt32(1), m_builder->getInt32(0));
 
-  // yRate = (primitiveShadingRate & (Vertical2Pixels | Vertical4Pixels)) ? 0x1 : 0x0
+  // hwYRate = (primitiveShadingRate & (Vertical2Pixels | Vertical4Pixels)) ? 0x1 : 0x0
   Value *yRate2Pixels = m_builder->CreateAnd(
       primitiveShadingRate, m_builder->getInt32(ShadingRateVertical2Pixels | ShadingRateVertical4Pixels));
   yRate2Pixels = m_builder->CreateICmpNE(yRate2Pixels, m_builder->getInt32(0));
@@ -2537,6 +2916,115 @@ Value *MeshTaskShader::convertToHwShadingRate(Value *primitiveShadingRate) {
   hwShadingRate = m_builder->CreateOr(hwShadingRate, hwXRate);
 
   return hwShadingRate;
+}
+
+// =====================================================================================================================
+// Check if barrier completion flag is needed. Barrier completion flag is to address this case:
+//
+//   ...
+//   if (threadId < numMeshThreads) {
+//     Run API mesh shader (contains API barriers)
+//     ...
+//     Barrier
+//     Or
+//     if (Uniform condition)
+//       Barrier
+//   }
+//
+//   Barrier (Post-API)
+//   ...
+//
+// There are extra waves that will not run API mesh shader (just to export vertices and primitives as post-API
+// mesh shader processing) and the API mesh shader contains API barriers by calling barrier(). As a result, the
+// extra waves will be out of sync because when API mesh shader waves hit the API barriers, the extra waves
+// will hit the post-API barrier. The extra waves are then out of sync after that. The solution idea is to add
+// additional barriers for extra waves according to the hit number of API barriers, making them matching to
+// avoid out-of-sync problems. There are two cases:
+//
+//   1. Barriers are all placed in the entry-point
+//   For such cases, we just collected all used API barriers. In extra wave, we add equal number of barriers statically
+//   and the number is known from previous collecting.
+//
+//   2. Some of barriers are placed in uniform control flow
+//   For such cases, the blocks where API barriers are placed don't post-dominate the entry block or the block is
+//   contained by a cycle (loop). We have to add dynamical barrier handling. The processing is something like this:
+//
+//   barrierToggle = false
+//   Write 0 to barrier completion flag in LDS
+//   ...
+//   if (API mesh waves) {
+//     if (API mesh threads) {
+//       ...
+//       barrierToggle = !barrierToggle (Flip the toggle)
+//       API barrier
+//       ...
+//       barrierFlag = barrierToggle ? 3 : 2 (Before API mesh shader completion)
+//       Write barrierFlag to LDS
+//     }
+//     Barrier (Sync the completion of API mesh waves)
+//   } else {
+//     do {
+//       barrierToggle = !barrierToggle (Flip the toggle)
+//       Barrier
+//
+//       Read barrierFlag from LDS
+//       barrierCompleted = barrierFlag != 0
+//       barriersToggle = barrierFlag & 0x1
+//     } while (!barrierCompleted || barriersToggle == barrierToggle)
+//   }
+//   ...
+//
+//   The barrier completion flag has 2 bits: bits[1] indicates if all API barriers are completed, bits[0] indicates the
+//   toggle flipping in API mesh waves. The toggle in extra waves should not be equal to the toggle in API mesh waves
+//   because we have an extra barrier in API mesh waves to sync their completion.
+//
+// @param entryPoint : Entry-point of mesh shader
+// @returns : Value indicating whether barrier completion flag is needed
+bool MeshTaskShader::checkNeedBarrierFlag(Function *entryPoint) {
+  if (m_pipelineState->enableMeshRowExport())
+    return false; // Not needed if row export is enable
+
+  const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
+  const unsigned numMeshThreads = meshMode.workgroupSizeX * meshMode.workgroupSizeY * meshMode.workgroupSizeZ;
+  const unsigned numThreads =
+      m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage.gs.calcFactor.primAmpFactor;
+  assert(numThreads >= numMeshThreads);
+
+  const unsigned waveSize = m_pipelineState->getShaderWaveSize(ShaderStageMesh);
+  const unsigned numMeshWaves = alignTo(numMeshThreads, waveSize) / waveSize;
+  const unsigned numWaves = alignTo(numThreads, waveSize) / waveSize;
+  if (numWaves == numMeshWaves)
+    return false; // Wave number to run API mesh shader is equal to actual wave number to run HW mesh shader (HW GS)
+
+  assert(getShaderStage(entryPoint) == ShaderStageMesh);
+  auto module = entryPoint->getParent();
+  for (auto &func : module->functions()) {
+    if (func.isIntrinsic() && func.getIntrinsicID() == Intrinsic::amdgcn_s_barrier) {
+      for (auto user : func.users()) {
+        CallInst *const call = cast<CallInst>(user);
+        if (call->getParent()->getParent() == entryPoint)
+          m_barriers.push_back(call);
+      }
+    }
+  }
+
+  // API mesh shader contains no barriers
+  if (m_barriers.empty())
+    return false;
+
+  auto &postDomTree = m_analysisHandlers->getPostDomTree(*entryPoint);
+  auto &cycleInfo = m_analysisHandlers->getCycleInfo(*entryPoint);
+  auto &entryBlock = entryPoint->getEntryBlock();
+  for (auto barrier : m_barriers) {
+    auto barrierBlock = barrier->getParent();
+    if (!postDomTree.dominates(barrierBlock, &entryBlock) || cycleInfo.getCycleDepth(barrierBlock) > 0) {
+      // NOTE: If the block where the API barrier is placed doesn't post-dominates the entry block or the block is
+      // contained within a cycle, we have to switch to dynamical barrier handling.
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // =====================================================================================================================

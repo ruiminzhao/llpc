@@ -28,9 +28,9 @@
  * @brief LLPC source file: implementation of Builder methods for image operations
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
 #include "YCbCrConverter.h"
 #include "lgc/LgcContext.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/TargetInfo.h"
 #include "lgc/util/Internal.h"
 #include "llvm/IR/Intrinsics.h"
@@ -1568,8 +1568,9 @@ Value *ImageBuilder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, V
   std::string callName = "llvm.amdgcn.image.bvh.intersect.ray";
   addTypeMangling(nullptr, {nodePtr, direction}, callName);
 
-  return emitCall(callName, FixedVectorType::get(getInt32Ty(), 4), args, {}, &*GetInsertPoint());
+  return CreateNamedCall(callName, FixedVectorType::get(getInt32Ty(), 4), args, {});
 }
+
 #endif
 
 // =====================================================================================================================
@@ -1980,11 +1981,17 @@ Value *ImageBuilder::handleFragCoordViewIndex(Value *coord, unsigned flags, unsi
     case ShaderStageVertex:
       builtInUsage.vs.viewIndex = true;
       break;
+    case ShaderStageTessControl:
+      builtInUsage.tcs.viewIndex = true;
+      break;
     case ShaderStageTessEval:
       builtInUsage.tes.viewIndex = true;
       break;
     case ShaderStageGeometry:
       builtInUsage.gs.viewIndex = true;
+      break;
+    case ShaderStageMesh:
+      builtInUsage.mesh.viewIndex = true;
       break;
     case ShaderStageFragment:
       builtInUsage.fs.viewIndex = true;
@@ -2031,7 +2038,7 @@ Value *ImageBuilder::fixImageDescForRead(Value *imageDesc) {
 // @param imageInst : the image instruction
 // @param descIdx : the index of the descriptor to put readfirstlane on
 void ImageBuilder::enforceReadFirstLane(Instruction *imageInst, unsigned descIdx) {
-  InsertPoint savedInsertPoint = saveIP();
+  IRBuilder<>::InsertPointGuard guard(*this);
   SetInsertPoint(imageInst);
   Value *origDesc = imageInst->getOperand(descIdx);
   const unsigned elemCount = cast<FixedVectorType>(origDesc->getType())->getNumElements();
@@ -2042,5 +2049,4 @@ void ImageBuilder::enforceReadFirstLane(Instruction *imageInst, unsigned descIdx
     newDesc = CreateInsertElement(newDesc, elem, elemIdx);
   }
   imageInst->setOperand(descIdx, newDesc);
-  restoreIP(savedInsertPoint);
 }

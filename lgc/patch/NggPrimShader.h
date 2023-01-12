@@ -89,6 +89,10 @@ struct PrimShaderCbLayoutLookupTable {
 // Represents the layout structure of an item of vertex cull info (this acts as ES-GS ring item from HW's perspective)
 struct VertexCullInfo {
   //
+  // Vertex transform feedback outputs
+  //
+  unsigned xfbOutputs[4];
+  //
   // Vertex cull data
   //
   unsigned cullDistanceSignMask;
@@ -118,6 +122,10 @@ struct VertexCullInfo {
 // Represents a collection of LDS offsets (in bytes) within an item of vertex cull info.
 struct VertexCullInfoOffsets {
   //
+  // Vertex transform feedback outputs
+  //
+  unsigned xfbOutputs;
+  //
   // Vertex cull data
   //
   unsigned cullDistanceSignMask;
@@ -140,6 +148,18 @@ struct VertexCullInfoOffsets {
   unsigned relPatchId;
 };
 
+// Represents export info of a transform feedback output
+struct XfbOutputExport {
+  unsigned xfbBuffer;   // Transform feedback buffer
+  unsigned xfbOffset;   // Transform feedback offset
+  unsigned numElements; // Number of output elements, valid range is [1,4]
+  bool is16bit;         // Whether the output is 16-bit
+  struct {
+    unsigned streamId; // Output stream ID
+    unsigned loc;      // Output location
+  } locInfo;           // Output location info in GS-VS ring (just for GS)
+};
+
 // =====================================================================================================================
 // Represents the manager of NGG primitive shader.
 class NggPrimShader {
@@ -160,13 +180,14 @@ private:
   static unsigned calcVertexCullInfoSizeAndOffsets(PipelineState *pipelineState,
                                                    VertexCullInfoOffsets &vertCullInfoOffsets);
 
-  llvm::FunctionType *generatePrimShaderEntryPointType(llvm::Module *module, uint64_t *inRegMask) const;
+  llvm::FunctionType *generatePrimShaderEntryPointType(llvm::Module *module, uint64_t *inRegMask);
   llvm::Function *generatePrimShaderEntryPoint(llvm::Module *module);
 
   void buildPrimShaderCbLayoutLookupTable();
 
-  void constructPrimShaderWithoutGs(llvm::Module *module);
-  void constructPrimShaderWithGs(llvm::Module *module);
+  void buildPassthroughPrimShader(llvm::Function *entryPoint);
+  void buildPrimShader(llvm::Function *entryPoint);
+  void buildPrimShaderWithGs(llvm::Function *entryPoint);
 
   void initWaveThreadInfo(llvm::Value *mergedGroupInfo, llvm::Value *mergedWaveInfo);
 
@@ -246,6 +267,16 @@ private:
   llvm::Value *fetchCullDistanceSignMask(llvm::Value *vertexId);
   llvm::Value *calcVertexItemOffset(unsigned streamId, llvm::Value *vertexId);
 
+  void processVertexAttribExport(llvm::Function *&targetFunc);
+
+  void processXfbOutputExport(llvm::Module *module, llvm::Argument *sysValueStart);
+  void processGsXfbOutputExport(llvm::Module *module, llvm::Argument *sysValueStart);
+  llvm::Value *fetchXfbOutput(llvm::Module *module, llvm::Argument *sysValueStart,
+                              llvm::SmallVector<XfbOutputExport, 32> &xfbOutputExports);
+
+  llvm::Value *readXfbOutputFromLds(llvm::Type *readDataTy, llvm::Value *vertexId, unsigned outputIndex);
+  void writeXfbOutputToLds(llvm::Value *writeData, llvm::Value *vertexId, unsigned outputIndex);
+
   // Checks if NGG culling operations are enabled
   bool enableCulling() const {
     return m_nggControl->enableBackfaceCulling || m_nggControl->enableFrustumCulling ||
@@ -254,18 +285,17 @@ private:
   }
 
   llvm::BasicBlock *createBlock(llvm::Function *parent, const llvm::Twine &blockName = "");
-
-  llvm::Value *CreateUBfe(llvm::Value *value, unsigned offset, unsigned count);
+  llvm::Value *createUBfe(llvm::Value *value, unsigned offset, unsigned count);
+  void createFenceAndBarrier();
 
   static const unsigned NullPrim = (1u << 31); // Null primitive data (invalid)
 
-  PipelineState *m_pipelineState; // Pipeline state
-  llvm::LLVMContext *m_context;   // LLVM context
-  GfxIpVersion m_gfxIp;           // Graphics IP version info
+  PipelineState *m_pipelineState = nullptr; // Pipeline state
+  GfxIpVersion m_gfxIp;                     // Graphics IP version info
 
-  const NggControl *m_nggControl; // NGG control settings
+  const NggControl *m_nggControl = nullptr; // NGG control settings
 
-  NggLdsManager *m_ldsManager; // NGG LDS manager
+  NggLdsManager *m_ldsManager = nullptr; // NGG LDS manager
 
   // NGG factors used for calculation (different modes use different factors)
   struct {
@@ -278,11 +308,13 @@ private:
     llvm::Value *threadIdInSubgroup; // Thread ID in sub-group
 
     llvm::Value *waveIdInSubgroup; // Wave ID in sub-group
+    llvm::Value *orderedWaveId;    // Ordered wave ID
 
     llvm::Value *primitiveId;   // Primitive ID (for VS)
     llvm::Value *vertCompacted; // Whether vertex compaction is performed (for culling mode)
 
     // System values (SGPRs)
+    llvm::Value *attribRingBase;          // Attribute ring base for this sub-group
     llvm::Value *primShaderTableAddrLow;  // Primitive shader table address low
     llvm::Value *primShaderTableAddrHigh; // Primitive shader table address high
 
@@ -296,22 +328,23 @@ private:
     llvm::Value *esGsOffset4; // ES-GS offset of vertex4
     llvm::Value *esGsOffset5; // ES-GS offset of vertex5
 
-  } m_nggFactor;
+  } m_nggInputs = {};
 
-  bool m_hasVs;  // Whether the pipeline has vertex shader
-  bool m_hasTcs; // Whether the pipeline has tessellation control shader
-  bool m_hasTes; // Whether the pipeline has tessellation evaluation shader
-  bool m_hasGs;  // Whether the pipeline has geometry shader
+  bool m_hasVs = false;  // Whether the pipeline has vertex shader
+  bool m_hasTes = false; // Whether the pipeline has tessellation evaluation shader
+  bool m_hasGs = false;  // Whether the pipeline has geometry shader
 
-  bool m_constPositionZ; // Whether the Z channel of vertex position data is constant
+  bool m_enableSwXfb = false; // Whether SW-emulated stream-out is enabled (GFX11+)
+
+  bool m_constPositionZ = false; // Whether the Z channel of vertex position data is constant
 
   // Base offsets (in dwords) of GS output vertex streams in GS-VS ring
-  unsigned m_gsStreamBases[MaxGsStreams];
+  unsigned m_gsStreamBases[MaxGsStreams] = {};
 
   PrimShaderCbLayoutLookupTable m_cbLayoutTable; // Layout lookup table of primitive shader constant buffer
   VertexCullInfoOffsets m_vertCullInfoOffsets;   // A collection of offsets within an item of vertex cull info
 
-  std::unique_ptr<llvm::IRBuilder<>> m_builder; // LLVM IR builder
+  llvm::IRBuilder<> m_builder; // LLVM IR builder
 };
 
 } // namespace lgc

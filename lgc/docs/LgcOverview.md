@@ -8,6 +8,15 @@ See
 [LLPC overview](../../llpc/docs/LlpcOverview.md)
 for the context of LGC within LLPC.
 
+## lgc command-line tool
+
+The `lgc` command-line tool allows exercising LGC functionality of the
+[different supported compilation modes](#support-for-shader-part-pipeline-and-whole-pipeline-compilation).
+
+It also allows running individual passes or custom pass pipelines, similar to LLVM's `opt` tool.
+However, beware that LGC currently still has some outside-IR state that is not serialized,
+and so this does not work with all passes.
+
 ## LGC interface classes
 
 This section outlines the classes that are exposed by LGC to the front-end.
@@ -105,7 +114,7 @@ The front-end flow is:
   - Where the front-end creates a pass manager for its own passes, it should call
     `BuilderContext::PreparePassManager` to ensure it is suitably set up. It can optionally
     use `PassManager::Create` to create the middle-end's subclass pass manager instead of
-    using the standard `legacy::PassManager`.
+    using the standard `PassManager`.
   - For a shader compile, you're done: The IR module at this point is the result of
     the compile, and can be stored away and kept for later linking with other shaders.
 
@@ -271,10 +280,9 @@ PipelineState stores two kinds of outside-IR state:
 * The second kind of outside-IR state is the state set in middle-end passes (and BuilderImpl).
   This is `ResourceUsage` and `InterfaceData`, which are declared in their own separate file
   `ResourceUsage.h`.
-  This state does not get written into IR metadata. In theory we could add a facility to write
-  the state into IR metadata and read it back, and that would allow us to support lit testing of
-  individual middle-end passes with `-stop-before` and `-run-pass` options like `llc`. But
-  that does not happen now.
+  This state does not get written into IR metadata, which currently prevents us from testing some
+  passes individually. We should remove this limitation by adding a facility to write the state
+  into IR metadata and read it back.
 
 ### ShaderModes
 

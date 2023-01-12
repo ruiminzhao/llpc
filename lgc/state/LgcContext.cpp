@@ -30,6 +30,7 @@
  */
 #include "lgc/LgcContext.h"
 #include "lgc/Builder.h"
+#include "lgc/LgcDialect.h"
 #include "lgc/PassManager.h"
 #include "lgc/patch/Patch.h"
 #include "lgc/state/PassManagerCache.h"
@@ -42,15 +43,9 @@
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 401324
-// Old version
-#include "llvm/Support/TargetRegistry.h"
-#else
-// New version (and unknown version)
-#include "llvm/MC/TargetRegistry.h"
-#endif
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -59,10 +54,6 @@
 
 using namespace lgc;
 using namespace llvm;
-
-namespace llvm {
-void initializeLegacyBuilderReplayerPass(PassRegistry &);
-} // namespace llvm
 
 static codegen::RegisterCodeGenFlags CGF;
 
@@ -122,8 +113,6 @@ void LgcContext::initialize() {
   Initialized = true;
 #endif
 
-  auto &passRegistry = *PassRegistry::getPassRegistry();
-
   // Initialize LLVM target: AMDGPU
   LLVMInitializeAMDGPUTargetInfo();
   LLVMInitializeAMDGPUTarget();
@@ -132,13 +121,14 @@ void LgcContext::initialize() {
   LLVMInitializeAMDGPUAsmParser();
   LLVMInitializeAMDGPUDisassembler();
 
+  auto &passRegistry = *PassRegistry::getPassRegistry();
+
   // Initialize core LLVM passes so they can be referenced by -stop-before etc.
   initializeCore(passRegistry);
   initializeTransformUtils(passRegistry);
   initializeScalarOpts(passRegistry);
   initializeVectorization(passRegistry);
   initializeInstCombine(passRegistry);
-  initializeAggressiveInstCombine(passRegistry);
   initializeIPO(passRegistry);
   initializeCodeGen(passRegistry);
   initializeShadowStackGCLoweringPass(passRegistry);
@@ -147,9 +137,6 @@ void LgcContext::initialize() {
 
   // Initialize LGC passes so they can be referenced by -stop-before etc.
   initializeUtilPasses(passRegistry);
-  initializeStatePasses(passRegistry);
-  initializeLegacyBuilderReplayerPass(passRegistry);
-  initializePatchPasses(passRegistry);
 
   // Initialize some command-line option defaults.
   setOptionDefault("filetype", "obj");
@@ -259,8 +246,7 @@ LgcContext *LgcContext::create(LLVMContext &context, StringRef gpuName, unsigned
 
   LLPC_OUTS("TargetMachine optimization level = " << optLevel << "\n");
 
-  builderContext->m_targetMachine =
-      target->createTargetMachine(triple, gpuName, "", targetOpts, Optional<Reloc::Model>(), None, optLevel);
+  builderContext->m_targetMachine = target->createTargetMachine(triple, gpuName, "", targetOpts, {}, {}, optLevel);
   assert(builderContext->m_targetMachine);
   return builderContext;
 }
@@ -270,6 +256,7 @@ LgcContext *LgcContext::create(LLVMContext &context, StringRef gpuName, unsigned
 // @param context : LLVM context to give each Builder
 // @param palAbiVersion : PAL pipeline ABI version to compile for
 LgcContext::LgcContext(LLVMContext &context, unsigned palAbiVersion) : m_context(context) {
+  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(context);
 }
 
 // =====================================================================================================================
@@ -293,26 +280,6 @@ Pipeline *LgcContext::createPipeline() {
 // @param pipeline : Pipeline object for pipeline compile, nullptr for shader compile
 Builder *LgcContext::createBuilder(Pipeline *pipeline) {
   return Builder::createBuilderRecorder(this, pipeline, EmitLgc);
-}
-
-// =====================================================================================================================
-// Prepare a pass manager. This manually adds a target-aware TLI pass, so middle-end optimizations do not think that
-// we have library functions.
-//
-// @param [in/out] passMgr : Pass manager
-void LgcContext::preparePassManager(legacy::PassManager *passMgr) {
-  TargetLibraryInfoImpl targetLibInfo(getTargetMachine()->getTargetTriple());
-
-  // Adjust it to allow memcpy and memset.
-  // TODO: Investigate why the latter is necessary. I found that
-  // test/shaderdb/ObjStorageBlock_TestMemCpyInt32.comp
-  // got unrolled far too much, and at too late a stage for the descriptor loads to be commoned up. It might
-  // be an unfortunate interaction between LoopIdiomRecognize and fat pointer laundering.
-  targetLibInfo.setAvailable(LibFunc_memcpy);
-  targetLibInfo.setAvailable(LibFunc_memset);
-
-  auto targetLibInfoPass = new TargetLibraryInfoWrapperPass(targetLibInfo);
-  passMgr->add(targetLibInfoPass);
 }
 
 // =====================================================================================================================

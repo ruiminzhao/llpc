@@ -54,31 +54,8 @@ extern const char *ShaderTable;
 namespace Llpc {
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerRayTracingBuiltIn::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering memory operations.
-ModulePass *createLegacySpirvLowerRayTracingBuiltIn() {
-  return new LegacySpirvLowerRayTracingBuiltIn();
-}
-
-// =====================================================================================================================
 SpirvLowerRayTracingBuiltIn::SpirvLowerRayTracingBuiltIn() : m_dispatchRaysInfoDesc(nullptr) {
   memset(m_traceParams, 0, sizeof(m_traceParams));
-}
-
-// =====================================================================================================================
-LegacySpirvLowerRayTracingBuiltIn::LegacySpirvLowerRayTracingBuiltIn() : ModulePass(ID) {
-  initializeLegacySpirvLowerRayTracingBuiltInPass(*PassRegistry::getPassRegistry());
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-bool LegacySpirvLowerRayTracingBuiltIn::runOnModule(Module &module) {
-  return Impl.runImpl(module);
 }
 
 // =====================================================================================================================
@@ -165,7 +142,7 @@ bool SpirvLowerRayTracingBuiltIn::runImpl(Module &module) {
         Type *instTy = inst->getType();
         if (isa<PointerType>(instTy) && instTy->getPointerAddressSpace() == SPIRAS_Input) {
           assert(isa<GetElementPtrInst>(inst) || isa<BitCastInst>(inst));
-          Type *newInstTy = PointerType::get(instTy->getContainedType(0), SPIRAS_Private);
+          Type *newInstTy = PointerType::getWithSamePointeeType(cast<PointerType>(instTy), SPIRAS_Private);
           inst->mutateType(newInstTy);
         }
       }
@@ -387,7 +364,3 @@ Value *SpirvLowerRayTracingBuiltIn::getDispatchRaysInfoDesc(Instruction *insertP
 }
 
 } // namespace Llpc
-
-// =====================================================================================================================
-// Initializes the pass of SPIR-V lowering the ray tracing built-ins.
-INITIALIZE_PASS(LegacySpirvLowerRayTracingBuiltIn, DEBUG_TYPE, "Lower SPIR-V ray tracing built-ins", false, false)

@@ -32,6 +32,7 @@
 #include "llpcContext.h"
 #include "llpcDebug.h"
 #include "llpcSpirvLowerAccessChain.h"
+#include "llpcSpirvLowerCfgMerges.h"
 #include "llpcSpirvLowerConstImmediateStore.h"
 #include "llpcSpirvLowerGlobal.h"
 #include "llpcSpirvLowerInstMetaRemove.h"
@@ -51,6 +52,12 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/Verifier.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
@@ -188,6 +195,9 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
     passMgr.addPass(SpirvLowerRayTracingIntrinsics());
 #endif
 
+  // Lower SPIR-V CFG merges before inlining
+  passMgr.addPass(SpirvLowerCfgMerges());
+
   // Function inlining. Use the "always inline" pass, since we want to inline all functions, and
   // we marked (non-entrypoint) functions as "always inline" just after SPIR-V reading.
   passMgr.addPass(AlwaysInlinerPass());
@@ -220,10 +230,12 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
 
   // Remove redundant load/store operations and do minimal optimization
   // It is required by SpirvLowerImageOp.
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 404149
-  passMgr.addPass(createModuleToFunctionPassAdaptor(SROA()));
-#else
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 444780
+  // Old version of the code
   passMgr.addPass(createModuleToFunctionPassAdaptor(SROAPass()));
+#else
+  // New version of the code (also handles unknown version, which we treat as latest)
+  passMgr.addPass(createModuleToFunctionPassAdaptor(SROAPass(SROAOptions::ModifyCFG)));
 #endif
   passMgr.addPass(GlobalOptPass());
   passMgr.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
@@ -280,94 +292,6 @@ void SpirvLower::replaceGlobal(Context *context, GlobalVariable *original, Globa
 }
 
 // =====================================================================================================================
-// Add per-shader lowering passes to pass manager
-//
-// @param context : LLPC context
-// @param stage : Shader stage
-// @param [in/out] passMgr : Pass manager to add passes to
-// @param lowerTimer : Timer to time lower passes with, nullptr if not timing
-#if VKI_RAY_TRACING
-// @param rayTracing : Whether we are lowering a ray tracing pipeline shader
-// @param rayQuery : Whether we are lowering a ray query library
-// @param isInternalRtShader : Whether we are lowering an internal ray tracing shader
-#endif
-void LegacySpirvLower::addPasses(Context *context, ShaderStage stage, legacy::PassManager &passMgr, Timer *lowerTimer
-#if VKI_RAY_TRACING
-                                 ,
-                                 bool rayTracing, bool rayQuery, bool isInternalRtShader
-#endif
-) {
-  // Manually add a target-aware TLI pass, so optimizations do not think that we have library functions.
-  context->getLgcContext()->preparePassManager(&passMgr);
-
-  // Start timer for lowering passes.
-  if (lowerTimer)
-    passMgr.add(LgcContext::createStartStopTimer(lowerTimer, true));
-
-#if VKI_RAY_TRACING
-  if (isInternalRtShader)
-    passMgr.add(createLegacySpirvLowerRayTracingIntrinsics());
-#endif
-
-  // Function inlining. Use the "always inline" pass, since we want to inline all functions, and
-  // we marked (non-entrypoint) functions as "always inline" just after SPIR-V reading.
-  passMgr.add(createAlwaysInlinerLegacyPass());
-  passMgr.add(createGlobalDCEPass());
-
-  // Lower SPIR-V access chain
-  passMgr.add(createLegacySpirvLowerAccessChain());
-
-#if VKI_RAY_TRACING
-  if (rayTracing)
-    passMgr.add(createLegacySpirvLowerRayTracingBuiltIn());
-  if (rayQuery)
-    passMgr.add(createLegacySpirvLowerRayQueryPostInline());
-#endif
-
-  // Lower SPIR-V terminators
-  passMgr.add(createLegacySpirvLowerTerminator());
-
-  // Lower SPIR-V global variables, inputs, and outputs
-  passMgr.add(createLegacySpirvLowerGlobal());
-
-  // Lower SPIR-V constant immediate store.
-  passMgr.add(createLegacySpirvLowerConstImmediateStore());
-
-  // Lower SPIR-V constant folding - must be done before instruction combining pass.
-  passMgr.add(createLegacySpirvLowerMathConstFolding());
-
-  // Lower SPIR-V memory operations
-  passMgr.add(createLegacySpirvLowerMemoryOp());
-
-  // Remove redundant load/store operations and do minimal optimization
-  // It is required by SpirvLowerImageOp.
-  passMgr.add(createSROAPass());
-  passMgr.add(createGlobalOptimizerPass());
-  passMgr.add(createAggressiveDCEPass());
-  passMgr.add(createInstructionCombiningPass(2));
-  passMgr.add(createCFGSimplificationPass());
-  passMgr.add(createEarlyCSEPass());
-
-  // Lower SPIR-V floating point optimisation
-  passMgr.add(createLegacySpirvLowerMathFloatOp());
-
-  // Lower SPIR-V instruction metadata remove
-  passMgr.add(createLegacySpirvLowerInstMetaRemove());
-
-  // Stop timer for lowering passes.
-  if (lowerTimer)
-    passMgr.add(LgcContext::createStartStopTimer(lowerTimer, false));
-
-  // Dump the result
-  if (EnableOuts()) {
-    passMgr.add(createPrintModulePass(
-        outs(), "\n"
-                "===============================================================================\n"
-                "// LLPC SPIR-V lowering results\n"));
-  }
-}
-
-// =====================================================================================================================
 // Initializes the pass according to the specified module.
 //
 // NOTE: This function should be called at the beginning of "runOnModule()".
@@ -382,6 +306,15 @@ void SpirvLower::init(Module *module) {
   } else {
     m_shaderStage = getShaderStageFromModule(m_module);
     m_entryPoint = getEntryPoint(m_module);
+    if (m_shaderStage == ShaderStageInvalid) {
+#if VKI_RAY_TRACING
+      // There might be cases we fail to get shader stage from a module that is not directly converted from SPIR-V, for
+      // example, unified ray tracing pipeline shader, or entry for indirect ray tracing pipeline. In such case, clamp
+      // the shader stage to compute.
+#endif
+      assert(m_entryPoint);
+      m_shaderStage = ShaderStageCompute;
+    }
   }
   m_builder = m_context->getBuilder();
 }

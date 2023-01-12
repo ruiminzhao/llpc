@@ -313,6 +313,16 @@ void ConfigBuilderBase::setThreadgroupDimensions(llvm::ArrayRef<unsigned> values
 }
 
 // =====================================================================================================================
+// Set stream-out vertex strides (GFX11+)
+//
+// @param values : Values to set
+void ConfigBuilderBase::setStreamOutVertexStrides(ArrayRef<unsigned> values) {
+  auto &arrayNode = m_pipelineNode[Util::Abi::PipelineMetadataKey::StreamOutVertexStrides].getArray(true);
+  for (unsigned i = 0; i < values.size(); ++i)
+    arrayNode[i] = values[i];
+}
+
+// =====================================================================================================================
 /// Append a single entry to the PAL register metadata.
 ///
 /// @param [in] key : The metadata key (usually a register address).
@@ -386,22 +396,20 @@ unsigned ConfigBuilderBase::setupFloatingPointMode(ShaderStage shaderStage) {
 
     // The HW rounding mode values happen to be one less than the FpRoundMode value, other than
     // FpRoundMode::DontCare, which we map to a default value.
-    floatMode.bits.fp16fp64RoundMode = shaderMode.fp16RoundMode != FpRoundMode::DontCare
-                                           ? static_cast<unsigned>(shaderMode.fp16RoundMode) - 1
-                                           : shaderMode.fp64RoundMode != FpRoundMode::DontCare
-                                                 ? static_cast<unsigned>(shaderMode.fp64RoundMode) - 1
-                                                 : FP_ROUND_TO_NEAREST_EVEN;
+    floatMode.bits.fp16fp64RoundMode =
+        shaderMode.fp16RoundMode != FpRoundMode::DontCare   ? static_cast<unsigned>(shaderMode.fp16RoundMode) - 1
+        : shaderMode.fp64RoundMode != FpRoundMode::DontCare ? static_cast<unsigned>(shaderMode.fp64RoundMode) - 1
+                                                            : FP_ROUND_TO_NEAREST_EVEN;
     floatMode.bits.fp32RoundMode = shaderMode.fp32RoundMode != FpRoundMode::DontCare
                                        ? static_cast<unsigned>(shaderMode.fp32RoundMode) - 1
                                        : FP_ROUND_TO_NEAREST_EVEN;
 
     // The denorm modes happen to be one less than the FpDenormMode value, other than
     // FpDenormMode::DontCare, which we map to a default value.
-    floatMode.bits.fp16fp64DenormMode = shaderMode.fp16DenormMode != FpDenormMode::DontCare
-                                            ? static_cast<unsigned>(shaderMode.fp16DenormMode) - 1
-                                            : shaderMode.fp64DenormMode != FpDenormMode::DontCare
-                                                  ? static_cast<unsigned>(shaderMode.fp64DenormMode) - 1
-                                                  : FP_DENORM_FLUSH_NONE;
+    floatMode.bits.fp16fp64DenormMode =
+        shaderMode.fp16DenormMode != FpDenormMode::DontCare   ? static_cast<unsigned>(shaderMode.fp16DenormMode) - 1
+        : shaderMode.fp64DenormMode != FpDenormMode::DontCare ? static_cast<unsigned>(shaderMode.fp64DenormMode) - 1
+                                                              : FP_DENORM_FLUSH_NONE;
     floatMode.bits.fp32DenormMode = shaderMode.fp32DenormMode != FpDenormMode::DontCare
                                         ? static_cast<unsigned>(shaderMode.fp32DenormMode) - 1
                                         : FP_DENORM_FLUSH_IN_OUT;

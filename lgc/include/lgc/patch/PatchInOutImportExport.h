@@ -102,7 +102,6 @@ private:
                                     llvm::Value *compIdx, llvm::Value *vertexOrPrimitiveIdx, bool isPerPrimitive,
                                     BuilderBase &builder);
 
-  llvm::Value *patchVsBuiltInInputImport(llvm::Type *inputTy, unsigned builtInId, BuilderBase &builder);
   llvm::Value *patchTcsBuiltInInputImport(llvm::Type *inputTy, unsigned builtInId, llvm::Value *elemIdx,
                                           llvm::Value *vertexIdx, BuilderBase &builder);
   llvm::Value *patchTesBuiltInInputImport(llvm::Type *inputTy, unsigned builtInId, llvm::Value *elemIdx,
@@ -205,10 +204,6 @@ private:
   void recordVertexAttribExport(unsigned location, llvm::ArrayRef<llvm::Value *> attribValues);
   void exportVertexAttribs(llvm::Instruction *insertPos);
 
-  void storeTessFactors();
-  void storeTessFactorToBuffer(llvm::ArrayRef<llvm::Value *> outerTessFactors,
-                               llvm::ArrayRef<llvm::Value *> innerTessFactors, llvm::Instruction *insertPos);
-
   GfxIpVersion m_gfxIp;                     // Graphics IP version info
   PipelineSystemValues m_pipelineSysValues; // Cache of ShaderSystemValues objects, one per shader stage
 
@@ -224,6 +219,7 @@ private:
   // and gl_Layer is 16-bit low part). Thus, the export is delayed with them merged together.
   llvm::Value *m_viewportIndex; // Correspond to "out int gl_ViewportIndex"
   llvm::Value *m_layer;         // Correspond to "out int gl_Layer"
+  llvm::Value *m_viewIndex;     // Correspond to "in int gl_Layer"
 
   bool m_hasTs; // Whether the pipeline has tessellation shaders
 
@@ -240,31 +236,6 @@ private:
 
   std::set<unsigned> m_expLocs; // The locations that already have an export instruction for the vertex shader.
   const std::array<unsigned char, 4> *m_buffFormats; // The format of MTBUF instructions for specified GFX
-};
-
-// =====================================================================================================================
-// Represents the pass of LLVM patching operations for input import and output export.
-class LegacyPatchInOutImportExport : public llvm::ModulePass {
-public:
-  LegacyPatchInOutImportExport();
-  ~LegacyPatchInOutImportExport();
-
-  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-    analysisUsage.addRequired<LegacyPipelineShaders>();
-    analysisUsage.addRequired<llvm::PostDominatorTreeWrapperPass>();
-    analysisUsage.addPreserved<LegacyPipelineShaders>();
-  }
-
-  bool runOnModule(llvm::Module &module) override;
-
-  static char ID; // ID of this pass
-
-private:
-  LegacyPatchInOutImportExport(const LegacyPatchInOutImportExport &) = delete;
-  LegacyPatchInOutImportExport &operator=(const LegacyPatchInOutImportExport &) = delete;
-
-  PatchInOutImportExport m_impl;
 };
 
 } // namespace lgc

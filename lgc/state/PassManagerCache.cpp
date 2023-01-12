@@ -31,7 +31,13 @@
 #include "lgc/state/PassManagerCache.h"
 #include "lgc/LgcContext.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
 #include "llvm/IR/IRPrintingPasses.h"
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
@@ -82,7 +88,7 @@ std::pair<lgc::PassManager &, LegacyPassManager &> PassManagerCache::getPassMana
   // TODO: Creation of a normal compilation pass manager, not just one for a glue shader.
   assert(info.isGlue && "Non-glue shader compilation not implemented yet");
 
-  passManagers.first.reset(PassManager::Create(m_lgcContext->getTargetMachine()));
+  passManagers.first.reset(PassManager::Create(m_lgcContext));
   passManagers.first->registerFunctionAnalysis([&] { return m_lgcContext->getTargetMachine()->getTargetIRAnalysis(); });
 
   // Manually add a target-aware TLI pass, so optimizations do not think that we have library functions.

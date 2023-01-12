@@ -49,31 +49,6 @@ static cl::opt<bool>
 namespace lgc {
 
 // =====================================================================================================================
-// Initializes static members.
-char LegacyPatchInitializeWorkgroupMemory::ID = 0;
-
-// =====================================================================================================================
-// Pass creator, creates the pass of setting up the value for workgroup global variables.
-ModulePass *createLegacyPatchInitializeWorkgroupMemory() {
-  return new LegacyPatchInitializeWorkgroupMemory();
-}
-
-// =====================================================================================================================
-LegacyPatchInitializeWorkgroupMemory::LegacyPatchInitializeWorkgroupMemory() : ModulePass(ID) {
-}
-
-// =====================================================================================================================
-// Executes this LLVM patching pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPatchInitializeWorkgroupMemory::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  PipelineShadersResult &pipelineShaders = getAnalysis<LegacyPipelineShaders>().getResult();
-  return m_impl.runImpl(module, pipelineShaders, pipelineState);
-}
-
-// =====================================================================================================================
 // Executes this LLVM patching pass on the specified LLVM module.
 //
 // @param [in/out] module : LLVM module to be run on
@@ -176,6 +151,31 @@ void PatchInitializeWorkgroupMemory::initializeWithZero(GlobalVariable *lds, Bui
   Value *localInvocationId = getFunctionArgument(m_entryPoint, entryArgIdxs.cs.localInvocationId);
   const unsigned actualNumThreads = shaderMode.workgroupSizeX * shaderMode.workgroupSizeY * shaderMode.workgroupSizeZ;
 
+  // On GFX11, it is a single VGPR and we need to extract the three components.
+  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major >= 11) {
+    assert(localInvocationId->getType() == builder.getInt32Ty());
+
+    static constexpr unsigned LocalInvocationIdPackMask = 0x3FF;
+    Value *unpackedLocalInvocationId = UndefValue::get(FixedVectorType::get(builder.getInt32Ty(), 3));
+
+    // X = PackedId[9:0]
+    unpackedLocalInvocationId = builder.CreateInsertElement(
+        unpackedLocalInvocationId, builder.CreateAnd(localInvocationId, builder.getInt32(LocalInvocationIdPackMask)),
+        uint64_t(0));
+
+    // Y = PackedId[19:10]
+    localInvocationId = builder.CreateLShr(localInvocationId, builder.getInt32(10));
+    unpackedLocalInvocationId = builder.CreateInsertElement(
+        unpackedLocalInvocationId, builder.CreateAnd(localInvocationId, builder.getInt32(LocalInvocationIdPackMask)),
+        1);
+
+    // Z = PackedId[29:20], PackedId[31:30] set to 0 by hardware
+    localInvocationId = builder.CreateLShr(localInvocationId, builder.getInt32(10));
+    unpackedLocalInvocationId = builder.CreateInsertElement(unpackedLocalInvocationId, localInvocationId, 2);
+
+    localInvocationId = unpackedLocalInvocationId;
+  }
+
   Value *threadId = builder.CreateExtractElement(localInvocationId, uint64_t(0));
   if (shaderMode.workgroupSizeY > 1) {
     Value *stride = builder.CreateMul(builder.getInt32(shaderMode.workgroupSizeX),
@@ -273,7 +273,3 @@ unsigned PatchInitializeWorkgroupMemory::getTypeSizeInDwords(Type *inputTy) {
 }
 
 } // namespace lgc
-
-// =====================================================================================================================
-// Initializes the pass of initialize workgroup memory with zero.
-INITIALIZE_PASS(LegacyPatchInitializeWorkgroupMemory, DEBUG_TYPE, "Patch for initialize workgroup memory", false, false)

@@ -54,11 +54,8 @@ void ConfigBuilder::buildPalMetadata() {
   else {
     const bool hasTs = (m_hasTcs || m_hasTes);
 
-    if (!m_pipelineState->isWholePipeline() && m_pipelineState->hasShaderStage(ShaderStageFragment)) {
-      // FS-only shader compilation (part-pipeline compilation)
-      buildPipelineVsFsRegConfig();
-    } else if (!hasTs && !m_hasGs) {
-      // VS-FS pipeline
+    if (!hasTs && !m_hasGs) {
+      // VS-FS pipeline or FS-only shader compilation (part-pipeline compilation)
       buildPipelineVsFsRegConfig();
     } else if (hasTs && !m_hasGs) {
       // VS-TS-FS pipeline
@@ -343,19 +340,19 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
   SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, FLOAT_MODE, floatMode);
   SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, DX10_CLAMP, true); // Follow PAL setting
 
-  const auto &xfbStrides = resUsage->inOutUsage.xfbStrides;
-  bool enableXfb = resUsage->inOutUsage.enableXfb;
+  const auto &xfbStrides = m_pipelineState->getXfbBufferStrides();
+  const auto &streamXfbBuffers = m_pipelineState->getStreamXfbBuffers();
+  bool enableXfb = m_pipelineState->enableXfb();
 
   if (shaderStage == ShaderStageCopyShader) {
     SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR, lgc::CopyShaderUserSgprCount);
     setNumAvailSgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxSgprsAvailable);
     setNumAvailVgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxVgprsAvailable);
 
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN,
-                  resUsage->inOutUsage.gs.outLocCount[0] > 0 && enableXfb);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, resUsage->inOutUsage.gs.outLocCount[1] > 0);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, resUsage->inOutUsage.gs.outLocCount[2] > 0);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, resUsage->inOutUsage.gs.outLocCount[3] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN, streamXfbBuffers[0] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, streamXfbBuffers[1] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, streamXfbBuffers[2] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, streamXfbBuffers[3] > 0);
     SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, RAST_STREAM, resUsage->inOutUsage.gs.rasterStream);
   } else {
     const auto &shaderOptions = m_pipelineState->getShaderOptions(shaderStage);
@@ -386,7 +383,7 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
 
   unsigned streamBufferConfig = 0;
   for (auto i = 0; i < MaxGsStreams; ++i)
-    streamBufferConfig |= (resUsage->inOutUsage.streamXfbBuffers[i] << (i * 4));
+    streamBufferConfig |= (streamXfbBuffers[i] << (i * 4));
   SET_REG(&config->vsRegs, VGT_STRMOUT_BUFFER_CONFIG, streamBufferConfig);
 
   bool disableVertexReuse = m_pipelineState->getInputAssemblyState().disableVertexReuse;
@@ -491,7 +488,7 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
     }
 
     unsigned clipDistanceMask = (1 << clipDistanceCount) - 1;
-    unsigned cullDistanceMask = (1 << cullDistanceCount) - 1;
+    unsigned cullDistanceMask = ((1 << cullDistanceCount) - 1) << clipDistanceCount;
 
     // Set fields CLIP_DIST_ENA_0 ~ CLIP_DIST_ENA_7 and CULL_DIST_ENA_0 ~ CULL_DIST_ENA_7
     unsigned paClVsOutCntl = GET_REG(&config->vsRegs, PA_CL_VS_OUT_CNTL);

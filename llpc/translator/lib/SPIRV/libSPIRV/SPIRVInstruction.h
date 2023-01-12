@@ -2261,6 +2261,8 @@ _SPIRV_OP(SubgroupAnyKHR, true, 4, false)
 _SPIRV_OP(SubgroupAllEqualKHR, true, 4, false)
 _SPIRV_OP(ReadClockKHR, true, 4)
 _SPIRV_OP(IsHelperInvocationEXT, true, 3)
+_SPIRV_OP(EmitMeshTasksEXT, false, 5, false)
+_SPIRV_OP(SetMeshOutputsEXT, false, 3, false)
 #undef _SPIRV_OP
 class SPIRVSubgroupShuffleINTELInstBase : public SPIRVInstTemplateBase {
 protected:
@@ -2394,13 +2396,15 @@ protected:
       // 4x8-bit is packed into a 32-bit integer
       auto Op1IntTy = static_cast<SPIRVTypeInt *>(Op1Ty);
       auto Op2IntTy = static_cast<SPIRVTypeInt *>(Op2Ty);
-      assert(Op1IntTy->getBitWidth() == 32 && Op2IntTy->getBitWidth() == 32 && Type->getBitWidth() >= 8);
+      unsigned bitWidth = 8;
+      assert(Op1IntTy->getBitWidth() == 32 && Op2IntTy->getBitWidth() == 32 && Type->getBitWidth() >= bitWidth);
       unsigned optionalIdx = WordCount == 6 ? 2 : 3;
       assert(isValidPackedVectorFormat(static_cast<spv::PackedVectorFormat>(Ops[optionalIdx])) &&
              "Invalid packed vector format");
       (void)Op1IntTy;
       (void)Op2IntTy;
       (void)optionalIdx;
+      (void)bitWidth;
     } else {
       // 4x8-bit integer vectors
       assert(Op1Ty->getVectorComponentCount() == Op2Ty->getVectorComponentCount() &&

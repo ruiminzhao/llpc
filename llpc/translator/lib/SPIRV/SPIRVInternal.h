@@ -166,6 +166,7 @@ enum SPIRAddressSpace {
   SPIRAS_Uniform = 7,  // Memory buffer descriptor
   SPIRAS_Input = 64,
   SPIRAS_Output = 65,
+  SPIRAS_TaskPayload = 66,
   SPIRAS_Count,
 };
 
@@ -178,6 +179,7 @@ template <> inline void SPIRVMap<SPIRAddressSpace, std::string>::init() {
   add(SPIRAS_Input, "Input");
   add(SPIRAS_Output, "Output");
   add(SPIRAS_Uniform, "Uniform");
+  add(SPIRAS_TaskPayload, "TaskPayload");
 }
 
 template <> inline void SPIRVMap<SPIRAddressSpace, SPIRVStorageClassKind>::init() {
@@ -201,6 +203,7 @@ template <> inline void SPIRVMap<SPIRAddressSpace, SPIRVStorageClassKind>::init(
   add(SPIRAS_Private, StorageClassIncomingRayPayloadKHR);
   add(SPIRAS_Global, StorageClassShaderRecordBufferKHR);
 #endif
+  add(SPIRAS_TaskPayload, StorageClassTaskPayloadWorkgroupEXT);
 }
 typedef SPIRVMap<SPIRAddressSpace, SPIRVStorageClassKind> SPIRSPIRVAddrSpaceMap;
 
@@ -350,9 +353,6 @@ template <typename T> void move(std::vector<T> &V, size_t Begin, size_t End, siz
   V.insert(V.begin() + Target, Segment.begin(), Segment.end());
 }
 
-void removeFnAttr(LLVMContext *Context, CallInst *Call, Attribute::AttrKind Attr);
-void addFnAttr(LLVMContext *Context, CallInst *Call, Attribute::AttrKind Attr);
-
 Function *getOrCreateFunction(Module *M, Type *RetTy, ArrayRef<Type *> ArgTypes, StringRef Name,
                               AttributeList *Attrs = nullptr, bool TakeName = true);
 
@@ -401,6 +401,7 @@ union ShaderInOutMetadata {
     // byte 12
     uint64_t IsBlockArray : 1;       // Whether we are handling block array
     uint64_t PerVertexDimension : 1; // Whether this is the per-vertex dimension (outermost) for an array
+    uint64_t PerPrimitive : 1;       // Whether this is a per-primitive output (mesh shader)
   };
   uint64_t U64All[2];
 };
@@ -429,6 +430,8 @@ struct ShaderInOutDecorate {
 
   bool PerVertexDimension; // Whether this is decorated by "pervertexKHR" // NOLINT
                            // (Fragment shader)
+
+  bool PerPrimitive; // Whether this is a per-primitive output (mesh shader)
 
   struct {
     SPIRVInterpModeKind Mode; // Interpolation mode

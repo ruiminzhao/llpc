@@ -213,11 +213,6 @@ static CompSetting computeCompSetting(BufDataFormat dfmt) {
 }
 } // namespace
 
-namespace lgc {
-// Create BuilderReplayer pass
-ModulePass *createLegacyBuilderReplayer(Pipeline *pipeline);
-} // namespace lgc
-
 // =====================================================================================================================
 // Constructor
 //
@@ -344,6 +339,7 @@ void PipelineState::readState(Module *module) {
   readGraphicsState(module);
   if (!m_palMetadata)
     m_palMetadata = new PalMetadata(this, module);
+  setXfbStateMetadata(module);
 }
 
 // =====================================================================================================================
@@ -438,8 +434,19 @@ ShaderStage PipelineState::getNextShaderStage(ShaderStage shaderStage) const {
 }
 
 // =====================================================================================================================
+// Get the shader stage mask.
+unsigned PipelineState::getShaderStageMask() {
+  if (!m_stageMask && !m_computeLibrary) {
+    // No shader stage mask set (and it isn't a compute library). We must be in ElfLinker; get the shader stage
+    // mask from PAL metadata.
+    m_stageMask = getPalMetadata()->getShaderStageMask();
+  }
+  return m_stageMask;
+}
+
+// =====================================================================================================================
 // Check whether the pipeline is a graphics pipeline
-bool PipelineState::isGraphics() const {
+bool PipelineState::isGraphics() {
   return (getShaderStageMask() & ((1U << ShaderStageTask) | (1U << ShaderStageVertex) | (1U << ShaderStageTessControl) |
                                   (1U << ShaderStageTessEval) | (1U << ShaderStageGeometry) | (1U << ShaderStageMesh) |
                                   (1U << ShaderStageFragment))) != 0;
@@ -1272,6 +1279,8 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
       } else if (hasShaderStage(ShaderStageGeometry)) {
         // Legacy (non-NGG) hardware path for GS does not support wave32.
         waveSize = 64;
+        if (getTargetInfo().getGfxIpVersion().major >= 11)
+          waveSize = 32;
       }
 
       // Experimental data from performance tuning show that wave64 is more efficient than wave32 in most cases for CS
@@ -1323,6 +1332,22 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
 }
 
 // =====================================================================================================================
+// Whether WGP mode is enabled for the given shader stage
+//
+// @param stage : Shader stage
+bool PipelineState::getShaderWgpMode(ShaderStage stage) const {
+  if (stage == ShaderStageCopyShader) {
+    // Treat copy shader as part of geometry shader
+    stage = ShaderStageGeometry;
+  }
+
+  assert(stage <= ShaderStageCompute);
+  assert(stage < m_shaderOptions.size());
+
+  return m_shaderOptions[stage].wgpMode;
+}
+
+// =====================================================================================================================
 // Checks if SW-emulated mesh pipeline statistics is needed
 bool PipelineState::needSwMeshPipelineStats() const {
   return getTargetInfo().getGfxIpVersion().major < 11;
@@ -1335,6 +1360,26 @@ bool PipelineState::enableMeshRowExport() const {
     return false; // Row export is not supported by HW
 
   return m_meshRowExport;
+}
+
+// =====================================================================================================================
+// Checks if SW-emulated stream-out should be enabled.
+bool PipelineState::enableSwXfb() {
+  assert(isGraphics());
+
+  // SW-emulated stream-out is enabled on GFX11+
+  if (getTargetInfo().getGfxIpVersion().major < 11)
+    return false;
+
+  auto lastVertexStage = getLastVertexProcessingStage();
+  lastVertexStage = lastVertexStage == ShaderStageCopyShader ? ShaderStageGeometry : lastVertexStage;
+
+  if (lastVertexStage == ShaderStageInvalid) {
+    assert(isUnlinked()); // Unlinked pipeline only having fragment shader.
+    return false;
+  }
+
+  return enableXfb();
 }
 
 // =====================================================================================================================
@@ -1534,6 +1579,19 @@ StringRef PipelineState::getBuiltInName(BuiltInKind builtIn) {
 }
 
 // =====================================================================================================================
+// Determine whether can use tessellation factor optimization
+bool PipelineState::canOptimizeTessFactor() {
+  if (getTargetInfo().getGfxIpVersion().major < 11)
+    return false;
+  auto resUsage = getShaderResourceUsage(ShaderStageTessControl);
+  auto &perPatchBuiltInOutLocMap = resUsage->inOutUsage.perPatchBuiltInOutputLocMap;
+  // Disable tessellation factor optimization if TFs are read in TES or TCS
+  if (perPatchBuiltInOutLocMap.count(BuiltInTessLevelOuter) || perPatchBuiltInOutLocMap.count(BuiltInTessLevelInner))
+    return false;
+  return getOptions().optimizeTessFactor;
+}
+
+// =====================================================================================================================
 // Set the packable state of generic input/output
 //
 void PipelineState::initializeInOutPackState() {
@@ -1682,17 +1740,31 @@ PrimitiveType PipelineState::getPrimitiveType() {
 }
 
 // =====================================================================================================================
-// Get (create if necessary) the PipelineState from this wrapper pass.
+// Set transform feedback state metadata
 //
-// @param module : IR module
-PipelineState *LegacyPipelineStateWrapper::getPipelineState(Module *module) {
-  if (!m_pipelineState) {
-    m_allocatedPipelineState = std::make_unique<PipelineState>(m_builderContext);
-    m_pipelineState = &*m_allocatedPipelineState;
-    m_pipelineState->readState(module);
-    m_pipelineState->initializeInOutPackState();
+// @param xfbStateMetadata : XFB state metadata
+void PipelineState::setXfbStateMetadata(Module *module) {
+  // Read XFB state metadata
+  for (auto &func : *module) {
+    if (isShaderEntryPoint(&func)) {
+      MDNode *xfbStateMetaNode = func.getMetadata(XfbStateMetadataName);
+      if (xfbStateMetaNode) {
+        m_xfbStateMetadata.enableXfb = true;
+        auto &streamXfbBuffers = m_xfbStateMetadata.streamXfbBuffers;
+        auto &xfbStrides = m_xfbStateMetadata.xfbStrides;
+        for (unsigned xfbBuffer = 0; xfbBuffer < MaxTransformFeedbackBuffers; ++xfbBuffer) {
+          // Get the vertex streamId from metadata
+          auto metaOp = cast<ConstantAsMetadata>(xfbStateMetaNode->getOperand(2 * xfbBuffer));
+          int streamId = cast<ConstantInt>(metaOp->getValue())->getSExtValue();
+          if (streamId != InvalidValue)
+            streamXfbBuffers[streamId] |= 1 << xfbBuffer; // Bit mask of used xfbBuffers in a stream
+          // Get the stride from metadata
+          metaOp = cast<ConstantAsMetadata>(xfbStateMetaNode->getOperand(2 * xfbBuffer + 1));
+          xfbStrides[xfbBuffer] = cast<ConstantInt>(metaOp->getValue())->getZExtValue();
+        }
+      }
+    }
   }
-  return m_pipelineState;
 }
 
 // =====================================================================================================================
@@ -1709,41 +1781,6 @@ PipelineStateWrapper::Result PipelineStateWrapper::run(Module &module, ModuleAna
     m_pipelineState->initializeInOutPackState();
   }
   return Result(m_pipelineState);
-}
-
-// =====================================================================================================================
-// Pass to clear pipeline state out of the IR
-class LegacyPipelineStateClearer : public ModulePass {
-public:
-  LegacyPipelineStateClearer() : ModulePass(ID) {}
-
-  void getAnalysisUsage(AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-  }
-
-  bool runOnModule(Module &module) override;
-
-  static char ID; // ID of this pass
-private:
-  PipelineStateClearer m_impl;
-};
-
-char LegacyPipelineStateClearer::ID = 0;
-
-// =====================================================================================================================
-// Create pipeline state clearer pass
-ModulePass *lgc::createLegacyPipelineStateClearer() {
-  return new LegacyPipelineStateClearer();
-}
-
-// =====================================================================================================================
-// Run PipelineStateClearer pass to clear the pipeline state out of the IR
-//
-// @param [in/out] module : IR module
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyPipelineStateClearer::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  return m_impl.runImpl(module, pipelineState);
 }
 
 // =====================================================================================================================
@@ -1770,13 +1807,6 @@ bool PipelineStateClearer::runImpl(Module &module, PipelineState *pipelineState)
 }
 
 // =====================================================================================================================
-// Initialize the pipeline state clearer pass
-INITIALIZE_PASS(LegacyPipelineStateClearer, "llpc-pipeline-state-clearer", "LLPC pipeline state clearer", false, true)
-
-// =====================================================================================================================
-char LegacyPipelineStateWrapper::ID = 0;
-
-// =====================================================================================================================
 AnalysisKey PipelineStateWrapper::Key;
 
 // =====================================================================================================================
@@ -1796,22 +1826,3 @@ PipelineStateWrapper::PipelineStateWrapper(LgcContext *builderContext) : m_build
 // @param pipelineState : Pipeline state to wrap
 PipelineStateWrapper::PipelineStateWrapper(PipelineState *pipelineState) : m_pipelineState(pipelineState) {
 }
-
-// =====================================================================================================================
-//
-// @param builderContext : LgcContext
-LegacyPipelineStateWrapper::LegacyPipelineStateWrapper(LgcContext *builderContext)
-    : ImmutablePass(ID), m_builderContext(builderContext) {
-}
-
-// =====================================================================================================================
-// Clean-up of LegacyPipelineStateWrapper at end of pass manager run
-//
-// @param module : Module
-bool LegacyPipelineStateWrapper::doFinalization(Module &module) {
-  return false;
-}
-
-// =====================================================================================================================
-// Initialize the pipeline state wrapper pass
-INITIALIZE_PASS(LegacyPipelineStateWrapper, DEBUG_TYPE, "LLPC pipeline state wrapper", false, true)

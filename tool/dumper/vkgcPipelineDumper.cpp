@@ -33,6 +33,7 @@
 #include "vkgcUtil.h"
 #include "llvm/Support/Mutex.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
@@ -68,6 +69,7 @@ std::ostream &operator<<(std::ostream &out, ShadowDescriptorTableUsage shadowDes
 std::ostream &operator<<(std::ostream &out, VkProvokingVertexModeEXT provokingVertexMode);
 std::ostream &operator<<(std::ostream &out, ResourceLayoutScheme layout);
 std::ostream &operator<<(std::ostream &out, ThreadGroupSwizzleMode threadGroupSwizzleMode);
+std::ostream &operator<<(std::ostream &out, InvariantLoads invariants);
 
 template std::ostream &operator<<(std::ostream &out, ElfReader<Elf64> &reader);
 template raw_ostream &operator<<(raw_ostream &out, ElfReader<Elf64> &reader);
@@ -351,6 +353,10 @@ std::string PipelineDumper::getPipelineInfoFileName(PipelineBuildInfo pipelineIn
       fileNamePrefix = "PipelineGs";
     else if (pipelineInfo.pGraphicsInfo->tes.pModuleData)
       fileNamePrefix = "PipelineTess";
+    else if (pipelineInfo.pGraphicsInfo->task.pModuleData && pipelineInfo.pGraphicsInfo->mesh.pModuleData)
+      fileNamePrefix = "PipelineTaskMesh";
+    else if (pipelineInfo.pGraphicsInfo->mesh.pModuleData)
+      fileNamePrefix = "PipelineMesh";
     else
       fileNamePrefix = "PipelineVsFs";
 
@@ -590,6 +596,8 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   dumpFile << "options.waveBreakSize = " << shaderInfo->options.waveBreakSize << "\n";
   dumpFile << "options.forceLoopUnrollCount = " << shaderInfo->options.forceLoopUnrollCount << "\n";
   dumpFile << "options.useSiScheduler = " << shaderInfo->options.useSiScheduler << "\n";
+  dumpFile << "options.disableCodeSinking = " << shaderInfo->options.disableCodeSinking << "\n";
+  dumpFile << "options.favorLatencyHiding = " << shaderInfo->options.favorLatencyHiding << "\n";
   dumpFile << "options.updateDescInElf = " << shaderInfo->options.updateDescInElf << "\n";
   dumpFile << "options.allowVaryWaveSize = " << shaderInfo->options.allowVaryWaveSize << "\n";
   dumpFile << "options.enableLoadScalarizer = " << shaderInfo->options.enableLoadScalarizer << "\n";
@@ -611,7 +619,6 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   dumpFile << "options.overrideShaderThreadGroupSizeZ = " << shaderInfo->options.overrideShaderThreadGroupSizeZ << "\n";
   dumpFile << "options.nsaThreshold = " << shaderInfo->options.nsaThreshold << "\n";
   dumpFile << "options.aggressiveInvariantLoads = " << shaderInfo->options.aggressiveInvariantLoads << "\n";
-  dumpFile << "options.disableInvariantLoads = " << shaderInfo->options.disableInvariantLoads << "\n";
   dumpFile << "\n";
 }
 
@@ -787,6 +794,9 @@ void PipelineDumper::dumpPipelineOptions(const PipelineOptions *options, std::os
   dumpFile << "options.extendedRobustness.robustImageAccess = " << options->extendedRobustness.robustImageAccess
            << "\n";
   dumpFile << "options.extendedRobustness.nullDescriptor = " << options->extendedRobustness.nullDescriptor << "\n";
+#if VKI_BUILD_GFX11
+  dumpFile << "options.optimizeTessFactor = " << options->optimizeTessFactor << "\n";
+#endif
 
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   dumpFile << "options.optimizationLevel = " << options->optimizationLevel << "\n";
@@ -797,6 +807,9 @@ void PipelineDumper::dumpPipelineOptions(const PipelineOptions *options, std::os
 #if VKI_RAY_TRACING
   dumpFile << "options.internalRtShaders = " << options->internalRtShaders << "\n";
 #endif
+
+  dumpFile << "options.forceNonUniformResourceIndexStageMask = " << options->forceNonUniformResourceIndexStageMask
+           << "\n";
 }
 
 // =====================================================================================================================
@@ -934,10 +947,12 @@ void PipelineDumper::dumpGraphicsPipelineInfo(std::ostream *dumpFile, const char
   // Dump pipeline
   // clang-format off
   const PipelineShaderInfo *shaderInfos[ShaderStageGfxCount] = {
+    &pipelineInfo->task,
     &pipelineInfo->vs,
     &pipelineInfo->tcs,
     &pipelineInfo->tes,
     &pipelineInfo->gs,
+    &pipelineInfo->mesh,
     &pipelineInfo->fs,
   };
   // clang-format on
@@ -1077,10 +1092,16 @@ void PipelineDumper::dumpRayTracingRtState(const RtState *rtState, std::ostream 
   dumpStream << "rtState.enableDispatchRaysOuterSwizzle = " << rtState->enableDispatchRaysOuterSwizzle << "\n";
   dumpStream << "rtState.forceInvalidAccelStruct = " << rtState->forceInvalidAccelStruct << "\n";
   dumpStream << "rtState.enableRayTracingCounters = " << rtState->enableRayTracingCounters << "\n";
+#if VKI_BUILD_GFX11
+  dumpStream << "rtState.enableRayTracingHwTraversalStack = " << rtState->enableRayTracingHwTraversalStack << "\n";
+#endif
   dumpStream << "rtState.enableOptimalLdsStackSizeForIndirect = " << rtState->enableOptimalLdsStackSizeForIndirect
              << "\n";
   dumpStream << "rtState.enableOptimalLdsStackSizeForUnified = " << rtState->enableOptimalLdsStackSizeForUnified
              << "\n";
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
+  dumpStream << "rtState.maxRayLength = " << rtState->maxRayLength << "\n";
+#endif
 
   for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
     dumpStream << "rtState.gpurtFuncTable.pFunc[" << i << "] = " << rtState->gpurtFuncTable.pFunc[i] << "\n";
@@ -1149,8 +1170,14 @@ void PipelineDumper::updateHashForRtState(const RtState *rtState, MetroHash64 *h
   hasher->Update(rtState->enableDispatchRaysOuterSwizzle);
   hasher->Update(rtState->forceInvalidAccelStruct);
   hasher->Update(rtState->enableRayTracingCounters);
+#if VKI_BUILD_GFX11
+  hasher->Update(rtState->enableRayTracingHwTraversalStack);
+#endif
   hasher->Update(rtState->enableOptimalLdsStackSizeForIndirect);
   hasher->Update(rtState->enableOptimalLdsStackSizeForUnified);
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
+  hasher->Update(rtState->maxRayLength);
+#endif
 
   for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
     size_t funcNameLen = 0;
@@ -1182,19 +1209,23 @@ MetroHash::Hash PipelineDumper::generateHashForGraphicsPipeline(const GraphicsPi
 
   switch (unlinkedShaderType) {
   case UnlinkedStageVertexProcess:
+    updateHashForPipelineShaderInfo(ShaderStageTask, &pipeline->task, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageVertex, &pipeline->vs, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageTessControl, &pipeline->tcs, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageTessEval, &pipeline->tes, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageGeometry, &pipeline->gs, isCacheHash, &hasher, isRelocatableShader);
+    updateHashForPipelineShaderInfo(ShaderStageMesh, &pipeline->mesh, isCacheHash, &hasher, isRelocatableShader);
     break;
   case UnlinkedStageFragment:
     updateHashForPipelineShaderInfo(ShaderStageFragment, &pipeline->fs, isCacheHash, &hasher, isRelocatableShader);
     break;
   case UnlinkedStageCount:
+    updateHashForPipelineShaderInfo(ShaderStageTask, &pipeline->task, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageVertex, &pipeline->vs, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageTessControl, &pipeline->tcs, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageTessEval, &pipeline->tes, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageGeometry, &pipeline->gs, isCacheHash, &hasher, isRelocatableShader);
+    updateHashForPipelineShaderInfo(ShaderStageMesh, &pipeline->mesh, isCacheHash, &hasher, isRelocatableShader);
     updateHashForPipelineShaderInfo(ShaderStageFragment, &pipeline->fs, isCacheHash, &hasher, isRelocatableShader);
     break;
   default:
@@ -1203,7 +1234,7 @@ MetroHash::Hash PipelineDumper::generateHashForGraphicsPipeline(const GraphicsPi
   }
 
   if (!isRelocatableShader)
-    updateHashForResourceMappingInfo(&pipeline->resourceMapping, &hasher);
+    updateHashForResourceMappingInfo(&pipeline->resourceMapping, pipeline->pipelineLayoutApiHash, &hasher);
 
   hasher.Update(pipeline->iaState.deviceIndex);
 
@@ -1244,7 +1275,7 @@ MetroHash::Hash PipelineDumper::generateHashForComputePipeline(const ComputePipe
   updateHashForPipelineShaderInfo(ShaderStageCompute, &pipeline->cs, isCacheHash, &hasher, isRelocatableShader);
 
   if (!isRelocatableShader)
-    updateHashForResourceMappingInfo(&pipeline->resourceMapping, &hasher);
+    updateHashForResourceMappingInfo(&pipeline->resourceMapping, pipeline->pipelineLayoutApiHash, &hasher);
 
   hasher.Update(pipeline->deviceIndex);
 
@@ -1279,7 +1310,7 @@ MetroHash::Hash PipelineDumper::generateHashForRayTracingPipeline(const RayTraci
                                     /*isRelocatableShader=*/false);
   }
 
-  updateHashForResourceMappingInfo(&pipeline->resourceMapping, &hasher);
+  updateHashForResourceMappingInfo(&pipeline->resourceMapping, pipeline->pipelineLayoutApiHash, &hasher);
 
   hasher.Update(pipeline->deviceIndex);
 
@@ -1438,6 +1469,9 @@ void PipelineDumper::updateHashForFragmentState(const GraphicsPipelineBuildInfo 
   // Topology is required when BaryCoord is used
   hasher->Update(pipeline->iaState.topology);
 
+  // View index in fragment shader depends on the enablement of multi-view
+  hasher->Update(pipeline->iaState.enableMultiView);
+
   if (!isRelocatableShader) {
     hasher->Update(rsState->innerCoverage);
     hasher->Update(rsState->numSamples);
@@ -1467,8 +1501,11 @@ void PipelineDumper::updateHashForFragmentState(const GraphicsPipelineBuildInfo 
 // @param stage : The unlinked shader stage that should be included in the hash.
 void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options, MetroHash64 *hasher, bool isCacheHash,
                                                   bool isRelocatableShader, UnlinkedShaderStage stage) {
+#if VKI_BUILD_GFX11
+#else
   assert(options->reserved1f == false && "The reserved1f bit should be unused at this time.");
 
+#endif
   hasher->Update(options->includeDisassembly);
   hasher->Update(options->scalarBlockLayout);
   hasher->Update(options->includeIr);
@@ -1491,6 +1528,11 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
   hasher->Update(options->extendedRobustness.robustBufferAccess);
   hasher->Update(options->extendedRobustness.robustImageAccess);
   hasher->Update(options->extendedRobustness.nullDescriptor);
+#if VKI_BUILD_GFX11
+  if (stage != UnlinkedStageCompute) {
+    hasher->Update(options->optimizeTessFactor);
+  }
+#endif
 
   if (stage == UnlinkedStageFragment || stage == UnlinkedStageCount) {
     hasher->Update(options->enableInterpModePatch);
@@ -1506,6 +1548,7 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
 #if VKI_RAY_TRACING
   hasher->Update(options->internalRtShaders);
 #endif
+  hasher->Update(options->forceNonUniformResourceIndexStageMask);
 }
 
 // =====================================================================================================================
@@ -1564,6 +1607,8 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
 
       hasher->Update(options.forceLoopUnrollCount);
       hasher->Update(options.useSiScheduler);
+      hasher->Update(options.disableCodeSinking);
+      hasher->Update(options.favorLatencyHiding);
       hasher->Update(options.updateDescInElf);
       hasher->Update(options.allowVaryWaveSize);
       hasher->Update(options.enableLoadScalarizer);
@@ -1585,7 +1630,6 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
       hasher->Update(options.overrideShaderThreadGroupSizeZ);
       hasher->Update(options.nsaThreshold);
       hasher->Update(options.aggressiveInvariantLoads);
-      hasher->Update(options.disableInvariantLoads);
     }
   }
 }
@@ -1596,44 +1640,49 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
 // @param resourceMapping : Pipeline resource mapping data.
 // @param [in,out] hasher : Haher to generate hash code.
 // @param stage : The stage for which we are building the hash. ShaderStageInvalid if building for the entire pipeline.
-void PipelineDumper::updateHashForResourceMappingInfo(const ResourceMappingData *resourceMapping, MetroHash64 *hasher,
+void PipelineDumper::updateHashForResourceMappingInfo(const ResourceMappingData *resourceMapping,
+                                                      const uint64_t pipelineLayoutApiHash, MetroHash64 *hasher,
                                                       ShaderStage stage) {
-  hasher->Update(resourceMapping->staticDescriptorValueCount);
-  if (resourceMapping->staticDescriptorValueCount > 0) {
-    for (unsigned i = 0; i < resourceMapping->staticDescriptorValueCount; ++i) {
-      auto staticDescriptorValue = &resourceMapping->pStaticDescriptorValues[i];
-      if (stage == ShaderStageInvalid || (staticDescriptorValue->visibility & shaderStageToMask(stage))) {
-        if (stage == ShaderStageInvalid)
-          hasher->Update(staticDescriptorValue->visibility);
-        hasher->Update(staticDescriptorValue->type);
-        hasher->Update(staticDescriptorValue->set);
-        hasher->Update(staticDescriptorValue->binding);
-        hasher->Update(staticDescriptorValue->arraySize);
+  if ((pipelineLayoutApiHash > 0) && (stage == ShaderStageInvalid || stage == ShaderStageCompute)) {
+    hasher->Update(reinterpret_cast<const uint8_t *>(&pipelineLayoutApiHash), sizeof(pipelineLayoutApiHash));
+  } else {
+    hasher->Update(resourceMapping->staticDescriptorValueCount);
+    if (resourceMapping->staticDescriptorValueCount > 0) {
+      for (unsigned i = 0; i < resourceMapping->staticDescriptorValueCount; ++i) {
+        auto staticDescriptorValue = &resourceMapping->pStaticDescriptorValues[i];
+        if (stage == ShaderStageInvalid || (staticDescriptorValue->visibility & shaderStageToMask(stage))) {
+          if (stage == ShaderStageInvalid)
+            hasher->Update(staticDescriptorValue->visibility);
+          hasher->Update(staticDescriptorValue->type);
+          hasher->Update(staticDescriptorValue->set);
+          hasher->Update(staticDescriptorValue->binding);
+          hasher->Update(staticDescriptorValue->arraySize);
+        }
+
+        // TODO: We should query descriptor size from patch
+
+        // The second part of StaticDescriptorValue is YCbCrMetaData, which is 4 dwords.
+        // The hasher should be updated when the content changes, this is because YCbCrMetaData
+        // is engaged in pipeline compiling.
+        const unsigned descriptorSize =
+            16 + (staticDescriptorValue->type != ResourceMappingNodeType::DescriptorYCbCrSampler
+                      ? 0
+                      : sizeof(SamplerYCbCrConversionMetaData));
+
+        hasher->Update(reinterpret_cast<const uint8_t *>(staticDescriptorValue->pValue),
+                       staticDescriptorValue->arraySize * descriptorSize);
       }
-
-      // TODO: We should query descriptor size from patch
-
-      // The second part of StaticDescriptorValue is YCbCrMetaData, which is 4 dwords.
-      // The hasher should be updated when the content changes, this is because YCbCrMetaData
-      // is engaged in pipeline compiling.
-      const unsigned descriptorSize =
-          16 + (staticDescriptorValue->type != ResourceMappingNodeType::DescriptorYCbCrSampler
-                    ? 0
-                    : sizeof(SamplerYCbCrConversionMetaData));
-
-      hasher->Update(reinterpret_cast<const uint8_t *>(staticDescriptorValue->pValue),
-                     staticDescriptorValue->arraySize * descriptorSize);
     }
-  }
 
-  hasher->Update(resourceMapping->userDataNodeCount);
-  if (resourceMapping->userDataNodeCount > 0) {
-    for (unsigned i = 0; i < resourceMapping->userDataNodeCount; ++i) {
-      auto userDataNode = &resourceMapping->pUserDataNodes[i];
-      if (stage == ShaderStageInvalid || (userDataNode->visibility & shaderStageToMask(stage))) {
-        if (stage == ShaderStageInvalid)
-          hasher->Update(userDataNode->visibility);
-        updateHashForResourceMappingNode(&userDataNode->node, true, hasher);
+    hasher->Update(resourceMapping->userDataNodeCount);
+    if (resourceMapping->userDataNodeCount > 0) {
+      for (unsigned i = 0; i < resourceMapping->userDataNodeCount; ++i) {
+        auto userDataNode = &resourceMapping->pUserDataNodes[i];
+        if (stage == ShaderStageInvalid || (userDataNode->visibility & shaderStageToMask(stage))) {
+          if (stage == ShaderStageInvalid)
+            hasher->Update(userDataNode->visibility);
+          updateHashForResourceMappingNode(&userDataNode->node, true, hasher);
+        }
       }
     }
   }
@@ -1781,6 +1830,7 @@ template <class OStream, class Elf>
 // @param [out] out : Output stream
 // @param reader : ELF object
 OStream &operator<<(OStream &out, ElfReader<Elf> &reader) {
+
   unsigned sectionCount = reader.getSectionCount();
   char formatBuf[256];
 
@@ -2490,6 +2540,25 @@ std::ostream &operator<<(std::ostream &out, ThreadGroupSwizzleMode threadGroupSw
     llvm_unreachable("Should never be called!");
     break;
   }
+  return out << string;
+}
+
+// =====================================================================================================================
+// Translates enum "InvariantLoads" to string and output to ostream.
+//
+// @param [out] out : Output stream
+// @param option : Value to convert
+std::ostream &operator<<(std::ostream &out, InvariantLoads option) {
+  const char *string = nullptr;
+  switch (option) {
+    CASE_CLASSENUM_TO_STRING(InvariantLoads, Auto)
+    CASE_CLASSENUM_TO_STRING(InvariantLoads, EnableOptimization)
+    CASE_CLASSENUM_TO_STRING(InvariantLoads, DisableOptimization)
+    CASE_CLASSENUM_TO_STRING(InvariantLoads, ClearInvariants)
+  default:
+    llvm_unreachable("Should never be called!");
+  }
+
   return out << string;
 }
 

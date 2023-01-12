@@ -29,8 +29,8 @@
  ***********************************************************************************************************************
  */
 #include "lgc/builder/BuilderReplayer.h"
-#include "BuilderImpl.h"
 #include "lgc/LgcContext.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/builder/BuilderRecorder.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/util/Internal.h"
@@ -41,42 +41,6 @@
 using namespace lgc;
 using namespace llvm;
 
-namespace {
-
-// =====================================================================================================================
-// Pass to replay Builder calls recorded by BuilderRecorder
-class LegacyBuilderReplayer final : public ModulePass, BuilderRecorderMetadataKinds {
-public:
-  LegacyBuilderReplayer() : ModulePass(ID), m_impl(nullptr) {}
-  LegacyBuilderReplayer(Pipeline *pipeline);
-
-  void getAnalysisUsage(AnalysisUsage &analysisUsage) const override {
-    analysisUsage.addRequired<LegacyPipelineStateWrapper>();
-  }
-
-  bool runOnModule(Module &module) override;
-
-  static char ID;
-
-private:
-  LegacyBuilderReplayer(const LegacyBuilderReplayer &) = delete;
-  LegacyBuilderReplayer &operator=(const LegacyBuilderReplayer &) = delete;
-
-  BuilderReplayer m_impl;
-};
-
-} // namespace
-
-char LegacyBuilderReplayer::ID = 0;
-
-// =====================================================================================================================
-// Create BuilderReplayer pass
-//
-// @param pipeline : Pipeline object
-ModulePass *lgc::createLegacyBuilderReplayer(Pipeline *pipeline) {
-  return new LegacyBuilderReplayer(pipeline);
-}
-
 // =====================================================================================================================
 // Constructor
 //
@@ -86,20 +50,16 @@ BuilderReplayer::BuilderReplayer(Pipeline *pipeline)
 }
 
 // =====================================================================================================================
-// Constructor
+// Parser callback for adding this pass from a textually described pass pipeline.
 //
-// @param pipeline : Pipeline object
-LegacyBuilderReplayer::LegacyBuilderReplayer(Pipeline *pipeline) : ModulePass(ID), m_impl(pipeline) {
-}
+// @param params : Parameters to the pass (in angle brackets)
+// @param passMgr : The pass manager to which the pass should be added
+bool BuilderReplayer::parsePass(llvm::StringRef params, llvm::ModulePassManager &passMgr) {
+  if (!params.empty())
+    return false;
 
-// =====================================================================================================================
-// Run the BuilderReplayer pass on a module
-//
-// @param [in/out] module : LLVM module to be run on
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyBuilderReplayer::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  return m_impl.runImpl(module, pipelineState);
+  passMgr.addPass(BuilderReplayer(nullptr));
+  return true;
 }
 
 // =====================================================================================================================
@@ -189,7 +149,7 @@ void BuilderReplayer::replayCall(unsigned opcode, CallInst *call) {
       m_shaderStageMap[enclosingFunc] = stage;
     } else
       stage = mapIt->second;
-    m_builder->setShaderStage(stage);
+    static_cast<BuilderImplBase *>(&*m_builder)->setShaderStage(stage);
   }
 
   // Set the insert point on the Builder. Also sets debug location to that of call.
@@ -704,7 +664,7 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   }
 
 #if VKI_RAY_TRACING
-  case BuilderRecorder::Opcode::ImageBvhIntersectRayAMD: {
+  case BuilderRecorder::Opcode::ImageBvhIntersectRay: {
     Value *bvhNodePtr = args[0];
     Value *extent = args[1];
     Value *origin = args[2];
@@ -909,7 +869,3 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   }
   }
 }
-
-// =====================================================================================================================
-// Initializes the pass
-INITIALIZE_PASS(LegacyBuilderReplayer, DEBUG_TYPE, "Replay LLPC builder calls", false, false)

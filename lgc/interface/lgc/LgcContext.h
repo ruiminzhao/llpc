@@ -42,13 +42,13 @@ class raw_pwrite_stream;
 class TargetMachine;
 class Timer;
 
-namespace legacy {
-
-class PassManager;
-
-} // namespace legacy
-
 } // namespace llvm
+
+namespace llvm_dialects {
+
+class DialectContext;
+
+} // namespace llvm_dialects
 
 namespace lgc {
 
@@ -99,6 +99,9 @@ public:
   // Get LLVM context
   llvm::LLVMContext &getContext() const { return m_context; }
 
+  // Get the dialects context.
+  llvm_dialects::DialectContext &getDialectContext() const { return *m_dialectContext; }
+
   // Get the target machine.
   llvm::TargetMachine *getTargetMachine() const { return m_targetMachine; }
 
@@ -115,12 +118,6 @@ public:
   //
   // @param pipeline : Pipeline object for pipeline compile, nullptr for shader compile
   Builder *createBuilder(Pipeline *pipeline);
-
-  // Prepare a legacy pass manager. This manually adds a target-aware TLI pass, so middle-end optimizations do not
-  // think that we have library functions.
-  //
-  // @param [in/out] passMgr : Pass manager
-  void preparePassManager(llvm::legacy::PassManager *passMgr);
 
   // Prepare a pass manager. This manually adds a target-aware TLI pass, so middle-end optimizations do not
   // think that we have library functions.
@@ -169,6 +166,7 @@ private:
   unsigned m_palAbiVersion = 0xFFFFFFFF;          // PAL pipeline ABI version to compile for
   PassManagerCache *m_passManagerCache = nullptr; // Pass manager cache and creator
   llvm::CodeGenOpt::Level m_initialOptLevel;      // Optimization level at initialization
+  std::unique_ptr<llvm_dialects::DialectContext> m_dialectContext;
 };
 
 } // namespace lgc

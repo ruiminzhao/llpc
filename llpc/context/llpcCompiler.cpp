@@ -44,6 +44,7 @@
 #endif
 #include "llpcShaderModuleHelper.h"
 #include "llpcSpirvLower.h"
+#include "llpcSpirvLowerCfgMerges.h"
 #if VKI_RAY_TRACING
 #include "llpcSpirvLowerRayTracing.h"
 #endif
@@ -59,6 +60,7 @@
 #include "lgc/ElfLinker.h"
 #include "lgc/EnumIterator.h"
 #include "lgc/PassManager.h"
+#include "llvm-dialects/Dialect/Dialect.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
@@ -68,6 +70,12 @@
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/IRPrintingPasses.h"
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
+// Old version of the code
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#endif
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
@@ -176,12 +184,6 @@ opt<int> ContextReuseLimit("context-reuse-limit",
 // -fatal-llvm-errors: Make all LLVM errors fatal
 opt<bool> FatalLlvmErrors("fatal-llvm-errors", cl::desc("Make all LLVM errors fatal"), init(false));
 
-// -new-pass-manager: Use LLVM's new pass manager (experimental)
-opt<unsigned> NewPassManager("new-pass-manager",
-                             cl::desc("0 - Legacy pass manager, 1 - New pass manager front-end, 2 - New pass manager "
-                                      "front-end and middle-end"),
-                             init(2));
-
 // -enable-part-pipeline: Use part pipeline compilation scheme (experimental)
 opt<bool> EnablePartPipeline("enable-part-pipeline", cl::desc("Enable part pipeline compilation scheme"), init(false));
 
@@ -240,13 +242,7 @@ std::condition_variable_any Compiler::m_helperThreadConditionVariable;
 // @param userData : An argument which will be passed to the installed error handler
 // @param reason : Error reason
 // @param genCrashDiag : Whether diagnostic should be generated
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 400826
-// Old version of the code
-static void fatalErrorHandler(void *userData, const std::string &reason, bool genCrashDiag) {
-#else
-// New version of the code (also handles unknown version, which we treat as latest)
 static void fatalErrorHandler(void *userData, const char *reason, bool genCrashDiag) {
-#endif
   LLPC_ERRS("LLVM FATAL ERROR: " << reason << "\n");
 #if LLPC_ENABLE_EXCEPTION
   throw("LLVM fatal error");
@@ -376,8 +372,6 @@ Result VKAPI_CALL ICompiler::Create(GfxIpVersion gfxIp, unsigned optionCount, co
   std::lock_guard<sys::Mutex> lock(*SCompilerMutex);
   MetroHash::Hash optionHash = Compiler::generateHashForCompileOptions(optionCount, options);
 
-  // Initialize passes so they can be referenced by -print-after etc.
-  initializeLowerPasses(*PassRegistry::getPassRegistry());
   LgcContext::initialize();
 
   bool parseCmdOption = true;
@@ -598,7 +592,7 @@ Result Compiler::BuildShaderModule(const ShaderModuleBuildInfo *shaderInfo, Shad
 // @returns : Formatted bytes, e.g., `ab c4 ef 00`.
 template <typename T> static FormattedBytes formatBytesLittleEndian(ArrayRef<T> data) {
   ArrayRef<uint8_t> bytes(reinterpret_cast<const uint8_t *>(data.data()), data.size() * sizeof(T));
-  return format_bytes(bytes, /* FirstByteOffset = */ None, /* NumPerLine = */ 16, /* ByteGroupSize = */ 1);
+  return format_bytes(bytes, /* FirstByteOffset = */ {}, /* NumPerLine = */ 16, /* ByteGroupSize = */ 1);
 }
 
 // =====================================================================================================================
@@ -634,16 +628,20 @@ Result Compiler::buildGraphicsShaderStage(const GraphicsPipelineBuildInfo *pipel
     nullptr,
     nullptr,
     nullptr,
+    nullptr,
+    nullptr,
     nullptr
   };
   // clang-format on
 
   switch (stage) {
   case UnlinkedStageVertexProcess: {
+    shaderInfo[ShaderStageTask] = &pipelineInfo->task;
     shaderInfo[ShaderStageVertex] = &pipelineInfo->vs;
     shaderInfo[ShaderStageTessControl] = &pipelineInfo->tcs;
     shaderInfo[ShaderStageTessEval] = &pipelineInfo->tes;
     shaderInfo[ShaderStageGeometry] = &pipelineInfo->gs;
+    shaderInfo[ShaderStageMesh] = &pipelineInfo->mesh;
     break;
   }
   case UnlinkedStageFragment: {
@@ -699,10 +697,12 @@ Result Compiler::buildGraphicsPipelineWithElf(const GraphicsPipelineBuildInfo *p
 
   // clang-format off
   SmallVector<const PipelineShaderInfo *, ShaderStageGfxCount> shaderInfo = {
+    &pipelineInfo->task,
     &pipelineInfo->vs,
     &pipelineInfo->tcs,
     &pipelineInfo->tes,
     &pipelineInfo->gs,
+    &pipelineInfo->mesh,
     &pipelineInfo->fs,
   };
   // clang-format on
@@ -726,12 +726,16 @@ Result Compiler::buildGraphicsPipelineWithElf(const GraphicsPipelineBuildInfo *p
   BinaryData elfBin = {};
   ElfPackage elf[UnlinkedStageCount] = {};
   ElfPackage pipelineElf;
-  if (!cacheAccessor && cacheAccessor->isInCache()) {
+  if (cacheAccessor && cacheAccessor->isInCache()) {
     LLPC_OUTS("Cache hit for graphics pipeline.\n");
     elfBin = cacheAccessor->getElfFromCache();
     pipelineOut->pipelineCacheAccess =
         cacheAccessor->hitInternalCache() ? CacheAccessInfo::InternalCacheHit : CacheAccessInfo::CacheHit;
   } else {
+    LLPC_OUTS("Cache miss for graphics pipeline.\n");
+    if (cacheAccessor && pipelineOut->pipelineCacheAccess == CacheAccessInfo::CacheNotChecked)
+      pipelineOut->pipelineCacheAccess = CacheAccessInfo::CacheMiss;
+
     GraphicsContext graphicsContext(m_gfxIp, pipelineInfo, &pipelineHash, &cacheHash);
     Context *context = acquireContext();
     context->attachPipelineContext(&graphicsContext);
@@ -764,6 +768,11 @@ Result Compiler::buildGraphicsPipelineWithElf(const GraphicsPipelineBuildInfo *p
 
     elfBin.codeSize = pipelineElf.size();
     elfBin.pCode = pipelineElf.data();
+
+    if (cacheAccessor && !cacheAccessor->isInCache()) {
+      LLPC_OUTS("Adding graphics pipeline to the cache.\n");
+      cacheAccessor->setElfInCache(elfBin);
+    }
   }
 
   void *allocBuf = pipelineInfo->pfnOutputAlloc(pipelineInfo->pInstance, pipelineInfo->pUserData, elfBin.codeSize);
@@ -926,10 +935,6 @@ static bool isUnrelocatableResourceMappingRootNode(const ResourceMappingNode *no
     const ResourceMappingNode *startInnerNode = node->tablePtr.pNext;
     const ResourceMappingNode *endInnerNode = startInnerNode + node->tablePtr.nodeCount;
     for (const ResourceMappingNode *innerNode = startInnerNode; innerNode != endInnerNode; ++innerNode) {
-      if (innerNode->type == ResourceMappingNodeType::DescriptorBufferCompact)
-        // The code to handle a compact descriptor cannot be easily patched, so relocatable shaders assume there are
-        // no compact descriptors.
-        return true;
       if (innerNode->type == ResourceMappingNodeType::InlineBuffer) {
         // The code to handle an inline buffer cannot be easily patched, so relocatable shaders
         // assume there are no inline buffers.
@@ -938,11 +943,9 @@ static bool isUnrelocatableResourceMappingRootNode(const ResourceMappingNode *no
     }
     break;
   }
-  case ResourceMappingNodeType::DescriptorResource:
   case ResourceMappingNodeType::DescriptorSampler:
   case ResourceMappingNodeType::DescriptorCombinedTexture:
   case ResourceMappingNodeType::DescriptorTexelBuffer:
-  case ResourceMappingNodeType::DescriptorBufferCompact:
     // Generic descriptors in the top level are not handled by the linker.
     return true;
   case ResourceMappingNodeType::InlineBuffer:
@@ -996,6 +999,9 @@ bool Compiler::canUseRelocatableGraphicsShaderElf(const ArrayRef<const PipelineS
                                                   const GraphicsPipelineBuildInfo *pipelineInfo) {
   // Check user data nodes for unsupported Descriptor types.
   if (hasUnrelocatableDescriptorNode(&pipelineInfo->resourceMapping))
+    return false;
+
+  if (pipelineInfo->iaState.enableMultiView)
     return false;
 
   if (shaderInfos[0]) {
@@ -1063,6 +1069,7 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
 
   // Set up middle-end objects.
   LgcContext *builderContext = context->getLgcContext();
+  auto dialectGuard = llvm_dialects::withDialects(builderContext->getDialectContext());
   std::unique_ptr<Pipeline> pipeline(builderContext->createPipeline());
   context->getPipelineContext()->setPipelineState(&*pipeline, /*hasher=*/nullptr,
                                                   pipelineLink == PipelineLink::Unlinked);
@@ -1096,7 +1103,7 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
       if (moduleDataEx->binType == BinaryType::MultiLlvmBc) {
         result = Result::ErrorInvalidShader;
       } else {
-        module = new Module((Twine("llpc") + getShaderStageName(shaderInfoEntry->entryStage)).str() +
+        module = new Module((Twine("llpc") + "_" + getShaderStageName(shaderInfoEntry->entryStage)).str() + "_" +
                                 std::to_string(getModuleIdByIndex(shaderIndex)),
                             *context);
       }
@@ -1118,83 +1125,42 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
       if (!shaderInfoEntry || !shaderInfoEntry->pModuleData || (stageSkipMask & shaderStageToMask(entryStage)))
         continue;
 
-      // Set the shader stage in the Builder.
-      context->getBuilder()->setShaderStage(getLgcShaderStage(entryStage));
+      std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create(context->getLgcContext()));
+      lowerPassMgr->setPassIndex(&passIndex);
+      SpirvLower::registerPasses(*lowerPassMgr);
 
-      if (cl::NewPassManager) {
-        std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create());
-        lowerPassMgr->setPassIndex(&passIndex);
-        SpirvLower::registerPasses(*lowerPassMgr);
+      // Start timer for translate.
+      timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, true);
 
-        // Start timer for translate.
-        timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, true);
-
-        // SPIR-V translation, then dump the result.
-        lowerPassMgr->addPass(SpirvLowerTranslator(entryStage, shaderInfoEntry));
-        if (EnableOuts()) {
-          lowerPassMgr->addPass(PrintModulePass(
-              outs(), "\n"
-                      "===============================================================================\n"
-                      "// LLPC SPIRV-to-LLVM translation results\n"));
-        }
+      // SPIR-V translation, then dump the result.
+      lowerPassMgr->addPass(SpirvLowerTranslator(entryStage, shaderInfoEntry));
+      if (EnableOuts()) {
+        lowerPassMgr->addPass(
+            PrintModulePass(outs(), "\n"
+                                    "===============================================================================\n"
+                                    "// LLPC SPIRV-to-LLVM translation results\n"));
+      }
 
 #if VKI_RAY_TRACING
-        const ShaderModuleData *moduleData = reinterpret_cast<const ShaderModuleData *>(shaderInfoEntry->pModuleData);
-        if (moduleData->usage.enableRayQuery) {
-          lowerPassMgr->addPass(SpirvLowerRayQuery(moduleData->usage.rayQueryLibrary));
-          rayQueryLibraryIndex = shaderIndex;
-        }
+      const ShaderModuleData *moduleData = reinterpret_cast<const ShaderModuleData *>(shaderInfoEntry->pModuleData);
+      if (moduleData->usage.enableRayQuery) {
+        lowerPassMgr->addPass(SpirvLowerRayQuery(moduleData->usage.rayQueryLibrary));
+        rayQueryLibraryIndex = shaderIndex;
+      }
 
-        isInternalRtShader = moduleData->usage.isInternalRtShader;
+      isInternalRtShader = moduleData->usage.isInternalRtShader;
 
-        if (isInternalRtShader)
-          assert(entryStage == ShaderStageCompute);
+      if (isInternalRtShader)
+        assert(entryStage == ShaderStageCompute);
 #endif
 
-        // Stop timer for translate.
-        timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, false);
+      // Stop timer for translate.
+      timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, false);
 
-        bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-        if (!success) {
-          LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
-          result = Result::ErrorInvalidShader;
-        }
-      } else {
-        std::unique_ptr<lgc::LegacyPassManager> lowerPassMgr(lgc::LegacyPassManager::Create());
-        lowerPassMgr->setPassIndex(&passIndex);
-
-        // Start timer for translate.
-        timerProfiler.addTimerStartStopPass(&*lowerPassMgr, TimerTranslate, true);
-
-        // SPIR-V translation, then dump the result.
-        lowerPassMgr->add(createSpirvLowerTranslator(entryStage, shaderInfoEntry));
-        if (EnableOuts()) {
-          lowerPassMgr->add(createPrintModulePass(
-              outs(), "\n"
-                      "===============================================================================\n"
-                      "// LLPC SPIRV-to-LLVM translation results\n"));
-        }
-#if VKI_RAY_TRACING
-        const ShaderModuleData *moduleData = reinterpret_cast<const ShaderModuleData *>(shaderInfoEntry->pModuleData);
-        if (moduleData->usage.enableRayQuery) {
-          lowerPassMgr->add(createLegacySpirvLowerRayQuery(moduleData->usage.rayQueryLibrary));
-          rayQueryLibraryIndex = shaderIndex;
-        }
-
-        isInternalRtShader = moduleData->usage.isInternalRtShader;
-
-        if (isInternalRtShader)
-          assert(entryStage == ShaderStageCompute);
-#endif
-        // Stop timer for translate.
-        timerProfiler.addTimerStartStopPass(&*lowerPassMgr, TimerTranslate, false);
-
-        // Run the passes.
-        bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-        if (!success) {
-          LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
-          result = Result::ErrorInvalidShader;
-        }
+      bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
+      if (!success) {
+        LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
+        result = Result::ErrorInvalidShader;
       }
     }
 #if VKI_RAY_TRACING
@@ -1238,34 +1204,18 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
         continue;
       }
 
-      context->getBuilder()->setShaderStage(getLgcShaderStage(entryStage));
-      bool success;
-      if (cl::NewPassManager) {
-        std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create());
-        lowerPassMgr->setPassIndex(&passIndex);
-        SpirvLower::registerPasses(*lowerPassMgr);
+      std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create(context->getLgcContext()));
+      lowerPassMgr->setPassIndex(&passIndex);
+      SpirvLower::registerPasses(*lowerPassMgr);
 
-        SpirvLower::addPasses(context, entryStage, *lowerPassMgr, timerProfiler.getTimer(TimerLower)
+      SpirvLower::addPasses(context, entryStage, *lowerPassMgr, timerProfiler.getTimer(TimerLower)
 #if VKI_RAY_TRACING
-                                                                      ,
-                              false, rayQuery, isInternalRtShader
+                                                                    ,
+                            false, rayQuery, isInternalRtShader
 #endif
-        );
-        // Run the passes.
-        success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-      } else {
-        std::unique_ptr<lgc::LegacyPassManager> lowerPassMgr(lgc::LegacyPassManager::Create());
-        lowerPassMgr->setPassIndex(&passIndex);
-
-        LegacySpirvLower::addPasses(context, entryStage, *lowerPassMgr, timerProfiler.getTimer(TimerLower)
-#if VKI_RAY_TRACING
-                                                                            ,
-                                    false, rayQuery, isInternalRtShader
-#endif
-        );
-        // Run the passes.
-        success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-      }
+      );
+      // Run the passes.
+      bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
       if (!success) {
         LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
         result = Result::ErrorInvalidShader;
@@ -1303,9 +1253,10 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
       };
 
   // Only enable per stage cache for full graphics pipeline (traditional pipeline or mesh pipeline)
-  bool checkPerStageCache = cl::EnablePerStageCache && !cl::EnablePartPipeline && context->isGraphics() &&
-                            !buildingRelocatableElf &&
-                            (context->getShaderStageMask() & (ShaderStageVertexBit | ShaderStageFragmentBit));
+  bool checkPerStageCache =
+      cl::EnablePerStageCache && !cl::EnablePartPipeline && context->isGraphics() && !buildingRelocatableElf &&
+      (context->getShaderStageMask() & (ShaderStageVertexBit | ShaderStageMeshBit | ShaderStageFragmentBit));
+
   if (!checkPerStageCache)
     checkShaderCacheFunc = nullptr;
 
@@ -1324,7 +1275,7 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
           timerProfiler.getTimer(TimerCodeGen),
       };
 
-      pipeline->generate(std::move(pipelineModule), elfStream, checkShaderCacheFunc, timers, cl::NewPassManager == 2);
+      pipeline->generate(std::move(pipelineModule), elfStream, checkShaderCacheFunc, timers);
 #if LLPC_ENABLE_EXCEPTION
       result = Result::Success;
 #endif
@@ -1697,10 +1648,12 @@ Result Compiler::BuildGraphicsPipeline(const GraphicsPipelineBuildInfo *pipeline
   BinaryData elfBin = {};
   // clang-format off
   SmallVector<const PipelineShaderInfo *, ShaderStageGfxCount> shaderInfo = {
+    &pipelineInfo->task,
     &pipelineInfo->vs,
     &pipelineInfo->tcs,
     &pipelineInfo->tes,
     &pipelineInfo->gs,
+    &pipelineInfo->mesh,
     &pipelineInfo->fs,
   };
   // clang-format on
@@ -1832,10 +1785,12 @@ Result Compiler::buildComputePipelineInternal(ComputeContext *computeContext,
   context->attachPipelineContext(computeContext);
 
   std::vector<const PipelineShaderInfo *> shadersInfo = {
+      nullptr,          ///< Task shader
       nullptr,          ///< Vertex shader
       nullptr,          ///< Tessellation control shader
       nullptr,          ///< Tessellation evaluation shader
       nullptr,          ///< Geometry shader
+      nullptr,          ///< Mesh shader
       nullptr,          ///< Fragment shader
       &pipelineInfo->cs ///< Compute shader
   };
@@ -2176,28 +2131,15 @@ Result Compiler::buildRayTracingPipelineElf(Context *context, Module *module, El
                                             std::vector<bool> &moduleCallsTraceRay, unsigned moduleIndex,
                                             std::unique_ptr<Pipeline> &pipeline, TimerProfiler &timerProfiler) {
   // Per-shader SPIR-V lowering passes.
-  context->getBuilder()->setShaderStage(getLgcShaderStage(ShaderStageCompute));
-
-  bool success;
   unsigned passIndex = 0;
-  if (cl::NewPassManager) {
-    std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create());
-    lowerPassMgr->setPassIndex(&passIndex);
-    SpirvLower::registerPasses(*lowerPassMgr);
+  std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create(context->getLgcContext()));
+  lowerPassMgr->setPassIndex(&passIndex);
+  SpirvLower::registerPasses(*lowerPassMgr);
 
-    SpirvLower::addPasses(context, ShaderStageCompute, *lowerPassMgr, timerProfiler.getTimer(TimerLower), true, false,
-                          false);
-    // Run the passes.
-    success = runPasses(&*lowerPassMgr, module);
-  } else {
-    std::unique_ptr<lgc::LegacyPassManager> lowerPassMgr(lgc::LegacyPassManager::Create());
-    lowerPassMgr->setPassIndex(&passIndex);
-
-    LegacySpirvLower::addPasses(context, ShaderStageCompute, *lowerPassMgr, timerProfiler.getTimer(TimerLower), true,
-                                false, false);
-    // Run the passes.
-    success = runPasses(&*lowerPassMgr, module);
-  }
+  SpirvLower::addPasses(context, ShaderStageCompute, *lowerPassMgr, timerProfiler.getTimer(TimerLower), true, false,
+                        false);
+  // Run the passes.
+  bool success = runPasses(&*lowerPassMgr, module);
   if (!success) {
     LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
     return Result::ErrorInvalidShader;
@@ -2253,7 +2195,7 @@ Result Compiler::buildRayTracingPipelineElf(Context *context, Module *module, El
         timerProfiler.getTimer(TimerCodeGen),
     };
 
-    pipeline->generate(std::move(pipelineModule), elfStream, nullptr, timers, cl::NewPassManager == 2);
+    pipeline->generate(std::move(pipelineModule), elfStream, nullptr, timers);
   }
 #if LLPC_ENABLE_EXCEPTION
   catch (const char *) {
@@ -2378,13 +2320,10 @@ Result Compiler::buildRayTracingPipelineInternal(Context *context, ArrayRef<cons
 
   bool hasError = false;
   context->setDiagnosticHandler(std::make_unique<LlpcDiagnosticHandler>(&hasError));
-#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 381316
-  // Old version of the code
-  context->setInlineAsmDiagnosticHandler(InlineAsmDiagHandler, &hasError);
-#endif
 
   // Set up middle-end objects.
   LgcContext *builderContext = context->getLgcContext();
+  auto dialectGuard = llvm_dialects::withDialects(builderContext->getDialectContext());
   std::unique_ptr<Pipeline> pipeline(builderContext->createPipeline());
   rayTracingContext->setPipelineState(&*pipeline, /*hasher=*/nullptr, unlinked);
   context->setBuilder(builderContext->createBuilder(&*pipeline));
@@ -2402,33 +2341,15 @@ Result Compiler::buildRayTracingPipelineInternal(Context *context, ArrayRef<cons
     if (!shaderInfoEntry->pModuleData)
       continue;
 
-    bool success;
-    if (cl::NewPassManager) {
-      std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create());
-      lowerPassMgr->setPassIndex(&passIndex);
-      SpirvLower::registerPasses(*lowerPassMgr);
+    std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create(context->getLgcContext()));
+    lowerPassMgr->setPassIndex(&passIndex);
+    SpirvLower::registerPasses(*lowerPassMgr);
 
-      // Set the shader stage in the Builder.
-      context->getBuilder()->setShaderStage(getLgcShaderStage(shaderInfoEntry->entryStage));
+    // SPIR-V translation, then dump the result.
+    lowerPassMgr->addPass(SpirvLowerTranslator(shaderInfoEntry->entryStage, shaderInfoEntry));
 
-      // SPIR-V translation, then dump the result.
-      lowerPassMgr->addPass(SpirvLowerTranslator(shaderInfoEntry->entryStage, shaderInfoEntry));
-
-      // Run the passes.
-      success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-    } else {
-      std::unique_ptr<lgc::LegacyPassManager> lowerPassMgr(lgc::LegacyPassManager::Create());
-      lowerPassMgr->setPassIndex(&passIndex);
-
-      // Set the shader stage in the Builder.
-      context->getBuilder()->setShaderStage(getLgcShaderStage(shaderInfoEntry->entryStage));
-
-      // SPIR-V translation, then dump the result.
-      lowerPassMgr->add(createSpirvLowerTranslator(shaderInfoEntry->entryStage, shaderInfoEntry));
-
-      // Run the passes.
-      success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-    }
+    // Run the passes.
+    bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
     if (!success) {
       LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
       result = Result::ErrorInvalidShader;
@@ -2438,51 +2359,27 @@ Result Compiler::buildRayTracingPipelineInternal(Context *context, ArrayRef<cons
   for (unsigned shaderIndex = 0; shaderIndex < shaderInfo.size() && result == Result::Success; ++shaderIndex) {
     ShaderStage entryStage = shaderInfo[shaderIndex]->entryStage;
 
-    bool success;
-    if (cl::NewPassManager) {
-      std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create());
-      lowerPassMgr->setPassIndex(&passIndex);
-      SpirvLower::registerPasses(*lowerPassMgr);
+    std::unique_ptr<lgc::PassManager> lowerPassMgr(lgc::PassManager::Create(context->getLgcContext()));
+    lowerPassMgr->setPassIndex(&passIndex);
+    SpirvLower::registerPasses(*lowerPassMgr);
 
-      // Set the shader stage in the Builder.
-      context->getBuilder()->setShaderStage(getLgcShaderStage(entryStage));
+    // Start timer for translate.
+    timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, true);
 
-      // Start timer for translate.
-      timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, true);
-
-      // OpTerminateRay/OpIgnoreIntersection of anyhit shader and OpReportIntersection of intersection shader could
-      // terminate ray during inbetween of shader execution. So functions in these shaders need to be inlined.
-      if (entryStage == ShaderStageRayTracingAnyHit || entryStage == ShaderStageRayTracingIntersect)
-        lowerPassMgr->addPass(AlwaysInlinerPass());
-      lowerPassMgr->addPass(SpirvLowerRayTracing(false));
-
-      // Stop timer for translate.
-      timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, false);
-
-      // Run the passes.
-      success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
-    } else {
-      std::unique_ptr<lgc::LegacyPassManager> lowerPassMgr(lgc::LegacyPassManager::Create());
-      lowerPassMgr->setPassIndex(&passIndex);
-
-      // Set the shader stage in the Builder.
-      context->getBuilder()->setShaderStage(getLgcShaderStage(entryStage));
-
-      // Start timer for translate.
-      timerProfiler.addTimerStartStopPass(&*lowerPassMgr, TimerTranslate, true);
-
-      // OpTerminateRay/OpIgnoreIntersection of anyhit shader and OpReportIntersection of intersection shader could
-      // terminate ray during inbetween of shader execution. So functions in these shaders need to be inlined.
-      if (entryStage == ShaderStageRayTracingAnyHit || entryStage == ShaderStageRayTracingIntersect)
-        lowerPassMgr->add(createAlwaysInlinerLegacyPass());
-      lowerPassMgr->add(createLegacySpirvLowerRayTracing(false));
-
-      // Stop timer for translate.
-      timerProfiler.addTimerStartStopPass(&*lowerPassMgr, TimerTranslate, false);
-
-      // Run the passes.
-      success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
+    // OpTerminateRay/OpIgnoreIntersection of anyhit shader and OpReportIntersection of intersection shader could
+    // terminate ray during inbetween of shader execution. So functions in these shaders need to be inlined.
+    if (entryStage == ShaderStageRayTracingAnyHit || entryStage == ShaderStageRayTracingIntersect) {
+      // Lower SPIR-V CFG merges before inlining
+      lowerPassMgr->addPass(SpirvLowerCfgMerges());
+      lowerPassMgr->addPass(AlwaysInlinerPass());
     }
+    lowerPassMgr->addPass(SpirvLowerRayTracing(false));
+
+    // Stop timer for translate.
+    timerProfiler.addTimerStartStopPass(*lowerPassMgr, TimerTranslate, false);
+
+    // Run the passes.
+    bool success = runPasses(&*lowerPassMgr, modules[shaderIndex]);
     if (!success) {
       LLPC_ERRS("Failed to translate SPIR-V or run per-shader passes\n");
       result = Result::ErrorInvalidShader;
@@ -2913,28 +2810,6 @@ Context *Compiler::acquireContext() const {
 }
 
 // =====================================================================================================================
-// Run legacy pass manager's passes on a module, catching any LLVM fatal error and returning a success indication
-//
-// @param passMgr : Pass manager
-// @param [in/out] module : Module
-bool Compiler::runPasses(lgc::LegacyPassManager *passMgr, Module *module) const {
-  bool success = false;
-#if LLPC_ENABLE_EXCEPTION
-  try
-#endif
-  {
-    passMgr->run(*module);
-    success = true;
-  }
-#if LLPC_ENABLE_EXCEPTION
-  catch (const char *) {
-    success = false;
-  }
-#endif
-  return success;
-}
-
-// =====================================================================================================================
 // Run pass manager's passes on a module, catching any LLVM fatal error and returning a success indication
 //
 // @param passMgr : Pass manager
@@ -2993,7 +2868,8 @@ void Compiler::buildShaderCacheHash(Context *context, unsigned stageMask, ArrayR
     PipelineDumper::updateHashForPipelineShaderInfo(stage, shaderInfo, true, &hasher, false);
     hasher.Update(pipelineInfo->iaState.deviceIndex);
 
-    PipelineDumper::updateHashForResourceMappingInfo(context->getResourceMapping(), &hasher, stage);
+    PipelineDumper::updateHashForResourceMappingInfo(context->getResourceMapping(), context->getPipelineLayoutApiHash(),
+                                                     &hasher, stage);
 
     // Update input/output usage (provided by middle-end caller of this callback).
     hasher.Update(stageHashes[getLgcShaderStage(stage)].data(), stageHashes[getLgcShaderStage(stage)].size());
@@ -3074,6 +2950,8 @@ bool Compiler::linkRelocatableShaderElf(ElfPackage *shaderElfs, ElfPackage *pipe
 // @param stage : Front-end LLPC shader stage
 lgc::ShaderStage getLgcShaderStage(Llpc::ShaderStage stage) {
   switch (stage) {
+  case ShaderStageTask:
+    return lgc::ShaderStageTask;
   case ShaderStageCompute:
     return lgc::ShaderStageCompute;
   case ShaderStageVertex:
@@ -3084,6 +2962,8 @@ lgc::ShaderStage getLgcShaderStage(Llpc::ShaderStage stage) {
     return lgc::ShaderStageTessEval;
   case ShaderStageGeometry:
     return lgc::ShaderStageGeometry;
+  case ShaderStageMesh:
+    return lgc::ShaderStageMesh;
   case ShaderStageFragment:
     return lgc::ShaderStageFragment;
   case ShaderStageCopyShader:

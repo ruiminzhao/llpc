@@ -79,9 +79,6 @@ static const char *RemapCapturedVaToReplayVa = "AmdTraceRayRemapCapturedVaToRepl
 } // namespace RtName
 
 namespace Llpc {
-// =====================================================================================================================
-// Initializes static members.
-char LegacySpirvLowerRayTracing::ID = 0;
 
 // TraceParams Type size in DWORD
 static unsigned TraceParamsTySize[] = {
@@ -106,18 +103,6 @@ static unsigned TraceParamsTySize[] = {
 // Get payload idx for TraceRayKHR instruction.
 unsigned getTraceRayParamPayloadIdx(void) {
   return TraceRayParam::Payload;
-}
-
-// =====================================================================================================================
-// Pass creator, creates the pass of SPIR-V lowering ray operations.
-// @param rayQueryLibrary : ray query library
-ModulePass *createLegacySpirvLowerRayTracing(bool rayQueryLibrary) {
-  return new LegacySpirvLowerRayTracing(rayQueryLibrary);
-}
-
-// =====================================================================================================================
-LegacySpirvLowerRayTracing::LegacySpirvLowerRayTracing(bool rayQueryLibrary) : ModulePass(ID), Impl(rayQueryLibrary) {
-  initializeLegacySpirvLowerRayTracingPass(*PassRegistry::getPassRegistry());
 }
 
 // =====================================================================================================================
@@ -455,14 +440,6 @@ template <> void SpirvLowerRayTracing::createRayTracingFunc<OpReportIntersection
 // Executes this SPIR-V lowering pass on the specified LLVM module.
 //
 // @param [in/out] module : LLVM module to be run on
-bool LegacySpirvLowerRayTracing::runOnModule(Module &module) {
-  return Impl.runImpl(module);
-}
-
-// =====================================================================================================================
-// Executes this SPIR-V lowering pass on the specified LLVM module.
-//
-// @param [in/out] module : LLVM module to be run on
 // @param [in/out] analysisManager : Analysis manager to use for this transformation
 PreservedAnalyses SpirvLowerRayTracing::run(Module &module, ModuleAnalysisManager &analysisManager) {
   runImpl(module);
@@ -583,8 +560,14 @@ bool SpirvLowerRayTracing::runImpl(Module &module) {
       // Assuming AnyHit/Intersect module is inlined, find the processed call instructions first
       std::vector<CallInst *> callInsts;
 
-      for (auto &block : m_entryPoint->getBasicBlockList()) {
+      for (auto &block : *m_entryPoint) {
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 445640
+        // Old version of the code
         for (auto &inst : block.getInstList()) {
+#else
+        // New version of the code (also handles unknown version, which we treat as latest)
+        for (auto &inst : block) {
+#endif
           if (isa<CallInst>(&inst))
             callInsts.push_back(dyn_cast<CallInst>(&inst));
         }
@@ -624,6 +607,7 @@ void SpirvLowerRayTracing::processLibraryFunction(Function *func) {
   assert(m_shaderStage == ShaderStageCompute);
   auto mangledName = func->getName();
   const char *traceRayFuncName = m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_TRACE_RAY);
+
   if (mangledName.startswith(traceRayFuncName)) {
     func->setLinkage(GlobalValue::ExternalLinkage);
   } else if (mangledName.startswith(RtName::GetFlattenedGroupThreadId)) {
@@ -1457,7 +1441,7 @@ void SpirvLowerRayTracing::createDbgInfo(Module &module, Function *func) {
   DIFile *file = builder.createFile(func->getName(), ".");
 
   // Create the DISubprogram for the module entry function
-  auto *funcTy = builder.createSubroutineType(builder.getOrCreateTypeArray(llvm::None));
+  auto *funcTy = builder.createSubroutineType(builder.getOrCreateTypeArray({}));
   auto spFlags = DISubprogram::SPFlagDefinition;
   auto subProgram =
       builder.createFunction(file, func->getName(), module.getName(), file, 0, funcTy, 0, DINode::FlagZero, spFlags);
@@ -1668,7 +1652,11 @@ void SpirvLowerRayTracing::createTraceRay() {
   m_builder->CreateStore(elem2, traceRaysArgs[TraceRayLibFuncParam::DirZ]);
 
   // 14, TMax
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
+  const float rayTMax = m_context->getPipelineContext()->getRayTracingState()->maxRayLength;
+#else
   const float rayTMax = m_context->getPipelineContext()->getPipelineOptions()->rtMaxRayLength;
+#endif
   if (rayTMax > 0.0) {
     arg = ConstantFP::get(m_builder->getFloatTy(), rayTMax);
   } else {
@@ -2074,7 +2062,7 @@ void SpirvLowerRayTracing::createCallableShaderEntryFunc(Function *func) {
 // @param func : Function to gather ReturnInst
 // @param rets : returned vector of  ReturnInst instructions
 void SpirvLowerRayTracing::getFuncRets(Function *func, SmallVector<Instruction *, 4> &rets) {
-  for (auto &block : func->getBasicBlockList()) {
+  for (auto &block : *func) {
     auto blockTerm = block.getTerminator();
     if (blockTerm != nullptr && isa<ReturnInst>(blockTerm))
       rets.push_back(blockTerm);
@@ -2381,7 +2369,3 @@ Function *SpirvLowerRayTracing::getOrCreateRemapCapturedVaToReplayVaFunc() {
 }
 
 } // namespace Llpc
-
-// =====================================================================================================================
-// Initializes the pass of SPIR-V lowering the ray tracing operations.
-INITIALIZE_PASS(LegacySpirvLowerRayTracing, DEBUG_TYPE, "Lower SPIR-V RayTracing operations", false, false)

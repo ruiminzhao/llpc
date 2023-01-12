@@ -28,8 +28,8 @@
  * @brief LLPC source file: implementation of lgc::Builder
  ***********************************************************************************************************************
  */
-#include "BuilderImpl.h"
 #include "lgc/LgcContext.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/builder/BuilderRecorder.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/ShaderModes.h"
@@ -75,17 +75,19 @@ Builder::Builder(LgcContext *builderContext)
 }
 
 // =====================================================================================================================
-// Set the common shader mode for the current shader, containing hardware FP round and denorm modes.
+// Set the common shader mode for the given shader stage, containing hardware FP round and denorm modes.
 //
+// @param shaderStage : Shader stage to set modes for
 // @param commonShaderMode : FP round and denorm modes
-void Builder::setCommonShaderMode(const CommonShaderMode &commonShaderMode) {
-  getShaderModes()->setCommonShaderMode(m_shaderStage, commonShaderMode);
+void Builder::setCommonShaderMode(ShaderStage shaderStage, const CommonShaderMode &commonShaderMode) {
+  getShaderModes()->setCommonShaderMode(shaderStage, commonShaderMode);
 }
 
 // =====================================================================================================================
-// Get the common shader mode for the current shader.
-const CommonShaderMode &Builder::getCommonShaderMode() {
-  return getShaderModes()->getCommonShaderMode(m_shaderStage);
+// Get the common shader mode for the given shader stage.
+// @param shaderStage : Shader stage to get modes for
+const CommonShaderMode &Builder::getCommonShaderMode(ShaderStage shaderStage) {
+  return getShaderModes()->getCommonShaderMode(shaderStage);
 }
 
 // =====================================================================================================================
@@ -230,7 +232,8 @@ unsigned Builder::getAddrSpaceConst() {
 //
 // @param builtIn : Built-in kind
 // @param inOutInfo : Extra input/output info (shader-defined array size)
-Type *Builder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo) {
+// @param context : LLVMContext
+Type *Builder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo, LLVMContext &context) {
   enum TypeCode : unsigned {
     a2f32,
     a4f32,
@@ -267,41 +270,41 @@ Type *Builder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo) {
 
   switch (typeCode) {
   case TypeCode::a2f32:
-    return ArrayType::get(getFloatTy(), 2);
+    return ArrayType::get(Type::getFloatTy(context), 2);
   case TypeCode::a4f32:
-    return ArrayType::get(getFloatTy(), 4);
+    return ArrayType::get(Type::getFloatTy(context), 4);
   // For ClipDistance and CullDistance, the shader determines the array size.
   case TypeCode::af32:
-    return ArrayType::get(getFloatTy(), arraySize);
+    return ArrayType::get(Type::getFloatTy(context), arraySize);
   // For SampleMask and PrimitivePointIndices, the shader determines the array size.
   case TypeCode::ai32:
-    return ArrayType::get(getInt32Ty(), arraySize);
+    return ArrayType::get(Type::getInt32Ty(context), arraySize);
   // For PrimitiveLineIndices, the shader determines the array size.
   case TypeCode::av2i32:
-    return ArrayType::get(FixedVectorType::get(getInt32Ty(), 2), arraySize);
+    return ArrayType::get(FixedVectorType::get(Type::getInt32Ty(context), 2), arraySize);
   // For PrimitiveTriangleIndices, the shader determines the array size.
   case TypeCode::av3i32:
-    return ArrayType::get(FixedVectorType::get(getInt32Ty(), 3), arraySize);
+    return ArrayType::get(FixedVectorType::get(Type::getInt32Ty(context), 3), arraySize);
   case TypeCode::f32:
-    return getFloatTy();
+    return Type::getFloatTy(context);
   case TypeCode::i1:
-    return getInt1Ty();
+    return Type::getInt1Ty(context);
   case TypeCode::i32:
-    return getInt32Ty();
+    return Type::getInt32Ty(context);
   case TypeCode::i64:
-    return getInt64Ty();
+    return Type::getInt64Ty(context);
   case TypeCode::v2f32:
-    return FixedVectorType::get(getFloatTy(), 2);
+    return FixedVectorType::get(Type::getFloatTy(context), 2);
   case TypeCode::v3f32:
-    return FixedVectorType::get(getFloatTy(), 3);
+    return FixedVectorType::get(Type::getFloatTy(context), 3);
   case TypeCode::v4f32:
-    return FixedVectorType::get(getFloatTy(), 4);
+    return FixedVectorType::get(Type::getFloatTy(context), 4);
   case TypeCode::v3i32:
-    return FixedVectorType::get(getInt32Ty(), 3);
+    return FixedVectorType::get(Type::getInt32Ty(context), 3);
   case TypeCode::v4i32:
-    return FixedVectorType::get(getInt32Ty(), 4);
+    return FixedVectorType::get(Type::getInt32Ty(context), 4);
   case TypeCode::a4v3f32:
-    return ArrayType::get(FixedVectorType::get(getFloatTy(), 3), 4);
+    return ArrayType::get(FixedVectorType::get(Type::getFloatTy(context), 3), 4);
   default:
     llvm_unreachable("Should never be called!");
     return nullptr;
@@ -449,11 +452,8 @@ CallInst *Builder::CreateIntrinsic(Intrinsic::ID id, ArrayRef<Type *> types, Arr
 // @param instName : Name to give instruction(s)
 Value *Builder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, Value *origin, Value *direction,
                                            Value *invDirection, Value *imageDesc, const Twine &instName) {
-  if (m_isBuilderRecorder) {
-    return static_cast<BuilderRecorder *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
-                                                                            invDirection, imageDesc, instName);
-  }
-  return static_cast<BuilderImplBase *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
+  return static_cast<BuilderRecorder *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
                                                                           invDirection, imageDesc, instName);
 }
+
 #endif

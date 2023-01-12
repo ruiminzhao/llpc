@@ -30,6 +30,7 @@
  */
 #include "lgc/patch/VertexFetch.h"
 #include "lgc/LgcContext.h"
+#include "lgc/builder/BuilderImpl.h"
 #include "lgc/patch/Patch.h"
 #include "lgc/patch/ShaderInputs.h"
 #include "lgc/state/IntrinsDefs.h"
@@ -40,6 +41,7 @@
 #include "lgc/util/Internal.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Module.h"
 
 #define DEBUG_TYPE "lgc-vertex-fetch"
@@ -53,6 +55,10 @@ class PipelineState;
 } // namespace lgc
 
 namespace {
+
+// Map vkgc
+static constexpr unsigned InternalDescriptorSetId = static_cast<unsigned>(-1);
+static constexpr unsigned FetchShaderInternalBufferBinding = 5;
 
 // Represents vertex format info corresponding to vertex attribute format (VkFormat).
 struct VertexFormatInfo {
@@ -85,6 +91,9 @@ public:
   Value *fetchVertex(Type *inputTy, const VertexInputDescription *description, unsigned location, unsigned compIdx,
                      BuilderBase &builder) override;
 
+  // Generate code to fetch a vertex value for uber shader
+  Value *fetchVertex(llvm::CallInst *callInst, Value *descPtr, BuilderBase &builder) override;
+
 private:
   void initialize(PipelineState *pipelineState);
 
@@ -111,14 +120,19 @@ private:
 
   bool needSecondVertexFetch(const VertexInputDescription *inputDesc) const;
 
+  Function *generateFetchFunction(bool is64bitFetch, Module *module);
+
   LgcContext *m_lgcContext = nullptr;   // LGC context
   LLVMContext *m_context = nullptr;     // LLVM context
   Value *m_vertexBufTablePtr = nullptr; // Vertex buffer table pointer
   Value *m_vertexIndex = nullptr;       // Vertex index
   Value *m_instanceIndex = nullptr;     // Instance index
+  Function *m_fetchVertex64 = nullptr;  // 64-bit fetch vertex function
+  Function *m_fetchVertex32 = nullptr;  // 32-bit fetch vertex function
 
   static const VertexCompFormatInfo m_vertexCompFormatInfo[]; // Info table of vertex component format
   static const unsigned char m_vertexFormatMapGfx10[][8];     // Info table of vertex format mapping for GFX10
+  static const unsigned char m_vertexFormatMapGfx11[][8];     // Info table of vertex format mapping for GFX11
 
   // Default values for vertex fetch (<4 x i32> or <8 x i32>)
   struct {
@@ -333,27 +347,179 @@ const unsigned char VertexFetchImpl::m_vertexFormatMapGfx10[][8] = {
 };
 // clang-format on
 
-char LegacyLowerVertexFetch::ID = 0;
+// clang-format off
+const unsigned char VertexFetchImpl::m_vertexFormatMapGfx11[][8] = {
+    // BUF_DATA_FORMAT
+    //   BUF_NUM_FORMAT_UNORM
+    //   BUF_NUM_FORMAT_SNORM
+    //   BUF_NUM_FORMAT_USCALED
+    //   BUF_NUM_FORMAT_SSCALED
+    //   BUF_NUM_FORMAT_UINT
+    //   BUF_NUM_FORMAT_SINT
+    //   BUF_NUM_FORMAT_SNORM_NZ
+    //   BUF_NUM_FORMAT_FLOAT
 
-// =====================================================================================================================
-// Create the vertex fetch pass
-ModulePass *lgc::createLegacyLowerVertexFetch() {
-  return new LegacyLowerVertexFetch();
-}
+    // BUF_DATA_FORMAT_INVALID
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
 
-// =====================================================================================================================
-LegacyLowerVertexFetch::LegacyLowerVertexFetch() : ModulePass(ID) {
-}
+    // BUF_DATA_FORMAT_8
+    {BUF_FORMAT_8_UNORM,
+     BUF_FORMAT_8_SNORM,
+     BUF_FORMAT_8_USCALED,
+     BUF_FORMAT_8_SSCALED,
+     BUF_FORMAT_8_UINT,
+     BUF_FORMAT_8_SINT,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
 
-// =====================================================================================================================
-// Run the lower vertex fetch pass on a module
-//
-// @param [in/out] module : Module
-// @returns : True if the module was modified by the transformation and false otherwise
-bool LegacyLowerVertexFetch::runOnModule(Module &module) {
-  PipelineState *pipelineState = getAnalysis<LegacyPipelineStateWrapper>().getPipelineState(&module);
-  return m_impl.runImpl(module, pipelineState);
-}
+    // BUF_DATA_FORMAT_16
+    {BUF_FORMAT_16_UNORM,
+     BUF_FORMAT_16_SNORM,
+     BUF_FORMAT_16_USCALED,
+     BUF_FORMAT_16_SSCALED,
+     BUF_FORMAT_16_UINT,
+     BUF_FORMAT_16_SINT,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_16_FLOAT},
+
+    // BUF_DATA_FORMAT_8_8
+    {BUF_FORMAT_8_8_UNORM,
+     BUF_FORMAT_8_8_SNORM,
+     BUF_FORMAT_8_8_USCALED,
+     BUF_FORMAT_8_8_SSCALED,
+     BUF_FORMAT_8_8_UINT,
+     BUF_FORMAT_8_8_SINT,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
+
+    // BUF_DATA_FORMAT_32
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_UINT,
+     BUF_FORMAT_32_SINT,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_FLOAT},
+
+    // BUF_DATA_FORMAT_16_16
+    {BUF_FORMAT_16_16_UNORM,
+     BUF_FORMAT_16_16_SNORM,
+     BUF_FORMAT_16_16_USCALED,
+     BUF_FORMAT_16_16_SSCALED,
+     BUF_FORMAT_16_16_UINT,
+     BUF_FORMAT_16_16_SINT,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_16_16_FLOAT},
+
+    // BUF_DATA_FORMAT_10_11_11
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_10_11_11_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_11_11_10
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_11_11_10_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_10_10_10_2
+    {BUF_FORMAT_10_10_10_2_UNORM_GFX11,
+     BUF_FORMAT_10_10_10_2_SNORM_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_10_10_10_2_UINT_GFX11,
+     BUF_FORMAT_10_10_10_2_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
+
+    // BUF_DATA_FORMAT_2_10_10_10
+    {BUF_FORMAT_2_10_10_10_UNORM_GFX11,
+     BUF_FORMAT_2_10_10_10_SNORM_GFX11,
+     BUF_FORMAT_2_10_10_10_USCALED_GFX11,
+     BUF_FORMAT_2_10_10_10_SSCALED_GFX11,
+     BUF_FORMAT_2_10_10_10_UINT_GFX11,
+     BUF_FORMAT_2_10_10_10_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
+
+    // BUF_DATA_FORMAT_8_8_8_8
+    {BUF_FORMAT_8_8_8_8_UNORM_GFX11,
+     BUF_FORMAT_8_8_8_8_SNORM_GFX11,
+     BUF_FORMAT_8_8_8_8_USCALED_GFX11,
+     BUF_FORMAT_8_8_8_8_SSCALED_GFX11,
+     BUF_FORMAT_8_8_8_8_UINT_GFX11,
+     BUF_FORMAT_8_8_8_8_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
+
+    // BUF_DATA_FORMAT_32_32
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_UINT_GFX11,
+     BUF_FORMAT_32_32_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_16_16_16_16
+    {BUF_FORMAT_16_16_16_16_UNORM_GFX11,
+     BUF_FORMAT_16_16_16_16_SNORM_GFX11,
+     BUF_FORMAT_16_16_16_16_USCALED_GFX11,
+     BUF_FORMAT_16_16_16_16_SSCALED_GFX11,
+     BUF_FORMAT_16_16_16_16_UINT_GFX11,
+     BUF_FORMAT_16_16_16_16_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_16_16_16_16_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_32_32_32
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_32_UINT_GFX11,
+     BUF_FORMAT_32_32_32_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_32_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_32_32_32_32
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_32_32_UINT_GFX11,
+     BUF_FORMAT_32_32_32_32_SINT_GFX11,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_32_32_32_32_FLOAT_GFX11},
+
+    // BUF_DATA_FORMAT_RESERVED_15
+    {BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID,
+     BUF_FORMAT_INVALID},
+};
+// clang-format on
 
 // =====================================================================================================================
 // Run the lower vertex fetch pass on a module
@@ -390,6 +556,30 @@ bool LowerVertexFetch::runImpl(Module &module, PipelineState *pipelineState) {
   if (vertexFetches.empty())
     return false;
 
+  // Some formats are not supported before gfx9.
+  GfxIpVersion gfxIp = pipelineState->getLgcContext()->getTargetInfo().getGfxIpVersion();
+  if (pipelineState->getOptions().enableUberFetchShader && gfxIp.major > 9) {
+    std::unique_ptr<lgc::Builder> desBuilder(Builder::createBuilderImpl(pipelineState->getLgcContext(), pipelineState));
+    static_cast<BuilderImplBase *>(&*desBuilder)->setShaderStage(ShaderStageVertex);
+    desBuilder->SetInsertPoint(&(*vertexFetches[0]->getFunction()->front().getFirstInsertionPt()));
+    auto desc =
+        desBuilder->CreateLoadBufferDesc(InternalDescriptorSetId, FetchShaderInternalBufferBinding,
+                                         desBuilder->getInt32(0), Builder::BufferFlagAddress, desBuilder->getInt8Ty());
+
+    // The size of each input descriptor is sizeof(UberFetchShaderAttribInfo). vector4
+    auto uberFetchAttrType = FixedVectorType::get(builder.getInt32Ty(), 4);
+    auto descPtr = desBuilder->CreateIntToPtr(desc, PointerType::get(uberFetchAttrType, ADDR_SPACE_CONST));
+
+    for (CallInst *call : vertexFetches) {
+      builder.SetInsertPoint(call);
+      Value *vertex = vertexFetch->fetchVertex(call, descPtr, builder);
+      // Replace and erase this call.
+      call->replaceAllUsesWith(vertex);
+      call->eraseFromParent();
+    }
+    return true;
+  }
+
   if (!pipelineState->isUnlinked() || !pipelineState->getVertexInputDescriptions().empty()) {
     // Whole-pipeline compilation (or shader compilation where we were given the vertex input descriptions).
     // Lower each vertex fetch.
@@ -422,19 +612,15 @@ bool LowerVertexFetch::runImpl(Module &module, PipelineState *pipelineState) {
   // 1. add metadata giving the location, component, type of each vertex fetch;
   // 2. add an input arg for each vertex fetch.
   //
-  // First add the metadata.
+  // First add the metadata and mutate the vertex shader function.
   SmallVector<VertexFetchInfo, 8> info;
+  SmallVector<Type *, 8> argTys;
+  SmallVector<std::string, 8> argNames;
   for (CallInst *call : vertexFetches) {
     unsigned location = cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
     unsigned component = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
     info.push_back({location, component, call->getType()});
-  }
-  pipelineState->getPalMetadata()->addVertexFetchInfo(info);
 
-  // Gather the input arg types.
-  SmallVector<Type *, 8> argTys;
-  SmallVector<std::string, 8> argNames;
-  for (CallInst *call : vertexFetches) {
     Type *ty = call->getType();
     // The return value from the fetch shader needs to use all floats, as the back-end maps an int in the
     // return value as an SGPR rather than a VGPR. For symmetry, we also use all floats here, in the input
@@ -443,6 +629,7 @@ bool LowerVertexFetch::runImpl(Module &module, PipelineState *pipelineState) {
     argTys.push_back(ty);
     argNames.push_back("");
   }
+  pipelineState->getPalMetadata()->addVertexFetchInfo(info);
 
   // Mutate the vertex shader function to add the new args.
   Function *newFunc = addFunctionArgs(vertexFetches[0]->getFunction(), nullptr, argTys, argNames);
@@ -470,14 +657,466 @@ bool LowerVertexFetch::runImpl(Module &module, PipelineState *pipelineState) {
         }
       }
     }
-    unsigned location = cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
-    unsigned component = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
-    vertex->setName("vertex" + Twine(location) + "." + Twine(component));
+    vertex->setName("vertex" + Twine(info[idx].location) + "." + Twine(info[idx].component));
     call->replaceAllUsesWith(vertex);
     call->eraseFromParent();
   }
 
   return true;
+}
+
+// =====================================================================================================================
+// Generate vertex fetch function.
+//
+// @param is64bitFetch : Whether is 64 bit fetch
+// @param [in/out] module : Module
+// @returns : Generated function
+Function *VertexFetchImpl::generateFetchFunction(bool is64bitFetch, Module *module) {
+  BuilderBase builder(*m_context);
+  // Helper to create basic block
+  auto createBlock = [&](Twine blockName, Function *parent) {
+    return BasicBlock::Create(*m_context, blockName, parent);
+  };
+
+  auto fetch64Type = FixedVectorType::get(Type::getInt32Ty(*m_context), 2);
+  auto fetchType = FixedVectorType::get(Type::getInt32Ty(*m_context), 4);
+
+  auto createFunction = [&] {
+    // Function args
+    Type *argTypes[] = {
+        FixedVectorType::get(builder.getInt32Ty(), 4), // vbdesc
+        builder.getInt32Ty(),                          // vbIndex
+        builder.getInt32Ty(),                          // vertexOffset
+        builder.getInt32Ty(),                          // component size in byte
+        builder.getInt1Ty(),                           // isPacked
+        builder.getInt1Ty(),                           // isBgr
+        builder.getInt1Ty(),                           // Y component mask
+        builder.getInt1Ty(),                           // Z component mask
+        builder.getInt1Ty(),                           // W component mask
+    };
+    // Return type
+    Type *retTy = FixedVectorType::get(builder.getInt32Ty(), is64bitFetch ? 8 : 4);
+
+    StringRef funcName = is64bitFetch ? "FetchVertex64" : "FetchVertex32";
+    FunctionType *const funcTy = FunctionType::get(retTy, argTypes, false);
+    Function *func = Function::Create(funcTy, GlobalValue::InternalLinkage, funcName, module);
+    func->setCallingConv(CallingConv::C);
+    func->addFnAttr(Attribute::AlwaysInline);
+
+    // Name args
+    auto argIt = func->arg_begin();
+    Value *vbDesc = argIt++;
+    vbDesc->setName("vbDesc");
+
+    Value *vbIndex = argIt++;
+    vbIndex->setName("vbIndex");
+
+    Value *vertexOffset = argIt++;
+    vertexOffset->setName("vertexOffset");
+
+    Value *compByteSize = argIt++;
+    compByteSize->setName("compByteSize");
+
+    Value *isPacked = argIt++;
+    isPacked->setName("isPacked");
+
+    Value *isBgr = argIt++;
+    isBgr->setName("isBgr");
+
+    Value *yMask = argIt++;
+    yMask->setName("yMask");
+    Value *zMask = argIt++;
+    zMask->setName("zMask");
+    Value *wMask = argIt++;
+    wMask->setName("wMask");
+
+    auto entry = createBlock(".entry", func);
+    auto wholeVertex = createBlock(".wholeVertex", func);
+    auto comp0Block = createBlock(".comp0Block", func);
+    auto comp1Block = createBlock(".comp1Block", func);
+    auto comp2Block = createBlock(".comp2Block", func);
+    auto comp3Block = createBlock(".comp3Block", func);
+    auto endfun = createBlock(".endfun", func);
+
+    Value *args[] = {
+        vbDesc,              // rsrc
+        vbIndex,             // vindex
+        vertexOffset,        // offset
+        builder.getInt32(0), // soffset
+        builder.getInt32(0)  // glc, slc
+    };
+
+    // .entry
+    {
+      builder.SetInsertPoint(entry);
+      // If ispacked is false, we require per-component fetch
+      builder.CreateCondBr(isPacked, wholeVertex, comp0Block);
+    }
+
+    // .wholeVertex
+    {
+      builder.SetInsertPoint(wholeVertex);
+      Value *vertex = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetchType, args, {});
+      if (is64bitFetch) {
+        // If it is 64-bit, we need the second fetch
+        args[2] = builder.CreateAdd(args[2], builder.getInt32(SizeOfVec4));
+        auto secondFetch = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetchType, args, {});
+        std::vector<Constant *> shuffleMask;
+        for (unsigned i = 0; i < 8; ++i)
+          shuffleMask.push_back(ConstantInt::get(Type::getInt32Ty(*m_context), i));
+        vertex = builder.CreateShuffleVector(vertex, secondFetch, ConstantVector::get(shuffleMask));
+      }
+      builder.CreateRet(vertex);
+    }
+
+    // return value
+    Value *lastVert = UndefValue::get(retTy);
+    Value *comp0 = nullptr;
+    Value *comp1 = nullptr;
+    Value *comp2 = nullptr;
+    Value *comp3 = nullptr;
+    // Per-component fetch
+    // reset
+    args[2] = vertexOffset;
+
+    // X channel
+    // .comp0Block
+    {
+      builder.SetInsertPoint(comp0Block);
+      if (is64bitFetch) {
+        Value *comp = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetch64Type, args, {});
+        Value *elem = builder.CreateExtractElement(comp, uint64_t(0));
+        lastVert = builder.CreateInsertElement(lastVert, elem, uint64_t(0));
+        elem = builder.CreateExtractElement(comp, 1);
+        lastVert = builder.CreateInsertElement(lastVert, elem, 1);
+        comp0 = lastVert;
+      } else {
+        comp0 = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, builder.getInt32Ty(), args, {});
+        lastVert = builder.CreateInsertElement(lastVert, comp0, uint64_t(0));
+        comp0 = lastVert;
+      }
+      // If Y channel is 0, we will fetch the second component.
+      builder.CreateCondBr(yMask, comp1Block, endfun);
+    }
+
+    // Y channel
+    // .comp1Block
+    {
+      builder.SetInsertPoint(comp1Block);
+      // Add offset. offset = offset + componentSize
+      args[2] = builder.CreateAdd(args[2], compByteSize);
+      if (is64bitFetch) {
+        Value *comp = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetch64Type, args, {});
+        Value *elem = builder.CreateExtractElement(comp, uint64_t(0));
+        lastVert = builder.CreateInsertElement(lastVert, elem, 2);
+        elem = builder.CreateExtractElement(comp, 1);
+        lastVert = builder.CreateInsertElement(lastVert, elem, 3);
+        comp1 = lastVert;
+      } else {
+        comp1 = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, Type::getInt32Ty(*m_context), args,
+                                        {});
+        lastVert = builder.CreateInsertElement(lastVert, comp1, 1);
+        comp1 = lastVert;
+      }
+      builder.CreateCondBr(zMask, comp2Block, endfun);
+    }
+
+    // Z channel
+    // .comp2Block
+    {
+      builder.SetInsertPoint(comp2Block);
+      args[2] = builder.CreateAdd(args[2], compByteSize);
+      if (is64bitFetch) {
+        Value *comp = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetch64Type, args, {});
+        Value *elem = builder.CreateExtractElement(comp, uint64_t(0));
+        lastVert = builder.CreateInsertElement(lastVert, elem, 4);
+        elem = builder.CreateExtractElement(comp, 1);
+        lastVert = builder.CreateInsertElement(lastVert, elem, 5);
+        comp2 = lastVert;
+      } else {
+        comp2 = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, Type::getInt32Ty(*m_context), args,
+                                        {});
+        lastVert = builder.CreateInsertElement(lastVert, comp2, 2);
+        comp2 = lastVert;
+      }
+      builder.CreateCondBr(wMask, comp3Block, endfun);
+    }
+
+    // W channel
+    // .comp3Block
+    {
+      builder.SetInsertPoint(comp3Block);
+      args[2] = builder.CreateAdd(args[2], compByteSize);
+      if (is64bitFetch) {
+        Value *comp = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, fetch64Type, args, {});
+        Value *elem = builder.CreateExtractElement(comp, uint64_t(0));
+        lastVert = builder.CreateInsertElement(lastVert, elem, 6);
+        elem = builder.CreateExtractElement(comp, 1);
+        lastVert = builder.CreateInsertElement(lastVert, elem, 7);
+        comp3 = lastVert;
+      } else {
+        comp3 = builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_load_format, Type::getInt32Ty(*m_context), args,
+                                        {});
+        lastVert = builder.CreateInsertElement(lastVert, comp3, 3);
+        comp3 = lastVert;
+      }
+      builder.CreateBr(endfun);
+    }
+
+    // .endfun
+    {
+      builder.SetInsertPoint(endfun);
+      auto phiInst = builder.CreatePHI(lastVert->getType(), 4);
+      phiInst->addIncoming(comp0, comp0Block);
+      phiInst->addIncoming(comp1, comp1Block);
+      phiInst->addIncoming(comp2, comp2Block);
+      phiInst->addIncoming(comp3, comp3Block);
+      Value *vertex = phiInst;
+      // If the format is bgr, fix the order. It only is included in 32-bit format.
+      if (!is64bitFetch) {
+        std::vector<Constant *> shuffleMask;
+        shuffleMask.push_back(builder.getInt32(2));
+        shuffleMask.push_back(builder.getInt32(1));
+        shuffleMask.push_back(builder.getInt32(0));
+        shuffleMask.push_back(builder.getInt32(3));
+        auto fixedVertex = builder.CreateShuffleVector(vertex, vertex, ConstantVector::get(shuffleMask));
+        vertex = builder.CreateSelect(isBgr, fixedVertex, vertex);
+      }
+      builder.CreateRet(vertex);
+    }
+    return func;
+  };
+
+  if (is64bitFetch) {
+    if (!m_fetchVertex64)
+      m_fetchVertex64 = createFunction();
+    return m_fetchVertex64;
+  }
+
+  if (!m_fetchVertex32)
+    m_fetchVertex32 = createFunction();
+  return m_fetchVertex32;
+}
+
+// =====================================================================================================================
+// This is an lgc.input.import.vertex operation.
+// Executes vertex fetch operations based on the uber shader buffer
+//
+// @param callInst : call instruction
+// @param descPtr : 64bit address of buffer
+// @param builder : Builder to use to insert vertex fetch instructions
+// @returns : vertex
+Value *VertexFetchImpl::fetchVertex(CallInst *callInst, llvm::Value *descPtr, BuilderBase &builder) {
+  unsigned location = cast<ConstantInt>(callInst->getArgOperand(0))->getZExtValue();
+  unsigned compIdx = cast<ConstantInt>(callInst->getArgOperand(1))->getZExtValue();
+  auto zero = builder.getInt32(0);
+
+  if (!m_vertexIndex) {
+    auto savedInsertPoint = builder.saveIP();
+    builder.SetInsertPoint(&*callInst->getFunction()->front().getFirstInsertionPt());
+    m_vertexIndex = ShaderInputs::getVertexIndex(builder, *m_lgcContext);
+    builder.restoreIP(savedInsertPoint);
+  }
+
+  if (!m_instanceIndex) {
+    auto savedInsertPoint = builder.saveIP();
+    builder.SetInsertPoint(&*callInst->getFunction()->front().getFirstInsertionPt());
+    m_instanceIndex = ShaderInputs::getInstanceIndex(builder, *m_lgcContext);
+    builder.restoreIP(savedInsertPoint);
+  }
+
+  // Get the vertex buffer table pointer as pointer to v4i32 descriptor.
+  Type *vbDescTy = FixedVectorType::get(Type::getInt32Ty(*m_context), 4);
+  if (!m_vertexBufTablePtr) {
+    auto savedInsertPoint = builder.saveIP();
+    builder.SetInsertPoint(&*callInst->getFunction()->front().getFirstInsertionPt());
+    m_vertexBufTablePtr =
+        ShaderInputs::getSpecialUserDataAsPointer(UserDataMapping::VertexBufferTable, vbDescTy, builder);
+    builder.restoreIP(savedInsertPoint);
+  }
+
+  // The size of each input descriptor is sizeof(UberFetchShaderAttribInfo). vector4
+  auto uberFetchAttrType = FixedVectorType::get(Type::getInt32Ty(*m_context), 4);
+  descPtr = builder.CreateGEP(uberFetchAttrType, descPtr, {builder.getInt32(location)});
+  auto uberFetchAttr = builder.CreateLoad(vbDescTy, descPtr);
+
+  // The first DWord
+  auto attr = builder.CreateExtractElement(uberFetchAttr, uint64_t(0));
+
+  // The second DWord
+  auto byteOffset = builder.CreateExtractElement(uberFetchAttr, 1);
+
+  // The third DWord
+  auto inputRate = builder.CreateExtractElement(uberFetchAttr, 2);
+
+  // The fourth DWord
+  auto bufferFormat = builder.CreateExtractElement(uberFetchAttr, 3);
+
+  // attr[0~7]
+  auto descBinding = builder.CreateAnd(attr, builder.getInt32(0xFF));
+
+  // attr[8]
+  auto perInstance = builder.CreateAnd(attr, builder.getInt32(0x100));
+
+  // attr[10]
+  auto isPacked = builder.CreateAnd(attr, builder.getInt32(0x400));
+  isPacked = builder.CreateICmpNE(isPacked, zero);
+
+  // attr[12~15]
+  auto componentSize = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, builder.getInt32Ty(),
+                                               {attr, builder.getInt32(12), builder.getInt32(4)});
+
+  auto xMask = builder.CreateAnd(attr, builder.getInt32(0x10000u));
+  auto yMask = builder.CreateAnd(attr, builder.getInt32(0x20000u));
+  auto zMask = builder.CreateAnd(attr, builder.getInt32(0x40000u));
+  auto wMask = builder.CreateAnd(attr, builder.getInt32(0x80000u));
+  xMask = builder.CreateICmpNE(xMask, zero);
+  yMask = builder.CreateICmpNE(yMask, zero);
+  zMask = builder.CreateICmpNE(zMask, zero);
+  wMask = builder.CreateICmpNE(wMask, zero);
+
+  // attr[20]
+  auto isBgr = builder.CreateAnd(attr, builder.getInt32(0x0100000));
+  isBgr = builder.CreateICmpNE(isBgr, zero);
+
+  // Load VbDesc
+  Value *vbDescPtr = builder.CreateGEP(vbDescTy, m_vertexBufTablePtr, descBinding);
+  LoadInst *loadInst = builder.CreateLoad(vbDescTy, vbDescPtr);
+  loadInst->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(loadInst->getContext(), {}));
+  loadInst->setAlignment(Align(16));
+  Value *vbDesc = loadInst;
+  // Replace buffer format
+  vbDesc = builder.CreateInsertElement(vbDesc, bufferFormat, 3);
+
+  auto isPerInstance = builder.CreateICmpNE(perInstance, zero);
+
+  // PerInstance
+  auto vbIndexInstance = ShaderInputs::getInput(ShaderInput::InstanceId, builder, *m_lgcContext);
+  vbIndexInstance = builder.CreateUDiv(vbIndexInstance, inputRate);
+  vbIndexInstance =
+      builder.CreateAdd(vbIndexInstance, ShaderInputs::getSpecialUserData(UserDataMapping::BaseInstance, builder));
+
+  // Select VbIndex
+  Value *vbIndex = builder.CreateSelect(isPerInstance, vbIndexInstance, m_vertexIndex);
+
+  auto inputType = callInst->getType();
+  auto inputTy = callInst->getType();
+  Type *basicTy = inputTy->isVectorTy() ? cast<VectorType>(inputTy)->getElementType() : inputTy;
+  const unsigned bitWidth = basicTy->getScalarSizeInBits();
+  assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32 || bitWidth == 64);
+
+  bool is64Fetch = bitWidth == 64;
+  auto func = generateFetchFunction(is64Fetch, callInst->getFunction()->getParent());
+  Value *lastVert =
+      builder.CreateCall(func, {vbDesc, vbIndex, byteOffset, componentSize, isPacked, isBgr, yMask, zMask, wMask});
+
+  // Get default fetch values
+  Constant *defaults = nullptr;
+
+  if (basicTy->isIntegerTy()) {
+    if (bitWidth == 8)
+      defaults = m_fetchDefaults.int8;
+    else if (bitWidth == 16)
+      defaults = m_fetchDefaults.int16;
+    else if (bitWidth == 32)
+      defaults = m_fetchDefaults.int32;
+    else {
+      assert(bitWidth == 64);
+      defaults = m_fetchDefaults.int64;
+    }
+  } else if (basicTy->isFloatingPointTy()) {
+    if (bitWidth == 16)
+      defaults = m_fetchDefaults.float16;
+    else if (bitWidth == 32)
+      defaults = m_fetchDefaults.float32;
+    else {
+      assert(bitWidth == 64);
+      defaults = m_fetchDefaults.double64;
+    }
+  } else
+    llvm_unreachable("Should never be called!");
+
+  const unsigned defaultCompCount = cast<FixedVectorType>(defaults->getType())->getNumElements();
+  std::vector<Value *> defaultValues(defaultCompCount);
+
+  for (unsigned i = 0; i < defaultValues.size(); ++i) {
+    defaultValues[i] = builder.CreateExtractElement(defaults, ConstantInt::get(Type::getInt32Ty(*m_context), i));
+  }
+
+  // Get vertex fetch values
+  const unsigned fetchCompCount =
+      lastVert->getType()->isVectorTy() ? cast<FixedVectorType>(lastVert->getType())->getNumElements() : 1;
+  std::vector<Value *> fetchValues(fetchCompCount);
+
+  if (fetchCompCount == 1)
+    fetchValues[0] = lastVert;
+  else {
+    for (unsigned i = 0; i < fetchCompCount; ++i) {
+      fetchValues[i] = builder.CreateExtractElement(lastVert, ConstantInt::get(Type::getInt32Ty(*m_context), i));
+    }
+  }
+
+  // Construct vertex fetch results
+  const unsigned inputCompCount = inputTy->isVectorTy() ? cast<FixedVectorType>(inputTy)->getNumElements() : 1;
+  const unsigned vertexCompCount = inputCompCount * (bitWidth == 64 ? 2 : 1);
+
+  std::vector<Value *> vertexValues(vertexCompCount);
+
+  // NOTE: Original component index is based on the basic scalar type.
+  compIdx *= (bitWidth == 64 ? 2 : 1);
+
+  // Vertex input might take values from vertex fetch values or default fetch values
+  for (unsigned i = 0; i < vertexCompCount; i++) {
+    if (compIdx + i < fetchCompCount)
+      vertexValues[i] = fetchValues[compIdx + i];
+    else if (compIdx + i < defaultCompCount)
+      vertexValues[i] = defaultValues[compIdx + i];
+    else {
+      llvm_unreachable("Should never be called!");
+      vertexValues[i] = UndefValue::get(Type::getInt32Ty(*m_context));
+    }
+  }
+  Value *vertex = nullptr;
+
+  if (vertexCompCount == 1)
+    vertex = vertexValues[0];
+  else {
+    Type *vertexTy = FixedVectorType::get(Type::getInt32Ty(*m_context), vertexCompCount);
+    vertex = UndefValue::get(vertexTy);
+
+    for (unsigned i = 0; i < vertexCompCount; ++i)
+      vertex = builder.CreateInsertElement(vertex, vertexValues[i], ConstantInt::get(Type::getInt32Ty(*m_context), i));
+  }
+
+  const bool is8bitFetch = (inputType->getScalarSizeInBits() == 8);
+  const bool is16bitFetch = (inputType->getScalarSizeInBits() == 16);
+
+  if (is8bitFetch) {
+    // NOTE: The vertex fetch results are represented as <n x i32> now. For 8-bit vertex fetch, we have to
+    // convert them to <n x i8> and the 24 high bits is truncated.
+    assert(inputTy->isIntOrIntVectorTy()); // Must be integer type
+
+    Type *vertexTy = vertex->getType();
+    Type *truncTy = Type::getInt8Ty(*m_context);
+    truncTy = vertexTy->isVectorTy()
+                  ? cast<Type>(FixedVectorType::get(truncTy, cast<FixedVectorType>(vertexTy)->getNumElements()))
+                  : truncTy;
+    vertex = builder.CreateTrunc(vertex, truncTy);
+  } else if (is16bitFetch) {
+    // NOTE: The vertex fetch results are represented as <n x i32> now. For 16-bit vertex fetch, we have to
+    // convert them to <n x i16> and the 16 high bits is truncated.
+    Type *vertexTy = vertex->getType();
+    Type *truncTy = Type::getInt16Ty(*m_context);
+    truncTy = vertexTy->isVectorTy()
+                  ? cast<Type>(FixedVectorType::get(truncTy, cast<FixedVectorType>(vertexTy)->getNumElements()))
+                  : truncTy;
+    vertex = builder.CreateTrunc(vertex, truncTy);
+  }
+
+  if (vertex->getType() != inputTy)
+    vertex = builder.CreateBitCast(vertex, inputTy);
+  vertex->setName("vertex");
+  return vertex;
 }
 
 // =====================================================================================================================
@@ -550,10 +1189,9 @@ Value *VertexFetchImpl::fetchVertex(Type *inputTy, const VertexInputDescription 
   if (description->inputRate == VertexInputRateVertex) {
     // Use vertex index
     if (!m_vertexIndex) {
-      auto savedInsertPoint = builder.saveIP();
+      IRBuilder<>::InsertPointGuard guard(builder);
       builder.SetInsertPointPastAllocas(insertPos->getFunction());
       m_vertexIndex = ShaderInputs::getVertexIndex(builder, *m_lgcContext);
-      builder.restoreIP(savedInsertPoint);
     }
     vbIndex = m_vertexIndex;
   } else {
@@ -562,10 +1200,9 @@ Value *VertexFetchImpl::fetchVertex(Type *inputTy, const VertexInputDescription 
     } else if (description->inputRate == VertexInputRateInstance) {
       // Use instance index
       if (!m_instanceIndex) {
-        auto savedInsertPoint = builder.saveIP();
+        IRBuilder<>::InsertPointGuard guard(builder);
         builder.SetInsertPointPastAllocas(insertPos->getFunction());
         m_instanceIndex = ShaderInputs::getInstanceIndex(builder, *m_lgcContext);
-        builder.restoreIP(savedInsertPoint);
       }
       vbIndex = m_instanceIndex;
     } else {
@@ -912,6 +1549,11 @@ unsigned VertexFetchImpl::mapVertexFormat(unsigned dfmt, unsigned nfmt) const {
     assert(nfmt < sizeof(m_vertexFormatMapGfx10[0]) / sizeof(m_vertexFormatMapGfx10[0][0]));
     format = m_vertexFormatMapGfx10[dfmt][nfmt];
     break;
+  case 11:
+    assert(dfmt < sizeof(m_vertexFormatMapGfx11) / sizeof(m_vertexFormatMapGfx11[0]));
+    assert(nfmt < sizeof(m_vertexFormatMapGfx11[0]) / sizeof(m_vertexFormatMapGfx11[0][0]));
+    format = m_vertexFormatMapGfx11[dfmt][nfmt];
+    break;
   }
   return format;
 }
@@ -926,11 +1568,10 @@ Value *VertexFetchImpl::loadVertexBufferDescriptor(unsigned binding, BuilderBase
   // Get the vertex buffer table pointer as pointer to v4i32 descriptor.
   Type *vbDescTy = FixedVectorType::get(Type::getInt32Ty(*m_context), 4);
   if (!m_vertexBufTablePtr) {
-    auto savedInsertPoint = builder.saveIP();
+    IRBuilder<>::InsertPointGuard guard(builder);
     builder.SetInsertPointPastAllocas(builder.GetInsertPoint()->getFunction());
     m_vertexBufTablePtr =
         ShaderInputs::getSpecialUserDataAsPointer(UserDataMapping::VertexBufferTable, vbDescTy, builder);
-    builder.restoreIP(savedInsertPoint);
   }
 
   Value *vbDescPtr = builder.CreateGEP(vbDescTy, m_vertexBufTablePtr, builder.getInt64(binding));
@@ -1037,11 +1678,11 @@ void VertexFetchImpl::addVertexFetchInst(Value *vbDesc, unsigned numChannels, bo
       // NOTE: The fetch values are represented by <n x i32>, so we will bitcast the float16 values to
       // int32 eventually.
       Type *bitCastTy = Type::getInt16Ty(*m_context);
-      bitCastTy = numChannels == 1 ? bitCastTy : FixedVectorType::get(bitCastTy, numChannels);
+      bitCastTy = numChannels == 1 ? bitCastTy : FixedVectorType::get(bitCastTy, numChannels >= 3 ? 4 : numChannels);
       fetch = new BitCastInst(fetch, bitCastTy, "", insertPos);
 
       Type *zExtTy = Type::getInt32Ty(*m_context);
-      zExtTy = numChannels == 1 ? zExtTy : FixedVectorType::get(zExtTy, numChannels);
+      zExtTy = numChannels == 1 ? zExtTy : FixedVectorType::get(zExtTy, numChannels >= 3 ? 4 : numChannels);
       fetch = new ZExtInst(fetch, zExtTy, "", insertPos);
     }
 
@@ -1158,7 +1799,3 @@ bool VertexFetchImpl::needPatchA2S(const VertexInputDescription *inputDesc) cons
 bool VertexFetchImpl::needSecondVertexFetch(const VertexInputDescription *inputDesc) const {
   return inputDesc->dfmt == BufDataFormat64_64_64 || inputDesc->dfmt == BufDataFormat64_64_64_64;
 }
-
-// =====================================================================================================================
-// Initialize the lower vertex fetch pass
-INITIALIZE_PASS(LegacyLowerVertexFetch, DEBUG_TYPE, "Lower vertex fetch calls", false, false)

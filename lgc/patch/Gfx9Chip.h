@@ -121,11 +121,33 @@ using namespace Pal::Gfx9::Chip;
     }                                                                                                                  \
   }
 
+// GFX11 only
+#define INIT_REG_GFX11(_gfx, _reg)                                                                                     \
+  {                                                                                                                    \
+    if (_gfx == 11) {                                                                                                  \
+      _reg##_ID = Pal::Gfx9::Chip::Gfx11::mm##_reg;                                                                    \
+      _reg##_VAL.u32All = 0;                                                                                           \
+    } else {                                                                                                           \
+      INIT_REG_TO_INVALID(_reg);                                                                                       \
+    }                                                                                                                  \
+  }
+
 // GFX9-GFX10 only
 #define INIT_REG_GFX9_10(_gfx, _reg)                                                                                   \
   {                                                                                                                    \
     if (_gfx == 9 || _gfx == 10) {                                                                                     \
       _reg##_ID = Gfx09_10::mm##_reg;                                                                                  \
+      _reg##_VAL.u32All = 0;                                                                                           \
+    } else {                                                                                                           \
+      INIT_REG_TO_INVALID(_reg);                                                                                       \
+    }                                                                                                                  \
+  }
+
+// HasHwVs only
+#define INIT_REG_HAS_HW_VS(_gfx, _reg)                                                                                 \
+  {                                                                                                                    \
+    if (_gfx == 9 || _gfx == 10) {                                                                                     \
+      _reg##_ID = HasHwVs::mm##_reg;                                                                                   \
       _reg##_VAL.u32All = 0;                                                                                           \
     } else {                                                                                                           \
       INIT_REG_TO_INVALID(_reg);                                                                                       \
@@ -179,6 +201,10 @@ using namespace Pal::Gfx9::Chip;
 #define SET_REG_GFX10_PLUS_FIELD(_stage, _reg, _field, _val) (_stage)->_reg##_VAL.gfx10Plus._field = (_val);
 #define SET_REG_GFX10_1_FIELD(_stage, _reg, _field, _val) (_stage)->_reg##_VAL.gfx101._field = (_val);
 #define SET_REG_GFX10_3_PLUS_FIELD(_stage, _reg, _field, _val) (_stage)->_reg##_VAL.gfx103Plus._field = (_val);
+#define SET_REG_GFX10_3_PLUS_EXCLUSIVE_FIELD(_stage, _reg, _field, _val)                                               \
+  (_stage)->_reg##_VAL.gfx103PlusExclusive._field = (_val);
+#define SET_REG_GFX10_4_PLUS_FIELD(_stage, _reg, _field, _val) (_stage)->_reg##_VAL.gfx104Plus._field = (_val);
+#define SET_REG_GFX11_FIELD(_stage, _reg, _field, _val) (_stage)->_reg##_VAL.gfx11._field = (_val);
 
 // Preferred number of GS primitives per ES thread.
 constexpr unsigned GsPrimsPerEsThread = 256;
@@ -545,6 +571,9 @@ struct MeshRegConfig {
   DEF_REG(GE_NGG_SUBGRP_CNTL);
   DEF_REG(SPI_SHADER_IDX_FORMAT);
 
+  DEF_REG(SPI_SHADER_GS_MESHLET_DIM);
+  DEF_REG(SPI_SHADER_GS_MESHLET_EXP_ALLOC);
+
   MeshRegConfig(GfxIpVersion gfxIp);
 };
 
@@ -567,9 +596,6 @@ struct PipelineTaskMeshFsRegConfig {
   CsRegConfig taskRegs;   // Task -> hardware CS
   MeshRegConfig meshRegs; // Mesh -> hardware primitive shader (NGG, ES-GS)
   PsRegConfig psRegs;     // FS   -> hardware PS
-
-  DEF_REG(VGT_SHADER_STAGES_EN);
-  DEF_REG(IA_MULTI_VGT_PARAM_PIPED);
 
   PipelineTaskMeshFsRegConfig(GfxIpVersion gfxIp);
 };

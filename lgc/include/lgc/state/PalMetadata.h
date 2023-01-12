@@ -130,8 +130,8 @@ public:
   // set to the minimum of any call to this function in any shader.
   void setUserDataSpillUsage(unsigned dwordOffset);
 
-  // Fix up user data registers. Any user data register that has one of the unlinked UserDataMapping values defined
-  // in AbiUnlinked.h is fixed up by looking at pipeline state.
+  // Fix up registers. Any user data register that has one of the unlinked UserDataMapping values defined in
+  // AbiUnlinked.h is fixed up by looking at pipeline state; And some dynamic states also need to be fixed.
   void fixUpRegisters();
 
   // Get a register value in PAL metadata.
@@ -202,6 +202,9 @@ public:
   // Returns the location of the fragment builtin or InvalidValue if the builtin is not found.
   unsigned getFragmentShaderBuiltInLoc(unsigned builtIn);
 
+  // Get shader stage mask (only called for a link-only pipeline whose shader stage mask has not been set yet).
+  unsigned getShaderStageMask();
+
 private:
   // Initialize the PalMetadata object after reading in already-existing PAL metadata if any
   void initialize();
@@ -217,9 +220,6 @@ private:
 
   // Returns true of the some of the user data nodes are spilled.
   bool userDataNodesAreSpilled() const { return m_spillThreshold->getUInt() != MAX_SPILL_THRESHOLD; }
-
-  // Test whether this is a graphics pipeline (even works in a link-only pipeline).
-  bool isGraphics();
 
   // Finalize PAL metadata user data limit for any compilation (shader, part-pipeline, whole pipeline)
   void finalizeUserDataLimit();

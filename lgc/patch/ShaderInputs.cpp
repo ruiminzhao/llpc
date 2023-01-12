@@ -75,6 +75,8 @@ const char *ShaderInputs::getSpecialUserDataName(UserDataMapping kind) {
     return "MeshTaskRingIndex";
   case UserDataMapping::MeshPipeStatsBuf:
     return "MeshPipeStatsBuf";
+  case UserDataMapping::StreamOutControlBuf:
+    return "StreamOutControlBuf";
   default:
     return "";
   }
@@ -159,6 +161,8 @@ Type *ShaderInputs::getInputType(ShaderInput inputKind, const LgcContext &lgcCon
   case ShaderInput::WorkgroupId:
     return FixedVectorType::get(Type::getInt32Ty(context), 3);
   case ShaderInput::LocalInvocationId:
+    if (lgcContext.getTargetInfo().getGfxIpVersion().major >= 11)
+      return Type::getInt32Ty(context);
     return FixedVectorType::get(Type::getInt32Ty(context), 3);
 
   case ShaderInput::TessCoordX:
@@ -319,6 +323,10 @@ void ShaderInputs::fixupUses(Module &module, PipelineState *pipelineState) {
   // For each function definition...
   for (Function &func : module) {
     if (func.isDeclaration())
+      continue;
+
+    // Only entrypoint and amd_gfx functions use user data, others don't use.
+    if (!isShaderEntryPoint(&func) && (func.getCallingConv() != CallingConv::AMDGPU_Gfx))
       continue;
 
     ShaderStage stage = getShaderStage(&func);
@@ -523,10 +531,11 @@ uint64_t ShaderInputs::getShaderArgTys(PipelineState *pipelineState, ShaderStage
 
   uint64_t inRegMask = 0;
   auto intfData = pipelineState->getShaderInterfaceData(shaderStage);
-  auto resUsage = pipelineState->getShaderResourceUsage(shaderStage);
-  const auto &xfbStrides = resUsage->inOutUsage.xfbStrides;
+  const auto &xfbStrides = pipelineState->getXfbBufferStrides();
+  // NOTE: For GFX11+, stream-out is actually SW-emulated in NGG primitive shader and we doesn't have relevant shader
+  // inputs for HW stream-out.
   const unsigned gfxIp = pipelineState->getTargetInfo().getGfxIpVersion().major;
-  const bool enableHwXfb = resUsage->inOutUsage.enableXfb && gfxIp <= 10;
+  const bool enableHwXfb = pipelineState->enableXfb() && gfxIp <= 10;
 
   // Enable optional shader inputs as required.
   switch (shaderStage) {

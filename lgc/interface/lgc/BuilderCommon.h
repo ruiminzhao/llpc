@@ -30,20 +30,21 @@
  */
 #pragma once
 
+#include "llvm-dialects/Dialect/Builder.h"
 #include "llvm/IR/IRBuilder.h"
 
 namespace lgc {
 
 // =====================================================================================================================
-// BuilderCommon extends IRBuilder<>, and provides a few utility methods used in both the LLPC front-end and in LGC
-// (the LLPC middle-end).
+// BuilderCommon extends llvm_dialects::Builder, which extends llvm::IRBuilder<>, and provides a few utility methods
+// used in both the LLPC front-end and in LGC (the LLPC middle-end).
 // This class is used directly by passes in LGC.
-class BuilderCommon : public llvm::IRBuilder<> {
+class BuilderCommon : public llvm_dialects::Builder {
 public:
   // Constructors
-  BuilderCommon(llvm::LLVMContext &context) : IRBuilder(context) {}
-  BuilderCommon(llvm::BasicBlock *block) : IRBuilder(block) {}
-  BuilderCommon(llvm::Instruction *inst) : IRBuilder(inst) {}
+  BuilderCommon(llvm::LLVMContext &context) : llvm_dialects::Builder(context) {}
+  BuilderCommon(llvm::BasicBlock *block) : llvm_dialects::Builder(block) {}
+  BuilderCommon(llvm::Instruction *inst) : llvm_dialects::Builder(inst) {}
 
   // Create an LLVM function call to the named function. The callee is built automatically based on return
   // type and its parameters.
