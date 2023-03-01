@@ -1,7 +1,7 @@
 ##
  #######################################################################################################################
  #
- #  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ #  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  #
  #  Permission is hereby granted, free of charge, to any person obtaining a copy
  #  of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,6 @@
 find_package(Python3 ${LLVM_MINIMUM_PYTHON_VERSION} REQUIRED
   COMPONENTS Interpreter)
 
-list(APPEND CMAKE_MODULE_PATH "${XGL_LLVM_BUILD_PATH}/${CMAKE_CFG_INTDIR}/lib/cmake/llvm")
 include(LLVMConfig)
 
 set(AMDLLPC_TEST_DEPS amdllpc FileCheck llvm-objdump llvm-readelf count not)

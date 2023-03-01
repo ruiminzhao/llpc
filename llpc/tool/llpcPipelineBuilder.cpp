@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -86,7 +86,7 @@ namespace StandaloneCompiler {
 // @param printPipelineInfo : Whether to print pipeline info (hash, filenames) before compilation.
 // @returns : Concrete `PipelineBuilder` object for this pipeline type.
 std::unique_ptr<PipelineBuilder> createPipelineBuilder(ICompiler &compiler, CompileInfo &compileInfo,
-                                                       llvm::Optional<Vkgc::PipelineDumpOptions> dumpOptions,
+                                                       std::optional<Vkgc::PipelineDumpOptions> dumpOptions,
                                                        bool printPipelineInfo) {
   const unsigned stageMask = compileInfo.stageMask;
 

@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -52,6 +52,9 @@ static cl::opt<bool> EnableTessOffChip("enable-tess-offchip", cl::desc("Enable t
 
 // -enable-row-export: enable row export for mesh shader
 static cl::opt<bool> EnableRowExport("enable-row-export", cl::desc("Enable row export for mesh shader"),
+                                     cl::init(false));
+
+cl::opt<bool> UseRegisterFieldFormat("use-register-field-format", cl::desc("Use register field format in pipeline ELF"),
                                      cl::init(false));
 
 // Names for named metadata nodes when storing and reading back pipeline state
@@ -219,7 +222,8 @@ static CompSetting computeCompSetting(BufDataFormat dfmt) {
 // @param builderContext : LGC builder context
 // @param emitLgc : Whether the option -emit-lgc is on
 PipelineState::PipelineState(LgcContext *builderContext, bool emitLgc)
-    : Pipeline(builderContext), m_emitLgc(emitLgc), m_meshRowExport(EnableRowExport) {
+    : Pipeline(builderContext), m_emitLgc(emitLgc), m_meshRowExport(EnableRowExport),
+      m_registerFieldFormat(UseRegisterFieldFormat) {
 }
 
 // =====================================================================================================================
@@ -322,6 +326,12 @@ void PipelineState::record(Module *module) {
   recordGraphicsState(module);
   if (m_palMetadata)
     m_palMetadata->record(module);
+
+  if (UseRegisterFieldFormat) {
+    const bool isFieldSupported =
+        getTargetInfo().getGfxIpVersion().major >= 11 && (m_pipelineLink == PipelineLink::WholePipeline);
+    UseRegisterFieldFormat.setValue(isFieldSupported);
+  }
 }
 
 // =====================================================================================================================
@@ -787,7 +797,8 @@ const ResourceNode *PipelineState::findPushConstantResourceNode() const {
 // @param nodeType : Resource node type
 // @param candidateType : Resource node candidate type
 static bool isNodeTypeCompatible(ResourceNodeType nodeType, ResourceNodeType candidateType) {
-  if (nodeType == ResourceNodeType::Unknown || candidateType == nodeType)
+  if (nodeType == ResourceNodeType::Unknown || candidateType == nodeType ||
+      candidateType == ResourceNodeType::DescriptorMutable)
     return true;
 
   if ((nodeType == ResourceNodeType::DescriptorConstBuffer || nodeType == DescriptorAnyBuffer) &&
@@ -1293,19 +1304,8 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
         waveSize = waveSizeOption;
 
       // Note: the conditions below override the tuning option.
-      // If subgroup size is used in any shader in the pipeline, use the specified subgroup size as wave size.
-      if (m_shaderModes.getAnyUseSubgroupSize()) {
-        // If allowVaryWaveSize is enabled, subgroupSize is default as zero, initialized as waveSize
-        subgroupSize = getShaderOptions(checkingStage).subgroupSize;
-        subgroupSize = (subgroupSize == 0) ? waveSize : subgroupSize;
-
-        m_subgroupSize[checkingStage] = subgroupSize;
-
-        if ((subgroupSize < waveSize) || getOptions().fullSubgroups)
-          waveSize = subgroupSize;
-      } else if (checkingStage == ShaderStageMesh || checkingStage == ShaderStageTask ||
-                 checkingStage == ShaderStageCompute) {
-        // If workgroup size is not larger than 32, use wave size 32.
+      // If workgroup size is not larger than 32, use wave size 32.
+      if (checkingStage == ShaderStageMesh || checkingStage == ShaderStageTask || checkingStage == ShaderStageCompute) {
         unsigned workGroupSize;
         if (checkingStage == ShaderStageMesh) {
           auto &mode = m_shaderModes.getMeshShaderMode();
@@ -1320,7 +1320,26 @@ void PipelineState::setShaderDefaultWaveSize(ShaderStage stage) {
           waveSize = 32;
       }
 
+      // If subgroup size is used in any shader in the pipeline, use the specified subgroup size.
+      if (m_shaderModes.getAnyUseSubgroupSize()) {
+        // If allowVaryWaveSize is enabled, subgroupSize is default as zero, initialized as waveSize
+        subgroupSize = getShaderOptions(checkingStage).subgroupSize;
+        // The driver only sets waveSize if a size is requested by an app. We may want to change that in the driver to
+        // set subgroupSize instead.
+        if (subgroupSize == 0)
+          subgroupSize = getShaderOptions(checkingStage).waveSize;
+        if (subgroupSize == 0)
+          subgroupSize = waveSize;
+
+        if ((subgroupSize < waveSize) || getOptions().fullSubgroups)
+          waveSize = subgroupSize;
+      } else {
+        // The subgroup size cannot be observed, use the wave size.
+        subgroupSize = waveSize;
+      }
+
       assert(waveSize == 32 || waveSize == 64);
+      assert(waveSize <= subgroupSize);
     }
     m_waveSize[checkingStage] = waveSize;
     m_subgroupSize[checkingStage] = subgroupSize;
@@ -1365,10 +1384,16 @@ bool PipelineState::enableMeshRowExport() const {
 // =====================================================================================================================
 // Checks if SW-emulated stream-out should be enabled.
 bool PipelineState::enableSwXfb() {
-  assert(isGraphics());
+  // Not graphics pipeline
+  if (!isGraphics())
+    return false;
 
   // SW-emulated stream-out is enabled on GFX11+
   if (getTargetInfo().getGfxIpVersion().major < 11)
+    return false;
+
+  // Mesh pipeline doesn't support stream-out
+  if (hasShaderStage(ShaderStageTask) || hasShaderStage(ShaderStageMesh))
     return false;
 
   auto lastVertexStage = getLastVertexProcessingStage();
@@ -1535,6 +1560,7 @@ const char *PipelineState::getResourceNodeTypeName(ResourceNodeType type) {
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, InlineBuffer)
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorConstBuffer)
     CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorConstBufferCompact)
+    CASE_CLASSENUM_TO_STRING(ResourceNodeType, DescriptorMutable)
     break;
   default:
     llvm_unreachable("Should never be called!");

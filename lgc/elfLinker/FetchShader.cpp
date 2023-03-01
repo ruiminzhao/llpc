@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -308,10 +308,7 @@ Function *FetchShader::createFetchFunc() {
   func->getArg(m_vsEntryRegInfo.sgprCount + m_vsEntryRegInfo.vertexId)->setName("VertexId");
   func->getArg(m_vsEntryRegInfo.sgprCount + m_vsEntryRegInfo.instanceId)->setName("InstanceId");
 
-  if (m_lgcContext->getTargetInfo().getGfxIpVersion().major >= 10) {
-    // Set up wave32 or wave64 to match the vertex shader.
-    func->addFnAttr("target-features", m_vsEntryRegInfo.wave32 ? "+wavefrontsize32" : "+wavefrontsize64");
-  }
+  setShaderStage(func, ShaderStageVertex);
 
   BasicBlock *block = BasicBlock::Create(func->getContext(), "", func);
   BuilderBase builder(block);

@@ -141,6 +141,7 @@ COMMENT_PREFIXES_BY_FILE_SUFFIX = {
   '.pipe': ';',
   '.spvasm': ';',
   '.ll': ';',
+  '.lgc': ';',
   # Everything else defaults to '//'
 }
 
@@ -155,6 +156,7 @@ def main():
                       help='The name of the tool used to generate the test case (defaults to "amdllpc")')
   parser.add_argument('--tool-binary',
                       help='The tool binary used to generate the test case')
+  parser.add_argument('--function', help='Only update functions whose name matches the given regex')
   parser.add_argument('-p', '--preserve-names', action='store_true',
                       help='Do not scrub IR names')
   parser.add_argument('--function-signature', action='store_true',
@@ -175,7 +177,6 @@ def main():
     if not re.match(r'^%s(-\d+)?(\.exe)?$' % (initial_args.tool), tool_basename):
       common.error('Unexpected tool name: ' + tool_basename)
       sys.exit(1)
-  tool_basename = initial_args.tool
 
   for ti in common.itertests(initial_args.tests, parser, 'tool/update_llpc_test_checks.py',
                              comment_prefix_callback=get_comment_prefix):
@@ -184,6 +185,11 @@ def main():
       common.SCRUB_TRAILING_WHITESPACE_TEST_RE = common.SCRUB_TRAILING_WHITESPACE_AND_ATTRIBUTES_RE
     else:
       common.SCRUB_TRAILING_WHITESPACE_TEST_RE = common.SCRUB_TRAILING_WHITESPACE_RE
+
+    tool_basename = ti.args.tool
+    tool_binary = tool_basename
+    if tool_basename == initial_args.tool and initial_args.tool_binary:
+      tool_binary = initial_args.tool_binary
 
     prefix_list = []
     for l in ti.run_lines:
@@ -225,10 +231,6 @@ def main():
       flags=ti.args,
       scrubber_args=[],
       path=ti.path)
-
-    tool_binary = ti.args.tool_binary
-    if not tool_binary:
-      tool_binary = tool_basename
 
     function_re = None
     scrubber = None
@@ -290,8 +292,20 @@ def main():
                                prefix_list, output_lines, global_vars_seen_dict,
                                args.preserve_names, True)
 
+    # Filter out functions
+    func_order = builder.func_order()
+    if ti.args.function:
+      filter_re = re.compile(ti.args.function)
+      new_func_order = {}
+      for prefix, func_names in func_order.items():
+        new_func_order[prefix] = [
+          func_name for func_name in func_names
+          if filter_re.search(func_name)
+        ]
+      func_order = new_func_order
+
     # Now generate all the checks.
-    common.add_checks_at_end(output_lines, prefix_list, builder.func_order(),
+    common.add_checks_at_end(output_lines, prefix_list, func_order,
                              ti.comment_prefix, lambda my_output_lines, prefixes, func:
                              add_checks(my_output_lines, ti.comment_prefix,
                                         prefixes, func_dict, func,
@@ -311,7 +325,6 @@ def main():
 
     with open(ti.path, 'wb') as f:
       f.writelines(['{}\n'.format(l).encode('utf-8') for l in output_lines])
-
 
 if __name__ == '__main__':
   main()

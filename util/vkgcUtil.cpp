@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -157,6 +157,7 @@ const char *getResourceMappingNodeTypeName(ResourceMappingNodeType type) {
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, DescriptorBufferCompact)
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, StreamOutTableVaPtr)
     CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, InlineBuffer)
+    CASE_CLASSENUM_TO_STRING(ResourceMappingNodeType, DescriptorMutable)
     break;
   default:
     llvm_unreachable("Should never be called!");

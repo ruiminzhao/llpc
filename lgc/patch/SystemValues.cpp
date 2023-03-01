@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2018-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2018-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -414,8 +414,6 @@ Value *ShaderSystemValues::getStreamOutBufDesc(unsigned xfbBuffer) {
     auto streamOutBufDescPtr = GetElementPtrInst::Create(streamOutTableType, streamOutTablePtr, idxs, "", insertPos);
     streamOutBufDescPtr->setMetadata(MetaNameUniform, MDNode::get(streamOutBufDescPtr->getContext(), {}));
     auto streamOutBufDescTy = GetElementPtrInst::getIndexedType(streamOutTableType, idxs);
-    // TODO: Remove this when LLPC will switch fully to opaque pointers.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(streamOutBufDescPtr->getType(), streamOutBufDescTy));
 
     auto streamOutBufDesc = new LoadInst(streamOutBufDescTy, streamOutBufDescPtr, "", false, Align(16), insertPos);
     streamOutBufDesc->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(streamOutBufDesc->getContext(), {}));
@@ -423,42 +421,6 @@ Value *ShaderSystemValues::getStreamOutBufDesc(unsigned xfbBuffer) {
     m_streamOutBufDescs[xfbBuffer] = streamOutBufDesc;
   }
   return m_streamOutBufDescs[xfbBuffer];
-}
-
-// =====================================================================================================================
-// Get stream-out buffer offset
-//
-// @param xfbBuffer : Transform feedback buffer ID
-Value *ShaderSystemValues::getStreamOutBufOffset(unsigned xfbBuffer) {
-  assert(m_pipelineState->enableSwXfb());
-  assert(xfbBuffer < MaxTransformFeedbackBuffers);
-  if (m_streamOutBufOffsets.size() <= xfbBuffer)
-    m_streamOutBufOffsets.resize(xfbBuffer + 1);
-
-  if (!m_streamOutBufOffsets[xfbBuffer]) {
-    auto streamOutControlBufPtr = getStreamOutControlBufPtr();
-    auto insertPos = streamOutControlBufPtr->getNextNode();
-
-    Value *idxs[] = {ConstantInt::get(Type::getInt64Ty(*m_context), 0),
-                     ConstantInt::get(Type::getInt64Ty(*m_context), 0), // 0: OFFSET[X], 1: FILLED_SIZE[X]
-                     ConstantInt::get(Type::getInt64Ty(*m_context), xfbBuffer)};
-
-    auto streamOutControlBufType = streamOutControlBufPtr->getType()->getPointerElementType();
-    auto streamOutBufOffsetPtr =
-        GetElementPtrInst::Create(streamOutControlBufType, streamOutControlBufPtr, idxs, "", insertPos);
-    streamOutBufOffsetPtr->setMetadata(MetaNameUniform, MDNode::get(streamOutBufOffsetPtr->getContext(), {}));
-    auto streamOutBufOffsetTy = streamOutBufOffsetPtr->getType()->getPointerElementType();
-
-    auto streamOutBufOffset = new LoadInst(streamOutBufOffsetTy, streamOutBufOffsetPtr, "", false, Align(4), insertPos);
-    // NOTE: PAL decided not to invalidate the SQC and L1 for every stream-out update, mainly because that will hurt
-    // overall performance worse than just forcing this one buffer to be read via L2. Since PAL would not have wider
-    // context, PAL believed that they would have to perform that invalidation on every Set/Load unconditionally.
-    // Thus, we force the load of stream-out control buffer to be volatile to let LLVM backend add GLC and DLC flags.
-    streamOutBufOffset->setVolatile(true);
-
-    m_streamOutBufOffsets[xfbBuffer] = streamOutBufOffset;
-  }
-  return m_streamOutBufOffsets[xfbBuffer];
 }
 
 // =====================================================================================================================
@@ -471,7 +433,7 @@ std::pair<Type *, Instruction *> ShaderSystemValues::getStreamOutTablePtr() {
       ArrayType::get(FixedVectorType::get(Type::getInt32Ty(*m_context), 4), MaxTransformFeedbackBuffers);
   if (!m_streamOutTablePtr) {
     auto intfData = m_pipelineState->getShaderInterfaceData(m_shaderStage);
-    unsigned entryArgIdx = 0;
+    unsigned entryArgIdx = InvalidValue;
 
     // Get the SGPR number of the stream-out table pointer.
     switch (m_shaderStage) {
@@ -488,7 +450,7 @@ std::pair<Type *, Instruction *> ShaderSystemValues::getStreamOutTablePtr() {
       llvm_unreachable("Should never be called!");
       break;
     }
-    assert(entryArgIdx != 0);
+    assert(entryArgIdx != InvalidValue);
 
     // Get the 64-bit extended node value.
     auto streamOutTablePtrLow = getFunctionArgument(m_entryPoint, entryArgIdx, "streamOutTable");
@@ -496,47 +458,6 @@ std::pair<Type *, Instruction *> ShaderSystemValues::getStreamOutTablePtr() {
     m_streamOutTablePtr = makePointer(streamOutTablePtrLow, streamOutTablePtrTy, InvalidValue);
   }
   return std::make_pair(streamOutTableTy, m_streamOutTablePtr);
-}
-
-// =====================================================================================================================
-// Get stream-out control buffer pointer
-Instruction *ShaderSystemValues::getStreamOutControlBufPtr() {
-  assert(m_pipelineState->enableSwXfb());
-  assert(m_shaderStage == ShaderStageVertex || m_shaderStage == ShaderStageTessEval ||
-         m_shaderStage == ShaderStageCopyShader);
-
-  if (!m_streamOutControlBufPtr) {
-    auto intfData = m_pipelineState->getShaderInterfaceData(m_shaderStage);
-    unsigned entryArgIdx = 0;
-
-    // Get the SGPR number of the stream-out control buffer pointer.
-    switch (m_shaderStage) {
-    case ShaderStageVertex:
-      entryArgIdx = intfData->entryArgIdxs.vs.streamOutData.controlBufPtr;
-      break;
-    case ShaderStageTessEval:
-      entryArgIdx = intfData->entryArgIdxs.tes.streamOutData.controlBufPtr;
-      break;
-    case ShaderStageCopyShader:
-      entryArgIdx = intfData->userDataUsage.gs.copyShaderStreamOutControlBuf;
-      break;
-    default:
-      llvm_unreachable("Should never be called!");
-      break;
-    }
-    assert(entryArgIdx != 0);
-
-    // Get the 64-bit extended node value.
-    auto streamOutControlBufPtrLow = getFunctionArgument(m_entryPoint, entryArgIdx, "streamOutControlBuf");
-    // NOTE: The stream-out control buffer has the following memory layout:
-    //   OFFSET[X]: OFFSET0, OFFSET1, ..., OFFSETN
-    //   FILLED_SIZE[X]: FILLED_SIZE0, FILLED_SIZE1, ..., FILLED_SIZEN
-    auto streamOutControlBufPtrTy = PointerType::get(
-        ArrayType::get(FixedVectorType::get(Type::getInt32Ty(*m_context), MaxTransformFeedbackBuffers), 2),
-        ADDR_SPACE_CONST);
-    m_streamOutControlBufPtr = makePointer(streamOutControlBufPtrLow, streamOutControlBufPtrTy, InvalidValue);
-  }
-  return m_streamOutControlBufPtr;
 }
 
 // =====================================================================================================================

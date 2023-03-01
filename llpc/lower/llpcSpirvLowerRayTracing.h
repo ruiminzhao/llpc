@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -125,7 +125,6 @@ enum RayHitStatus : unsigned {
 class SpirvLowerRayTracing : public SpirvLowerRayQuery {
 public:
   SpirvLowerRayTracing();
-  SpirvLowerRayTracing(bool rayQueryLibrary);
   llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
   virtual bool runImpl(llvm::Module &module);
 
@@ -179,10 +178,10 @@ private:
 
   llvm::GlobalVariable *m_traceParams[TraceParam::Count];              // Trace ray set parameters
   llvm::GlobalVariable *m_shaderTable[ShaderTable::Count];             // Shader table variables
-  llvm::GlobalVariable *m_funcRetFlag;                                 // Function return flag
-  llvm::Value *m_worldToObjMatrix;                                     // World to Object matrix
-  llvm::GlobalVariable *m_globalPayload;                               // Global payload variable
-  llvm::GlobalVariable *m_globalCallableData;                          // Global callable data variable
+  llvm::GlobalVariable *m_funcRetFlag = nullptr;                       // Function return flag
+  llvm::Value *m_worldToObjMatrix = nullptr;                           // World to Object matrix
+  llvm::GlobalVariable *m_globalPayload = nullptr;                     // Global payload variable
+  llvm::GlobalVariable *m_globalCallableData = nullptr;                // Global callable data variable
   std::set<unsigned, std::less<unsigned>> m_builtInParams;             // Indirect max builtins;
   llvm::SmallVector<llvm::Type *, TraceParam::Count> m_traceParamsTys; // Trace Params types
 };

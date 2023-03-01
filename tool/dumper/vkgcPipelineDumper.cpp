@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -62,7 +62,9 @@ std::ostream &operator<<(std::ostream &out, VkRayTracingShaderGroupTypeKHR type)
 #endif
 std::ostream &operator<<(std::ostream &out, ResourceMappingNodeType type);
 std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing);
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
 std::ostream &operator<<(std::ostream &out, NggCompactMode compactMode);
+#endif
 std::ostream &operator<<(std::ostream &out, DenormalMode denormalMode);
 std::ostream &operator<<(std::ostream &out, WaveBreakSize waveBreakSize);
 std::ostream &operator<<(std::ostream &out, ShadowDescriptorTableUsage shadowDescriptorTableUsage);
@@ -511,10 +513,12 @@ void PipelineDumper::dumpResourceMappingNode(const ResourceMappingNode *userData
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
   case ResourceMappingNodeType::DescriptorConstTexelBuffer: {
+  case ResourceMappingNodeType::DescriptorMutable:
     char setHexvalue[64] = {};
     snprintf(setHexvalue, 64, "0x%08" PRIX32, userDataNode->srdRange.set);
     dumpFile << prefix << ".set = " << setHexvalue << "\n";
     dumpFile << prefix << ".binding = " << userDataNode->srdRange.binding << "\n";
+    dumpFile << prefix << ".strideInDwords = " << userDataNode->srdRange.strideInDwords << "\n";
     break;
   }
   case ResourceMappingNodeType::DescriptorTableVaPtr: {
@@ -875,8 +879,14 @@ void PipelineDumper::dumpGraphicsStateInfo(const GraphicsPipelineBuildInfo *pipe
   dumpFile << "nggState.enableNgg = " << pipelineInfo->nggState.enableNgg << "\n";
   dumpFile << "nggState.enableGsUse = " << pipelineInfo->nggState.enableGsUse << "\n";
   dumpFile << "nggState.forceCullingMode = " << pipelineInfo->nggState.forceCullingMode << "\n";
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
   dumpFile << "nggState.compactMode = " << pipelineInfo->nggState.compactMode << "\n";
+#else
+  dumpFile << "nggState.compactVertex = " << pipelineInfo->nggState.compactVertex << "\n";
+#endif
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 59
   dumpFile << "nggState.enableVertexReuse = " << pipelineInfo->nggState.enableVertexReuse << "\n";
+#endif
   dumpFile << "nggState.enableBackfaceCulling = " << pipelineInfo->nggState.enableBackfaceCulling << "\n";
   dumpFile << "nggState.enableFrustumCulling = " << pipelineInfo->nggState.enableFrustumCulling << "\n";
   dumpFile << "nggState.enableBoxFilterCulling = " << pipelineInfo->nggState.enableBoxFilterCulling << "\n";
@@ -1419,10 +1429,9 @@ void PipelineDumper::updateHashForNonFragmentState(const GraphicsPipelineBuildIn
   hasher->Update(pipeline->dynamicVertexStride);
   hasher->Update(pipeline->enableUberFetchShader);
 
-  bool passthroughMode = !nggState->enableVertexReuse && !nggState->enableBackfaceCulling &&
-                         !nggState->enableFrustumCulling && !nggState->enableBoxFilterCulling &&
-                         !nggState->enableSphereCulling && !nggState->enableSmallPrimFilter &&
-                         !nggState->enableCullDistanceCulling;
+  bool passthroughMode = !nggState->enableBackfaceCulling && !nggState->enableFrustumCulling &&
+                         !nggState->enableBoxFilterCulling && !nggState->enableSphereCulling &&
+                         !nggState->enableSmallPrimFilter && !nggState->enableCullDistanceCulling;
 
   bool updateHashFromRs = (!isCacheHash);
   updateHashFromRs |= (enableNgg && !passthroughMode);
@@ -1437,8 +1446,14 @@ void PipelineDumper::updateHashForNonFragmentState(const GraphicsPipelineBuildIn
     if (nggState->enableNgg) {
       hasher->Update(nggState->enableGsUse);
       hasher->Update(nggState->forceCullingMode);
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
       hasher->Update(nggState->compactMode);
+#else
+      hasher->Update(nggState->compactVertex);
+#endif
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 59
       hasher->Update(nggState->enableVertexReuse);
+#endif
       hasher->Update(nggState->enableBackfaceCulling);
       hasher->Update(nggState->enableFrustumCulling);
       hasher->Update(nggState->enableBoxFilterCulling);
@@ -1713,7 +1728,8 @@ void PipelineDumper::updateHashForResourceMappingNode(const ResourceMappingNode 
   case ResourceMappingNodeType::DescriptorConstBuffer:
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
-  case ResourceMappingNodeType::DescriptorConstTexelBuffer: {
+  case ResourceMappingNodeType::DescriptorConstTexelBuffer:
+  case ResourceMappingNodeType::DescriptorMutable: {
     hasher->Update(userDataNode->srdRange);
     break;
   }
@@ -2124,7 +2140,7 @@ std::ostream &operator<<(std::ostream &out, ResourceMappingNodeType type) {
 // Translates enum "NggSubgroupSizingType" to string and output to ostream.
 //
 // @param [out] out : Output stream
-// @param subgroupSizing : NGG sub-group sizing type
+// @param subgroupSizing : NGG subgroup sizing type
 std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing) {
   const char *string = nullptr;
   switch (subgroupSizing) {
@@ -2143,6 +2159,7 @@ std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing
   return out << string;
 }
 
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
 // =====================================================================================================================
 // Translates enum "NggCompactMode" to string and output to ostream.
 //
@@ -2161,6 +2178,7 @@ std::ostream &operator<<(std::ostream &out, NggCompactMode compactMode) {
 
   return out << string;
 }
+#endif
 
 // =====================================================================================================================
 // Translates enum "DenormalMode" to string and output to ostream.

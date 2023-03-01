@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -33,10 +33,6 @@
 #include "EnumIterator.h"
 #include <array>
 #include <cstdint>
-
-// TODO: Remove this when LLPC will switch fully to opaque pointers.
-#define IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerType, typeToCompare)                                                  \
-  (cast<PointerType>(pointerType)->isOpaqueOrPointeeTypeMatches(typeToCompare))
 
 namespace lgc {
 
@@ -91,6 +87,7 @@ enum class ResourceNodeType : unsigned {
   InlineBuffer,                 ///< Inline buffer, with descriptor set and binding
   DescriptorConstBuffer,        ///< Generic descriptor: constant buffer
   DescriptorConstBufferCompact, ///< Compact buffer descriptor, only contains the buffer address
+  DescriptorMutable,            ///< Mutable descriptor type
   Count,                        ///< Count of resource mapping node types.
 };
 

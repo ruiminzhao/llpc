@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -65,6 +65,14 @@ ConfigBuilderBase::ConfigBuilderBase(Module *module, PipelineState *pipelineStat
 
   m_pipelineNode =
       m_document->getRoot().getMap(true)[Util::Abi::PalCodeObjectMetadataKey::Pipelines].getArray(true)[0].getMap(true);
+
+  if (m_pipelineState->useRegisterFieldFormat()) {
+    if (m_pipelineState->isGraphics())
+      m_graphicsRegistersNode = m_pipelineNode[Util::Abi::PipelineMetadataKey::GraphicsRegisters].getMap(true);
+
+    if (m_pipelineState->hasShaderStage(ShaderStageCompute) || m_pipelineState->hasShaderStage(ShaderStageTask))
+      m_computeRegistersNode = m_pipelineNode[Util::Abi::PipelineMetadataKey::ComputeRegisters].getMap(true);
+  }
 
   setApiName(pipelineState->getClient());
 }
@@ -293,7 +301,7 @@ void ConfigBuilderBase::setEsGsLdsSize(unsigned value) {
 }
 
 // =====================================================================================================================
-// Set NGG sub-group size
+// Set NGG subgroup size
 //
 // @param value : Value to set
 void ConfigBuilderBase::setNggSubgroupSize(unsigned value) {

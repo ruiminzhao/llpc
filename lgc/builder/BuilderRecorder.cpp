@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -156,10 +156,6 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "get.desc.ptr";
   case Opcode::LoadPushConstantsPtr:
     return "load.push.constants.ptr";
-  case Opcode::GetBufferDescLength:
-    return "get.buffer.desc.length";
-  case Opcode::PtrDiff:
-    return "buffer.ptrdiff";
   case Opcode::ReadGenericInput:
     return "read.generic.input";
   case Opcode::ReadPerVertexInput:
@@ -210,6 +206,8 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "barrier";
   case Opcode::Kill:
     return "kill";
+  case Opcode::DebugBreak:
+    return "debug.break";
   case Opcode::ReadClock:
     return "read.clock";
   case Opcode::Derivative:
@@ -524,6 +522,14 @@ Value *BuilderRecorder::CreateMatrixInverse(Value *const matrix, const Twine &in
 // @param instName : Name to give final instruction
 Instruction *BuilderRecorder::CreateReadClock(bool realtime, const Twine &instName) {
   return record(Opcode::ReadClock, getInt64Ty(), getInt1(realtime), instName);
+}
+
+// =====================================================================================================================
+// Create a "debug break halt"
+//
+// @param instName : Name to give final instruction
+Instruction *BuilderRecorder::CreateDebugBreak(const Twine &instName) {
+  return record(Opcode::DebugBreak, getVoidTy(), {}, instName);
 }
 
 // =====================================================================================================================
@@ -1079,11 +1085,10 @@ Value *BuilderRecorder::CreateFindSMsb(Value *value, const Twine &instName) {
 // @param binding : Descriptor binding
 // @param descIndex : Descriptor index
 // @param flags : BufferFlag* bit settings
-// @param pointeeTy : Type that the returned pointer should point to
 // @param instName : Name to give instruction(s)
 Value *BuilderRecorder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Value *descIndex, unsigned flags,
-                                             Type *pointeeTy, const Twine &instName) {
-  return record(Opcode::LoadBufferDesc, getBufferDescTy(pointeeTy),
+                                             const Twine &instName) {
+  return record(Opcode::LoadBufferDesc, getBufferDescTy(),
                 {
                     getInt32(descSet),
                     getInt32(binding),
@@ -1136,27 +1141,6 @@ Value *BuilderRecorder::CreateGetDescPtr(ResourceNodeType concreteType, Resource
 // @param instName : Name to give instruction(s)
 Value *BuilderRecorder::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &instName) {
   return record(Opcode::LoadPushConstantsPtr, returnTy, {}, instName);
-}
-
-// =====================================================================================================================
-// Create a buffer length query based on the specified descriptor.
-//
-// @param bufferDesc : The buffer descriptor to query.
-// @param instName : Name to give instruction(s).
-Value *BuilderRecorder::CreateGetBufferDescLength(Value *const bufferDesc, Value *offset, const Twine &instName) {
-  return record(Opcode::GetBufferDescLength, getInt32Ty(), {bufferDesc, offset}, instName);
-}
-
-// =====================================================================================================================
-// Return the i64 difference between two buffer fat pointer values, dividing out the size of the pointed-to objects.
-//
-// @param ty : Element type of the pointers.
-// @param lhs : Left hand side of the subtraction.
-// @param rhs : Reft hand side of the subtraction.
-// @param instName : Name to give instruction(s)
-Value *BuilderRecorder::CreatePtrDiff(llvm::Type *ty, llvm::Value *lhs, llvm::Value *rhs, const llvm::Twine &instName) {
-  // We can't store a type, so store a zero value of the type instead
-  return record(Opcode::PtrDiff, getInt64Ty(), {Constant::getNullValue(ty), lhs, rhs}, instName);
 }
 
 // =====================================================================================================================
@@ -1532,18 +1516,19 @@ Instruction *BuilderRecorder::CreateWriteGenericOutput(Value *valueToWrite, unsi
 // Create a write to an XFB (transform feedback / streamout) buffer.
 //
 // @param valueToWrite : Value to write
-// @param isBuiltIn : True for built-in, false for user output (ignored if not GS)
-// @param location : Location (row) or built-in kind of output (ignored if not GS)
+// @param isBuiltIn : True for built-in, false for user output
+// @param location : Location (row) or built-in kind of output
+// @param component : Component offset of inputs and outputs (ignored if built-in)
 // @param xfbBuffer : XFB buffer ID
 // @param xfbStride : XFB stride
 // @param xfbOffset : XFB byte offset
 // @param outputInfo : Extra output info (GS stream ID)
 Instruction *BuilderRecorder::CreateWriteXfbOutput(Value *valueToWrite, bool isBuiltIn, unsigned location,
-                                                   unsigned xfbBuffer, unsigned xfbStride, Value *xfbOffset,
-                                                   InOutInfo outputInfo) {
+                                                   unsigned component, unsigned xfbBuffer, unsigned xfbStride,
+                                                   Value *xfbOffset, InOutInfo outputInfo) {
   return record(Opcode::WriteXfbOutput, nullptr,
-                {valueToWrite, getInt1(isBuiltIn), getInt32(location), getInt32(xfbBuffer), getInt32(xfbStride),
-                 xfbOffset, getInt32(outputInfo.getData())},
+                {valueToWrite, getInt1(isBuiltIn), getInt32(location), getInt32(component), getInt32(xfbBuffer),
+                 getInt32(xfbStride), xfbOffset, getInt32(outputInfo.getData())},
                 "");
 }
 
@@ -2119,7 +2104,6 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::Fma:
     case Opcode::FpTruncWithRounding:
     case Opcode::Fract:
-    case Opcode::GetBufferDescLength:
     case Opcode::GetDescPtr:
     case Opcode::GetDescStride:
     case Opcode::GetWaveSize:
@@ -2133,7 +2117,6 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::MatrixTimesVector:
     case Opcode::NormalizeVector:
     case Opcode::OuterProduct:
-    case Opcode::PtrDiff:
     case Opcode::QuantizeToFp16:
     case Opcode::Reflect:
     case Opcode::Refract:
@@ -2228,6 +2211,7 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::SetMeshOutputs:
     case Opcode::Kill:
     case Opcode::ReadClock:
+    case Opcode::DebugBreak:
     case Opcode::WriteBuiltInOutput:
     case Opcode::WriteGenericOutput:
 #if VKI_RAY_TRACING

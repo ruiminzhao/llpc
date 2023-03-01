@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -58,9 +58,7 @@ public:
   void visitAtomicRMWInst(llvm::AtomicRMWInst &atomicRmwInst);
   void visitBitCastInst(llvm::BitCastInst &bitCastInst);
   void visitCallInst(llvm::CallInst &callInst);
-  void visitExtractElementInst(llvm::ExtractElementInst &extractElementInst);
   void visitGetElementPtrInst(llvm::GetElementPtrInst &getElemPtrInst);
-  void visitInsertElementInst(llvm::InsertElementInst &insertElementInst);
   void visitLoadInst(llvm::LoadInst &loadInst);
   void visitMemCpyInst(llvm::MemCpyInst &memCpyInst);
   void visitMemMoveInst(llvm::MemMoveInst &memMoveInst);
@@ -77,7 +75,6 @@ private:
   Replacement getRemappedValue(llvm::Value *value) const;
   llvm::Value *getBaseAddressFromBufferDesc(llvm::Value *const bufferDesc) const;
   void copyMetadata(llvm::Value *const dest, const llvm::Value *const src) const;
-  llvm::PointerType *getRemappedType(llvm::Type *const type) const;
   bool removeUsersForInvariantStarts(llvm::Value *const value);
   llvm::Value *replaceLoadStore(llvm::Instruction &loadInst);
   llvm::Value *replaceICmp(llvm::ICmpInst *const iCmpInst);
@@ -95,6 +92,7 @@ private:
   llvm::SmallVector<llvm::Instruction *, 16> m_postVisitInsts; // The post process instruction set.
   llvm::IRBuilder<> *m_builder;                                // The IRBuilder.
   llvm::LLVMContext *m_context;                                // The LLVM context.
+  llvm::PointerType *m_offsetType;                             // The proxy pointer type used to accumulate offsets.
   PipelineState *m_pipelineState;                              // The pipeline state
 
   std::function<bool(const llvm::Value &)> m_isDivergent;

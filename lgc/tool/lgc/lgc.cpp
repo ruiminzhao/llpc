@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -31,6 +31,7 @@
 
 #include "lgc/ElfLinker.h"
 #include "lgc/LgcContext.h"
+#include "lgc/LgcDialect.h"
 #include "lgc/PassManager.h"
 #include "lgc/Pipeline.h"
 #include "lgc/patch/Patch.h"
@@ -102,7 +103,6 @@ cl::opt<unsigned> PalAbiVersion("pal-abi-version", cl::init(0xFFFFFFFF), cl::cat
 // -v: enable verbose output
 cl::opt<bool> VerboseOutput("v", cl::cat(LgcCategory), cl::desc("Enable verbose output"), cl::init(false));
 
-cl::opt<bool> OpaquePointers("enable-opaque-pointers", cl::desc("Enable opaque-pointers in LGC"), cl::init(false));
 } // anonymous namespace
 
 // =====================================================================================================================
@@ -182,8 +182,10 @@ static bool runPassPipeline(Pipeline &pipeline, Module &module, raw_pwrite_strea
 // @param argv : Command-line arguments
 int main(int argc, char **argv) {
   const char *progName = sys::path::filename(argv[0]).data();
-  LLVMContext context;
   LgcContext::initialize();
+
+  LLVMContext context;
+  auto dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(context);
 
   // Set our category on options that we want to show in -help, and hide other options.
   auto opts = cl::getRegisteredOptions();
@@ -217,9 +219,8 @@ int main(int argc, char **argv) {
                                    " LLVM and LGC can be used.\n";
   cl::ParseCommandLineOptions(argc, argv, commandDesc);
 
-  // Temporarily disable opaque pointers (llvm is making opaque the default).
   // TODO: Remove this once work complete on transition to opaque pointers.
-  context.setOpaquePointers(OpaquePointers);
+  context.setOpaquePointers(true);
 
   // Find the -mcpu option and get its value.
   auto mcpu = opts.find("mcpu");
@@ -252,8 +253,6 @@ int main(int argc, char **argv) {
     errs() << progName << ": GPU type '" << gpuName << "' not recognized\n";
     return 1;
   }
-
-  auto dialectGuard = llvm_dialects::withDialects(lgcContext->getDialectContext());
 
   if (VerboseOutput)
     lgcContext->setLlpcOuts(&outs());

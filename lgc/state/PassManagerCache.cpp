@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -30,6 +30,7 @@
  */
 #include "lgc/state/PassManagerCache.h"
 #include "lgc/LgcContext.h"
+#include "lgc/patch/PatchSetupTargetFeatures.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 442438
 // Old version of the code
@@ -90,16 +91,25 @@ std::pair<lgc::PassManager &, LegacyPassManager &> PassManagerCache::getPassMana
 
   passManagers.first.reset(PassManager::Create(m_lgcContext));
   passManagers.first->registerFunctionAnalysis([&] { return m_lgcContext->getTargetMachine()->getTargetIRAnalysis(); });
+  passManagers.first->registerModuleAnalysis([&] { return PipelineStateWrapper(m_lgcContext); });
 
   // Manually add a target-aware TLI pass, so optimizations do not think that we have library functions.
   m_lgcContext->preparePassManager(*passManagers.first);
 
   // Add a few optimizations.
   FunctionPassManager fpm;
-  fpm.addPass(InstCombinePass(5));
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 452298
+  // Old version of the code
+  unsigned instCombineOpt = 5;
+#else
+  // New version of the code (also handles unknown version, which we treat as latest)
+  auto instCombineOpt = InstCombineOptions().setMaxIterations(5);
+#endif
+  fpm.addPass(InstCombinePass(instCombineOpt));
   fpm.addPass(InstSimplifyPass());
   fpm.addPass(EarlyCSEPass(true));
   passManagers.first->addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
+  passManagers.first->addPass(PatchSetupTargetFeatures());
   // Add one last pass that does nothing, but invalidates all the analyses.
   // This is required to avoid the pass manager to use results of analyses from
   // previous runs which is causing random crashes.

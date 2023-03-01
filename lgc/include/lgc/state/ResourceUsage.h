@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -118,12 +118,6 @@ public:
   bool isBuiltIn() const { return m_data.bits.isBuiltIn; }
   void setBuiltIn(bool isBuiltIn) { m_data.bits.isBuiltIn = isBuiltIn; }
 
-  bool isFlat() const { return m_data.bits.isFlat; }
-  void setFlat(bool isFlat) { m_data.bits.isFlat = isFlat; }
-
-  bool isCustom() const { return m_data.bits.isCustom; }
-  void setCustom(bool isCustom) { m_data.bits.isCustom = isCustom; }
-
   unsigned getStreamId() const { return m_data.bits.streamId; }
   void setStreamId(unsigned streamId) { m_data.bits.streamId = static_cast<uint16_t>(streamId); }
 
@@ -135,10 +129,8 @@ private:
     struct {
       uint16_t isHighHalf : 1; // High half in case of 16-bit attributes
       uint16_t component : 2;  // The component index
-      uint16_t location : 8;   // The location
+      uint16_t location : 10;  // The location
       uint16_t isBuiltIn : 1;  // Whether location is actually built-in ID
-      uint16_t isFlat : 1;     // Whether is flat shading
-      uint16_t isCustom : 1;   // Whether is custom interpolation
       uint16_t streamId : 2;   // Output vertex stream ID
     } bits;
     uint16_t u16All;
@@ -151,6 +143,13 @@ enum class WorkgroupLayout : unsigned {
   Linear,        // 4x1
   Quads,         // 2x2
   SexagintiQuads // 8x8
+};
+
+// Enumerate the workgroup layout for macro-tiling and
+// Workgroup layout for micro-tiling when swizzle thread id.
+struct SwizzleWorkgroupLayout {
+  WorkgroupLayout microLayout;
+  WorkgroupLayout macroLayout;
 };
 
 // Represents the usage info of shader resources.
@@ -174,6 +173,12 @@ struct ResourceUsage {
   struct {
     // Per-stage built-in usage
     union {
+      // Task shader
+      struct {
+        // Statement
+        unsigned meshLinearDispatch : 1; // Mesh linear dispatch from task shader when group count Y/Z are both ones
+      } task;
+
       // Vertex shader
       struct {
         // Input
@@ -328,7 +333,7 @@ struct ResourceUsage {
       // Compute shader
       struct {
         // Workgroup layout
-        unsigned workgroupLayout : 2; // The layout of the workgroup
+        unsigned foldWorkgroupXY : 1; // The layout of the workgroup
       } cs;
     };
 
@@ -359,9 +364,9 @@ struct ResourceUsage {
     // Map from output location info to the transform feedback info
     std::map<InOutLocationInfo, XfbOutInfo> locInfoXfbOutInfoMap;
 
-    // Count of transform feedback output export call (each call is to export <4 x dword> at most), used in SW emulated
+    // Count of transform feedback export call (each call is to export <4 x dword> at most), used in SW emulated
     // stream-out for GFX11+
-    unsigned xfbOutputExpCount = 0;
+    unsigned xfbExpCount = 0;
 
     // Count of mapped location for inputs/outputs (including those special locations to which the built-ins
     // are mapped)
@@ -515,9 +520,8 @@ struct InterfaceData {
   struct {
     // Geometry shader
     struct {
-      unsigned copyShaderEsGsLdsSize;         // ES -> GS ring LDS size (for copy shader)
-      unsigned copyShaderStreamOutTable;      // Stream-out table (for copy shader)
-      unsigned copyShaderStreamOutControlBuf; // Stream-out control buffer (for copy shader)
+      unsigned copyShaderEsGsLdsSize;    // ES -> GS ring LDS size (for copy shader)
+      unsigned copyShaderStreamOutTable; // Stream-out table (for copy shader)
     } gs;
 
     unsigned spillTable; // Spill table user data map

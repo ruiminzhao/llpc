@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2018-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2018-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -32,10 +32,12 @@
 #include "Gfx6ConfigBuilder.h"
 #include "Gfx9ConfigBuilder.h"
 #include "MeshTaskShader.h"
+#include "RegisterMetadataBuilder.h"
 #include "ShaderMerger.h"
 #include "lgc/state/PalMetadata.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "lgc-patch-prepare-pipeline-abi"
@@ -482,8 +484,13 @@ void PatchPreparePipelineAbi::addAbiMetadata(Module &module) {
     Gfx6::ConfigBuilder configBuilder(&module, m_pipelineState);
     configBuilder.buildPalMetadata();
   } else {
-    Gfx9::ConfigBuilder configBuilder(&module, m_pipelineState);
-    configBuilder.buildPalMetadata();
+    if (m_pipelineState->useRegisterFieldFormat()) {
+      Gfx9::RegisterMetadataBuilder regMetadataBuilder(&module, m_pipelineState);
+      regMetadataBuilder.buildPalMetadata();
+    } else {
+      Gfx9::ConfigBuilder configBuilder(&module, m_pipelineState);
+      configBuilder.buildPalMetadata();
+    }
   }
 }
 

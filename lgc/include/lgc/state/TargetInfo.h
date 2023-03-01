@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -137,6 +137,7 @@ struct WorkaroundFlags {
       unsigned waNggCullingNoEmptySubgroups : 1;
       unsigned waShaderInstPrefetchFwd64 : 1;
       unsigned waWarFpAtomicDenormHazard : 1;
+      unsigned waNggPassthroughMessageHazard : 1;
       unsigned waNggDisabled : 1;
       unsigned waFixBadImageDescriptor : 1;
       unsigned waLimitedMaxOutputVertexCount : 1;

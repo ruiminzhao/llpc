@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -37,6 +37,7 @@
 #include "vkgcElfReader.h"
 #include "vkgcMetroHash.h"
 #include "lgc/CommonDefs.h"
+#include <optional>
 
 namespace llvm {
 
@@ -85,8 +86,8 @@ public:
 private:
   Compiler *m_compiler;
   Context *m_context;
-  llvm::Optional<CacheAccessor> m_nonFragmentCacheAccessor;
-  llvm::Optional<CacheAccessor> m_fragmentCacheAccessor;
+  std::optional<CacheAccessor> m_nonFragmentCacheAccessor;
+  std::optional<CacheAccessor> m_fragmentCacheAccessor;
 
   // New ICache
   Vkgc::EntryHandle m_nonFragmentEntry;
@@ -192,8 +193,9 @@ private:
                                           const GraphicsPipelineBuildInfo *pipelineInfo);
   bool canUseRelocatableComputeShaderElf(const ComputePipelineBuildInfo *pipelineInfo);
 #if VKI_RAY_TRACING
-  Result buildRayTracingPipelineInternal(Context *context, llvm::ArrayRef<const PipelineShaderInfo *> shaderInfo,
-                                         bool unlinked, std::vector<ElfPackage> &pipelineElfs,
+  Result buildRayTracingPipelineInternal(RayTracingContext &rtContext,
+                                         llvm::ArrayRef<const PipelineShaderInfo *> shaderInfo, bool unlinked,
+                                         std::vector<ElfPackage> &pipelineElfs,
                                          std::vector<Vkgc::RayTracingShaderProperty> &shaderProps,
                                          IHelperThreadProvider *helperThreadProvider);
   void addRayTracingIndirectPipelineMetadata(ElfPackage *pipelineElf);

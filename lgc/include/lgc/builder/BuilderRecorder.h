@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -127,8 +127,6 @@ public:
     GetDescStride,
     GetDescPtr,
     LoadPushConstantsPtr,
-    GetBufferDescLength,
-    PtrDiff,
 
     // Image
     ImageLoad,
@@ -188,6 +186,7 @@ public:
     EmitMeshTasks,
     SetMeshOutputs,
     GetWaveSize,
+    DebugBreak,
 
     // Subgroup
     GetSubgroupSize,
@@ -357,7 +356,7 @@ public:
   // Descriptor operations
 
   llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
-                                    llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
+                                    const llvm::Twine &instName) override final;
 
   llvm::Value *CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
                                    unsigned binding, const llvm::Twine &instName) override final;
@@ -366,12 +365,6 @@ public:
                                 unsigned binding, const llvm::Twine &instName) override final;
 
   llvm::Value *CreateLoadPushConstantsPtr(llvm::Type *returnTy, const llvm::Twine &instName) override final;
-
-  llvm::Value *CreateGetBufferDescLength(llvm::Value *const bufferDesc, llvm::Value *offset,
-                                         const llvm::Twine &instName = "") override final;
-
-  llvm::Value *CreatePtrDiff(llvm::Type *ty, llvm::Value *lhs, llvm::Value *rhs,
-                             const llvm::Twine &instName = "") override final;
 
   // -----------------------------------------------------------------------------------------------------------------
   // Image operations
@@ -462,8 +455,8 @@ public:
 
   // Create a write to an XFB (transform feedback / streamout) buffer.
   llvm::Instruction *CreateWriteXfbOutput(llvm::Value *valueToWrite, bool isBuiltIn, unsigned location,
-                                          unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
-                                          InOutInfo outputInfo) override final;
+                                          unsigned component, unsigned xfbBuffer, unsigned xfbStride,
+                                          llvm::Value *xfbOffset, InOutInfo outputInfo) override final;
 
   // Create a read of barycoord input value.
   llvm::Value *CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
@@ -516,6 +509,8 @@ public:
   // Create a workgroup control barrier.
   llvm::Instruction *CreateBarrier() override final;
 
+  // Create debug break (system halt)
+  llvm::Instruction *CreateDebugBreak(const llvm::Twine &instName = "") override final;
   llvm::Instruction *CreateKill(const llvm::Twine &instName = "") override final;
   llvm::Instruction *CreateReadClock(bool realtime, const llvm::Twine &instName = "") override final;
   llvm::Instruction *CreateDemoteToHelperInvocation(const llvm::Twine &instName) override final;

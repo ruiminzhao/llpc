@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@
  ***********************************************************************************************************************
  */
 #include "lgc/LgcContext.h"
+#include "lgc/LgcDialect.h"
 #include "lgc/builder/BuilderImpl.h"
 #include "lgc/state/AbiUnlinked.h"
 #include "lgc/state/PalMetadata.h"
@@ -52,10 +53,9 @@ using namespace llvm;
 // @param binding : Descriptor binding
 // @param descIndex : Descriptor index
 // @param flags : BufferFlag* bit settings
-// @param pointeeTy : Type that the returned pointer should point to.
 // @param instName : Name to give instruction(s)
 Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Value *descIndex, unsigned flags,
-                                         Type *const pointeeTy, const Twine &instName) {
+                                         const Twine &instName) {
   Value *desc = nullptr;
   bool return64Address = false;
   descIndex = scalarizeIfUniform(descIndex, flags & BufferFlagNonUniform);
@@ -87,6 +87,15 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
       abstractType = ResourceNodeType::DescriptorBufferCompact;
 
     std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
+    if (!node) {
+      // If we can't find the node, assume mutable descriptor and search for any node.
+      std::tie(topNode, node) =
+          m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, descSet, binding);
+      if (!node) {
+        // We did not find the resource node. Return an poison value.
+        return PoisonValue::get(getBufferDescTy(pointeeTy));
+      }
+    }
     assert(node && "missing resource node");
 
     if (node == topNode && isa<Constant>(descIndex) && node->concreteType != ResourceNodeType::InlineBuffer) {
@@ -103,7 +112,7 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
       unsigned dwordOffset = cast<ConstantInt>(descIndex)->getZExtValue() * dwordSize;
       if (dwordOffset + dwordSize > node->sizeInDwords) {
         // Index out of range
-        desc = UndefValue::get(descTy);
+        desc = PoisonValue::get(descTy);
       } else {
         dwordOffset += node->offsetInDwords;
         dwordOffset += (binding - node->binding) * node->stride;
@@ -124,6 +133,13 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
     if (node) {
       ResourceNodeType resType = node->concreteType;
       ResourceNodeType abstractType = node->abstractType;
+      // Handle mutable descriptors
+      if (resType == ResourceNodeType::DescriptorMutable) {
+        resType = ResourceNodeType::DescriptorBuffer;
+      }
+      if (abstractType == ResourceNodeType::DescriptorMutable) {
+        abstractType = ResourceNodeType::DescriptorBuffer;
+      }
       Value *descPtr = getDescPtr(resType, abstractType, descSet, binding, topNode, node);
       // Index it.
       if (descIndex != getInt32(0)) {
@@ -186,9 +202,7 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
     desc->setName(instName);
 
   // Convert to fat pointer.
-  desc = CreateNamedCall(lgcName::LateLaunderFatPointer, getInt8Ty()->getPointerTo(ADDR_SPACE_BUFFER_FAT_POINTER), desc,
-                         Attribute::ReadNone);
-  return CreateBitCast(desc, getBufferDescTy(pointeeTy));
+  return create<BufferDescToPtrOp>(desc);
 }
 
 // =====================================================================================================================
@@ -209,11 +223,17 @@ Value *DescBuilder::CreateGetDescStride(ResourceNodeType concreteType, ResourceN
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
     std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
-    if (!node && m_pipelineState->findResourceNode(ResourceNodeType::Unknown, descSet, binding).second) {
-      // NOTE: Resource node may be DescriptorTexelBuffer, but it is defined as OpTypeSampledImage in SPIRV,
-      // In this case, a caller may search for the DescriptorSampler and not find it. We return nullptr and
-      // expect the caller to handle it.
-      return UndefValue::get(getInt32Ty());
+    if (!node) {
+      // If we can't find the node, assume mutable descriptor and search for any node.
+      std::tie(topNode, node) =
+          m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, descSet, binding);
+      if (!node && m_pipelineState->findResourceNode(ResourceNodeType::Unknown, descSet, binding).second) {
+        // NOTE: Resource node may be DescriptorTexelBuffer, but it is defined as OpTypeSampledImage in SPIRV,
+        // In this case, a caller may search for the DescriptorSampler and not find it. We return nullptr and
+        // expect the caller to handle it.
+        return PoisonValue::get(getInt32Ty());
+      }
+      assert(node && "missing resource node");
     }
     assert(node && "missing resource node");
   }
@@ -238,13 +258,18 @@ Value *DescBuilder::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNode
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
     std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
-    if (!node && m_pipelineState->findResourceNode(ResourceNodeType::Unknown, descSet, binding).second) {
-      // NOTE: Resource node may be DescriptorTexelBuffer, but it is defined as OpTypeSampledImage in SPIRV,
-      // In this case, a caller may search for the DescriptorSampler and not find it. We return nullptr and
-      // expect the caller to handle it.
-      return UndefValue::get(getDescPtrTy(concreteType));
+    if (!node) {
+      // If we can't find the node, assume mutable descriptor and search for any node.
+      std::tie(topNode, node) =
+          m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, descSet, binding);
+      if (!node && m_pipelineState->findResourceNode(ResourceNodeType::Unknown, descSet, binding).second) {
+        // NOTE: Resource node may be DescriptorTexelBuffer, but it is defined as OpTypeSampledImage in SPIRV,
+        // In this case, a caller may search for the DescriptorSampler and not find it. We return nullptr and
+        // expect the caller to handle it.
+        return PoisonValue::get(getDescPtrTy(concreteType));
+      }
+      assert(node && "missing resource node");
     }
-    assert(node && "missing resource node");
   }
 
   Value *descPtr = nullptr;
@@ -512,39 +537,6 @@ Value *DescBuilder::scalarizeIfUniform(Value *value, bool isNonUniform) {
       value = CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, value);
   }
   return value;
-}
-
-// =====================================================================================================================
-// Create a buffer length query based on the specified descriptor.
-//
-// @param bufferDesc : The buffer descriptor to query.
-// @param instName : Name to give instruction(s).
-Value *DescBuilder::CreateGetBufferDescLength(Value *const bufferDesc, Value *offset, const Twine &instName) {
-  // In future this should become a full LLVM intrinsic, but for now we patch in a late intrinsic that is cleaned up
-  // in patch buffer op.
-  return CreateNamedCall(lgcName::LateBufferLength, getInt32Ty(), {bufferDesc, offset}, Attribute::ReadNone);
-}
-
-// =====================================================================================================================
-// Return the i64 difference between two pointers, dividing out the size of the pointed-to objects.
-// For buffer fat pointers, delays the translation to patch phase.
-//
-// @param ty : Element type of the pointers.
-// @param lhs : Left hand side of the subtraction.
-// @param rhs : Reft hand side of the subtraction.
-// @param instName : Name to give instruction(s)
-Value *DescBuilder::CreatePtrDiff(llvm::Type *ty, llvm::Value *lhs, llvm::Value *rhs, const llvm::Twine &instName) {
-  Type *const lhsType = lhs->getType();
-  Type *const rhsType = rhs->getType();
-  if (!lhsType->isPointerTy() || lhsType->getPointerAddressSpace() != ADDR_SPACE_BUFFER_FAT_POINTER ||
-      !rhsType->isPointerTy() || rhsType->getPointerAddressSpace() != ADDR_SPACE_BUFFER_FAT_POINTER)
-    return IRBuilderBase::CreatePtrDiff(ty, lhs, rhs, instName);
-
-  // Add a dummy value of the pointer element type so we can later determine its size
-  Value *dummyValue = Constant::getNullValue(ty);
-  std::string callName = lgcName::LateBufferPtrDiff;
-  addTypeMangling(getVoidTy(), {dummyValue, lhs, rhs}, callName);
-  return CreateNamedCall(callName, getInt64Ty(), {dummyValue, lhs, rhs}, Attribute::ReadNone);
 }
 
 // =====================================================================================================================

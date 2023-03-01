@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -160,6 +160,7 @@ void ShaderModes::setComputeShaderMode(const ComputeShaderMode &inMode) {
   m_computeShaderMode.workgroupSizeX = std::max(1U, inMode.workgroupSizeX);
   m_computeShaderMode.workgroupSizeY = std::max(1U, inMode.workgroupSizeY);
   m_computeShaderMode.workgroupSizeZ = std::max(1U, inMode.workgroupSizeZ);
+  m_computeShaderMode.derivatives = inMode.derivatives;
 
   assert(m_computeShaderMode.workgroupSizeX <= MaxComputeWorkgroupSize &&
          m_computeShaderMode.workgroupSizeY <= MaxComputeWorkgroupSize &&

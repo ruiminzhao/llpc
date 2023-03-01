@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -548,8 +548,8 @@ template <typename T> void ConfigBuilder::buildHsRegConfig(ShaderStage shaderSta
   // Minimum and maximum tessellation factors supported by the hardware.
   constexpr float minTessFactor = 1.0f;
   constexpr float maxTessFactor = 64.0f;
-  SET_REG(&config->hsRegs, VGT_HOS_MIN_TESS_LEVEL, FloatToBits(minTessFactor));
-  SET_REG(&config->hsRegs, VGT_HOS_MAX_TESS_LEVEL, FloatToBits(maxTessFactor));
+  SET_REG(&config->hsRegs, VGT_HOS_MIN_TESS_LEVEL, bit_cast<uint32_t>(minTessFactor));
+  SET_REG(&config->hsRegs, VGT_HOS_MAX_TESS_LEVEL, bit_cast<uint32_t>(maxTessFactor));
 
   // Set VGT_LS_HS_CONFIG
   SET_REG_FIELD(&config->hsRegs, VGT_LS_HS_CONFIG, NUM_PATCHES, calcFactor.patchCountPerThreadGroup);
@@ -994,20 +994,16 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   const auto &computeMode = m_pipelineState->getShaderModes()->getComputeShaderMode();
   unsigned workgroupSizes[3] = {};
 
-  switch (static_cast<WorkgroupLayout>(builtInUsage.workgroupLayout)) {
-  case WorkgroupLayout::Unknown:
-  case WorkgroupLayout::Linear:
-    workgroupSizes[0] = computeMode.workgroupSizeX;
-    workgroupSizes[1] = computeMode.workgroupSizeY;
-    workgroupSizes[2] = computeMode.workgroupSizeZ;
-    break;
-  case WorkgroupLayout::Quads:
-  case WorkgroupLayout::SexagintiQuads:
+  if (builtInUsage.foldWorkgroupXY) {
     workgroupSizes[0] = computeMode.workgroupSizeX * computeMode.workgroupSizeY;
     workgroupSizes[1] = computeMode.workgroupSizeZ;
     workgroupSizes[2] = 1;
-    break;
+  } else {
+    workgroupSizes[0] = computeMode.workgroupSizeX;
+    workgroupSizes[1] = computeMode.workgroupSizeY;
+    workgroupSizes[2] = computeMode.workgroupSizeZ;
   }
+
   unsigned floatMode = setupFloatingPointMode(shaderStage);
   SET_REG_FIELD(config, COMPUTE_PGM_RSRC1, FLOAT_MODE, floatMode);
   SET_REG_FIELD(config, COMPUTE_PGM_RSRC1, DX10_CLAMP, true); // Follow PAL setting

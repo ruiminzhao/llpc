@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -38,6 +38,7 @@
 #include "vkgcMetroHash.h"
 #include "lgc/Builder.h"
 #include "lgc/LgcContext.h"
+#include "lgc/LgcDialect.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitstream/BitstreamReader.h"
@@ -64,10 +65,11 @@ namespace Llpc {
 //
 // @param gfxIp : Graphics IP version info
 Context::Context(GfxIpVersion gfxIp) : LLVMContext(), m_gfxIp(gfxIp) {
+  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(*this);
+
   reset();
-  // Temporarily disable opaque pointers (llvm is making opaque the default).
   // TODO: Remove this once work complete on transition to opaque pointers.
-  setOpaquePointers(GetOpaquePointersFlag());
+  setOpaquePointers(true);
 }
 
 // =====================================================================================================================

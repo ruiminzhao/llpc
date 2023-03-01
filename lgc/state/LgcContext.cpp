@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -256,7 +256,6 @@ LgcContext *LgcContext::create(LLVMContext &context, StringRef gpuName, unsigned
 // @param context : LLVM context to give each Builder
 // @param palAbiVersion : PAL pipeline ABI version to compile for
 LgcContext::LgcContext(LLVMContext &context, unsigned palAbiVersion) : m_context(context) {
-  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(context);
 }
 
 // =====================================================================================================================

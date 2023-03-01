@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2021-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2021-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -171,7 +171,10 @@ void ObjDisassembler::run() {
 
   // Figure out the target triple from the object file, and get features.
   Triple triple = m_objFile->makeTriple();
-  SubtargetFeatures features = m_objFile->getFeatures();
+  Expected<SubtargetFeatures> expectedFeatures = m_objFile->getFeatures();
+  if (!expectedFeatures)
+    report_fatal_error(expectedFeatures.takeError());
+  SubtargetFeatures features = *expectedFeatures;
 
   // Get the target specific parser.
   std::string error;
@@ -180,7 +183,7 @@ void ObjDisassembler::run() {
   if (!m_target)
     report_fatal_error(m_objFile->getFileName() + ": '" + m_tripleName + "': " + error);
 
-  // Get the CPU name.
+    // Get the CPU name.
 #if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 444152
   Optional<StringRef> mcpu = m_objFile->tryGetCPUName();
 #else

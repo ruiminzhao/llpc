@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -332,6 +332,7 @@ static void setGfx1010Info(TargetInfo *targetInfo) {
   targetInfo->getGpuWorkarounds().gfx10.waTessIncorrectRelativeIndex = 1;
   targetInfo->getGpuWorkarounds().gfx10.waSmemFollowedByVopc = 1;
   targetInfo->getGpuWorkarounds().gfx10.waNggCullingNoEmptySubgroups = 1;
+  targetInfo->getGpuWorkarounds().gfx10.waNggPassthroughMessageHazard = 1;
   targetInfo->getGpuWorkarounds().gfx10.waFixBadImageDescriptor = 1;
 }
 
@@ -352,6 +353,7 @@ static void setGfx1011Info(TargetInfo *targetInfo) {
   targetInfo->getGpuWorkarounds().gfx10.waShaderInstPrefetchFwd64 = 1;
   targetInfo->getGpuWorkarounds().gfx10.waWarFpAtomicDenormHazard = 1;
   targetInfo->getGpuWorkarounds().gfx10.waNggCullingNoEmptySubgroups = 1;
+  targetInfo->getGpuWorkarounds().gfx10.waNggPassthroughMessageHazard = 1;
   targetInfo->getGpuWorkarounds().gfx10.waFixBadImageDescriptor = 1;
 
   targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth16 = true;
@@ -378,8 +380,10 @@ static void setGfx1012Info(TargetInfo *targetInfo) {
   targetInfo->getGpuWorkarounds().gfx10.waNggCullingNoEmptySubgroups = 1;
   targetInfo->getGpuWorkarounds().gfx10.waShaderInstPrefetchFwd64 = 1;
   targetInfo->getGpuWorkarounds().gfx10.waWarFpAtomicDenormHazard = 1;
+  targetInfo->getGpuWorkarounds().gfx10.waNggPassthroughMessageHazard = 1;
   targetInfo->getGpuWorkarounds().gfx10.waNggDisabled = 1;
   targetInfo->getGpuWorkarounds().gfx10.waFixBadImageDescriptor = 1;
+
   targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth16 = true;
   targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth8 = true;
   targetInfo->getGpuProperty().supportIntegerDotFlag.compBitwidth4 = true;
@@ -433,6 +437,27 @@ static void setGfx1032Info(TargetInfo *targetInfo) {
 //
 // @param [in/out] targetInfo : Target info
 static void setGfx1034Info(TargetInfo *targetInfo) {
+  setGfx10Info(targetInfo);
+  setGfx103Info(targetInfo);
+
+  targetInfo->getGpuProperty().numShaderEngines = 1;
+}
+
+// gfx1035
+//
+// @param [in/out] targetInfo : Target info
+static void setGfx1035Info(TargetInfo *targetInfo) {
+  setGfx10Info(targetInfo);
+  setGfx103Info(targetInfo);
+
+  targetInfo->getGpuProperty().numShaderEngines = 1;
+  targetInfo->getGpuWorkarounds().gfx10.waClearWriteCompressBit = 1;
+}
+
+// gfx1036
+//
+// @param [in/out] targetInfo : Target info
+static void setGfx1036Info(TargetInfo *targetInfo) {
   setGfx10Info(targetInfo);
   setGfx103Info(targetInfo);
 
@@ -506,6 +531,8 @@ bool TargetInfo::setTargetInfo(StringRef gpuName) {
       {"gfx1031", &setGfx1031Info}, // gfx1031, navi22
       {"gfx1032", &setGfx1032Info}, // gfx1032, navi23
       {"gfx1034", &setGfx1034Info}, // gfx1034, navi24
+      {"gfx1035", &setGfx1035Info}, // gfx1035, rembrandt
+      {"gfx1036", &setGfx1036Info}, // gfx1036, raphael | mendocino
       {"gfx1100", &setGfx1100Info}, // gfx1100, navi31
   };
 

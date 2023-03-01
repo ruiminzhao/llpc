@@ -1,7 +1,7 @@
 ; Test that LLPC can handle multiple inline buffer in the root table.
 
 ; BEGIN_SHADERTEST
-; RUN: amdllpc -o %t.elf %gfxip %s -enable-opaque-pointers=true -v | FileCheck -check-prefix=SHADERTEST %s
+; RUN: amdllpc -o %t.elf %gfxip %s -v | FileCheck -check-prefix=SHADERTEST %s
 ; SHADERTEST-LABEL: {{^//}} LLPC SPIR-V lowering result
 ; SHADERTEST: define dllexport spir_func void @main()
 ; SHADERTEST-DAG: call ptr addrspace(7) (...) @lgc.create.load.buffer.desc.p7(i32 0, i32 0, i32 0, i32 0)
@@ -30,7 +30,7 @@
 ; SHADERTEST: [[desc1_3:%[0-9]*]] = insertelement <4 x i32> [[desc1_2]], i32 151468, i64 3
 
 ; Get the "fat pointer" for the buffer
-; SHADERTEST: call ptr addrspace(7) @lgc.late.launder.fat.pointer(<4 x i32> [[desc1_3]]) #2
+; SHADERTEST: call ptr addrspace(7) @lgc.buffer.desc.to.ptr(<4 x i32> [[desc1_3]])
 
 ; Get a pointer to the spill table
 ; SHADERTEST: [[spill_table0:%[0-9]*]] = call ptr addrspace(4) @lgc.spill.table() #2
@@ -42,7 +42,7 @@
 ; Test the use of InlineBuffer with relocatable shaders.  This is currently not supported, and we
 ; should fall back to full pipeline compilation.
 ; BEGIN_RELOCTEST
-; RUN: amdllpc --enable-relocatable-shader-elf -o %t.elf %gfxip %s -enable-opaque-pointers=true -v | FileCheck -check-prefix=RELOCTEST %s
+; RUN: amdllpc --enable-relocatable-shader-elf -o %t.elf %gfxip %s -v | FileCheck -check-prefix=RELOCTEST %s
 ; RELOCTEST-LABEL: {{^// LLPC}} calculated hash results (compute pipeline)
 ; RELOCTEST-LABEL: {{^Warning:}} Relocatable shader compilation requested but not possible
 ; RELOCTEST-LABEL: {{^// LLPC}} SPIRV-to-LLVM translation results

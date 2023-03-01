@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -714,15 +714,16 @@ Value *InOutBuilder::adjustIj(Value *value, Value *offset) {
 // of those correspondences is actually used when writing to XFB for each affected vertex.
 //
 // @param valueToWrite : Value to write
-// @param isBuiltIn : True for built-in, false for user output (ignored if not GS)
-// @param location : Location (row) or built-in kind of output (ignored if not GS)
+// @param isBuiltIn : True for built-in, false for user output
+// @param location : Location (row) or built-in kind of output
+// @param component : Component offset of inputs and outputs (ignored if built-in)
 // @param xfbBuffer : XFB buffer ID
 // @param xfbStride : XFB stride
 // @param xfbOffset : XFB byte offset
 // @param outputInfo : Extra output info (GS stream ID)
 Instruction *InOutBuilder::CreateWriteXfbOutput(Value *valueToWrite, bool isBuiltIn, unsigned location,
-                                                unsigned xfbBuffer, unsigned xfbStride, Value *xfbOffset,
-                                                InOutInfo outputInfo) {
+                                                unsigned component, unsigned xfbBuffer, unsigned xfbStride,
+                                                Value *xfbOffset, InOutInfo outputInfo) {
   // xfbStride must be a non-zero value
   assert(xfbStride > 0);
   // Can currently only cope with constant xfbOffset.
@@ -771,7 +772,7 @@ Instruction *InOutBuilder::CreateWriteXfbOutput(Value *valueToWrite, bool isBuil
       InOutLocationInfo outLocInfo;
       outLocInfo.setLocation(location);
       outLocInfo.setStreamId(streamId);
-      outLocInfo.setComponent(i);
+      outLocInfo.setComponent(component + i);
       outLocInfo.setBuiltIn(isBuiltIn);
       if (i >= 4) {
         outLocInfo.setLocation(location + 1);
@@ -974,31 +975,29 @@ Value *InOutBuilder::readBuiltIn(bool isOutput, BuiltInKind builtIn, InOutInfo i
 // @returns : gl_Barycoord
 Value *InOutBuilder::normalizeBaryCoord(Value *iJCoord) {
   auto baryType = FixedVectorType::get(getFloatTy(), 3);
-  Value *barycoord = UndefValue::get(baryType);
   auto one = ConstantFP::get(getFloatTy(), 1.0);
   auto zero = ConstantFP::get(getFloatTy(), 0.0);
 
-  auto iCoord = CreateExtractElement(iJCoord, uint64_t(0));
-  auto jCoord = CreateExtractElement(iJCoord, 1);
-  auto kCoord = CreateFSub(ConstantFP::get(getFloatTy(), 1.0), iCoord);
-  kCoord = CreateFSub(kCoord, jCoord);
+  Value *hwCoord[3] = {};
+  hwCoord[0] = CreateExtractElement(iJCoord, uint64_t(0));
+  hwCoord[1] = CreateExtractElement(iJCoord, 1);
+  hwCoord[2] = CreateFSub(CreateFSub(one, hwCoord[0]), hwCoord[1]);
 
   auto primType = m_pipelineState->getPrimitiveType();
   auto provokingVertexMode = m_pipelineState->getRasterizerState().provokingVertexMode;
+  Value *normalized[3] = {zero, zero, zero};
   switch (primType) {
   case PrimitiveType::Point: {
-    // Points
-    barycoord = ConstantVector::get({one, zero, zero});
+    normalized[0] = one;
     break;
   }
   case PrimitiveType::LineList:
   case PrimitiveType::LineStrip: {
     // Lines
     // The weight of vertex0 is (1 - i - j), the weight of vertex1 is (i + j).
-    auto yCoord = CreateFAdd(iCoord, jCoord);
-    barycoord = CreateInsertElement(barycoord, kCoord, uint64_t(0));
-    barycoord = CreateInsertElement(barycoord, yCoord, 1);
-    barycoord = CreateInsertElement(barycoord, zero, 2);
+    auto yCoord = CreateFAdd(hwCoord[0], hwCoord[1]);
+    normalized[0] = hwCoord[2];
+    normalized[1] = yCoord;
     break;
   }
   case PrimitiveType::TriangleList: {
@@ -1006,15 +1005,13 @@ Value *InOutBuilder::normalizeBaryCoord(Value *iJCoord) {
     // V0 ==> Attr_indx2
     // V1 ==> Attr_indx0
     // V2 ==> Attr_indx1
-    barycoord = CreateInsertElement(barycoord, iCoord, 2);
-    barycoord = CreateInsertElement(barycoord, jCoord, uint64_t(0));
-    barycoord = CreateInsertElement(barycoord, kCoord, 1);
+    normalized[0] = hwCoord[1];
+    normalized[1] = hwCoord[2];
+    normalized[2] = hwCoord[0];
     break;
   }
   default: {
     unsigned oddOffset = 0, evenOffset = 0;
-    Value *odd = UndefValue::get(baryType);
-    Value *even = UndefValue::get(baryType);
     switch (primType) {
     case PrimitiveType::TriangleFan: {
       oddOffset = provokingVertexMode == ProvokingVertexLast ? 0 : 2;
@@ -1037,21 +1034,22 @@ Value *InOutBuilder::normalizeBaryCoord(Value *iJCoord) {
       break;
     }
     }
-    odd = CreateInsertElement(odd, iCoord, oddOffset % 3);
-    odd = CreateInsertElement(odd, jCoord, (1 + oddOffset) % 3);
-    odd = CreateInsertElement(odd, kCoord, (2 + oddOffset) % 3);
-
-    even = CreateInsertElement(even, iCoord, evenOffset % 3);
-    even = CreateInsertElement(even, jCoord, (1 + evenOffset) % 3);
-    even = CreateInsertElement(even, kCoord, (2 + evenOffset) % 3);
 
     // Select between them.
     Value *primitiveId = readBuiltIn(false, BuiltInPrimitiveId, {}, nullptr, nullptr, "");
     Value *parity = CreateTrunc(primitiveId, Type::getInt1Ty(getContext()));
-    barycoord = CreateSelect(parity, odd, even);
+    for (unsigned i = 0; i < 3; ++i) {
+      Value *odd = hwCoord[(i - oddOffset + 3) % 3];
+      Value *even = hwCoord[(i - evenOffset + 3) % 3];
+      normalized[i] = CreateSelect(parity, odd, even);
+    }
     break;
   }
   }
+
+  Value *barycoord = PoisonValue::get(baryType);
+  for (unsigned i = 0; i < 3; ++i)
+    barycoord = CreateInsertElement(barycoord, normalized[i], i);
   return barycoord;
 }
 
@@ -1177,10 +1175,9 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
 
       // Load control bit from internal buffer
       auto bufferDesc = CreateLoadBufferDesc(options.reverseThreadGroupBufferDescSet,
-                                             options.reverseThreadGroupBufferBinding, getInt32(0), 0, getInt8Ty());
+                                             options.reverseThreadGroupBufferBinding, getInt32(0), 0);
       auto controlBitPtr = CreateInBoundsGEP(getInt8Ty(), bufferDesc, getInt32(0));
-      auto controlBit = CreateTrunc(
-          CreateLoad(getInt32Ty(), CreateBitCast(controlBitPtr, getBufferDescTy(getInt32Ty()))), getInt1Ty());
+      auto controlBit = CreateTrunc(CreateLoad(getInt32Ty(), controlBitPtr), getInt1Ty());
 
       workgroupId = CreateSelect(controlBit, reversedWorkgroupId, workgroupId);
     }
@@ -1189,7 +1186,7 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
   }
 
   case BuiltInLocalInvocationId:
-  case BuiltInHwLocalInvocationId: {
+  case BuiltInUnswizzledLocalInvocationId: {
     // LocalInvocationId is a v3i32 shader input (three VGPRs set up in hardware).
     Value *localInvocationId =
         ShaderInputs::getInput(ShaderInput::LocalInvocationId, BuilderBase::get(*this), *getLgcContext());
@@ -1222,28 +1219,13 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
       localInvocationId = CreateInsertElement(localInvocationId, getInt32(0), 2);
     }
 
-    if (builtIn == BuiltInLocalInvocationId) {
-      // If the option is enabled, we might want to reconfigure the workgroup layout later, which
-      // means the value of LocalInvocationId needs modifying. We can't do that now, as we need to
-      // know whether the shader uses images. Detect here that we can't do that optimization in
-      // a compute library. We don't detect here that we can't do the optimization in a compute shader
-      // with calls, as that detection is slightly more expensive.
-      if (m_pipelineState->getOptions().reconfigWorkgroupLayout && !getPipelineState()->isComputeLibrary()) {
+    if (m_shaderStage == ShaderStageCompute) {
+      // Reconfigure the workgroup layout later if it's necessary.
+      if (!getPipelineState()->isComputeLibrary()) {
         // Insert a call that later on might get lowered to code to reconfigure the workgroup.
-        localInvocationId = CreateNamedCall(lgcName::ReconfigureLocalInvocationId, localInvocationId->getType(),
-                                            localInvocationId, Attribute::ReadNone);
-      }
-
-      // In the case of 16x16 thread group size, wave32 SIMD will be created in eight 16x2 regions.
-      // This function maps the eight 16x2 regions into eight 8x4 regions.
-      //
-      // Originally SIMDs cover 16x2 regions, after swizzling they cover 8x4 regions.
-      bool pipelineThreadIdSwizzling =
-          m_pipelineState->getOptions().forceCsThreadIdSwizzling && !getPipelineState()->isComputeLibrary();
-      if (pipelineThreadIdSwizzling) {
-        // Insert a call that later on might get lowered to code to reconfigure the workgroup.
-        localInvocationId = CreateNamedCall(lgcName::SwizzleLocalInvocationId, localInvocationId->getType(),
-                                            localInvocationId, Attribute::ReadNone);
+        localInvocationId = CreateNamedCall(
+            lgcName::ReconfigureLocalInvocationId, localInvocationId->getType(),
+            {localInvocationId, getInt32(builtIn == BuiltInUnswizzledLocalInvocationId)}, Attribute::ReadNone);
       }
     }
 
@@ -1267,7 +1249,7 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
   }
 
   case BuiltInLocalInvocationIndex:
-  case BuiltInHwLocalInvocationIndex: {
+  case BuiltInUnswizzledLocalInvocationIndex: {
     // LocalInvocationIndex is
     // (WorkgroupSize.Y * LocalInvocationId.Z + LocalInvocationId.Y) * WorkGroupSize.X + LocalInvocationId.X
     Value *workgroupSize = readCsBuiltIn(BuiltInWorkgroupSize);
@@ -1275,7 +1257,7 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     if (builtIn == BuiltInLocalInvocationIndex) {
       localInvocationId = readCsBuiltIn(BuiltInLocalInvocationId, "readLocalInvocationId");
     } else {
-      localInvocationId = readCsBuiltIn(BuiltInHwLocalInvocationId, "readHWLocalInvocationId");
+      localInvocationId = readCsBuiltIn(BuiltInUnswizzledLocalInvocationId, "readHWLocalInvocationId");
     }
     Value *input = CreateMul(CreateExtractElement(workgroupSize, 1), CreateExtractElement(localInvocationId, 2));
     input = CreateAdd(input, CreateExtractElement(localInvocationId, 1));
@@ -1295,7 +1277,7 @@ Value *InOutBuilder::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
       return waveIdInSubgroup;
     } else {
       // Before Navi21, it should read the value before swizzling which is correct to calculate subgroup id.
-      Value *localInvocationIndex = readCsBuiltIn(BuiltInHwLocalInvocationIndex);
+      Value *localInvocationIndex = readCsBuiltIn(BuiltInUnswizzledLocalInvocationIndex);
       unsigned subgroupSize = getPipelineState()->getShaderSubgroupSize(m_shaderStage);
       return CreateLShr(localInvocationIndex, getInt32(Log2_32(subgroupSize)));
     }

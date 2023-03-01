@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -176,10 +176,8 @@ Type *Builder::getTransposedMatrixTy(Type *const matrixType) const {
 
 // =====================================================================================================================
 // Get the type of pointer returned by CreateLoadBufferDesc.
-//
-// @param pointeeTy : Type that the returned pointer should point to.
-PointerType *Builder::getBufferDescTy(Type *pointeeTy) {
-  return PointerType::get(pointeeTy, ADDR_SPACE_BUFFER_FAT_POINTER);
+PointerType *Builder::getBufferDescTy() {
+  return PointerType::get(getContext(), ADDR_SPACE_BUFFER_FAT_POINTER);
 }
 
 // =====================================================================================================================

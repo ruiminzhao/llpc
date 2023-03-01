@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -32,7 +32,6 @@
 #include "Gfx6Chip.h"
 #include "Gfx9Chip.h"
 #include "MeshTaskShader.h"
-#include "NggLdsManager.h"
 #include "NggPrimShader.h"
 #include "lgc/Builder.h"
 #include "lgc/state/IntrinsDefs.h"
@@ -198,9 +197,8 @@ void PatchResourceCollect::setNggControl(Module *module) {
   nggControl.enableGsUse =
       (options.nggFlags & NggFlagEnableGsUse) ||
       (m_pipelineState->getTargetInfo().getGfxIpVersion().major >= 11); // Always enable NGG on GS for GFX11+
-  nggControl.compactMode = (options.nggFlags & NggFlagCompactDisable) ? NggCompactDisable : NggCompactVertices;
+  nggControl.compactVertex = (options.nggFlags & NggFlagCompactVertex);
 
-  nggControl.enableVertexReuse = (options.nggFlags & NggFlagEnableVertexReuse);
   nggControl.enableBackfaceCulling = (options.nggFlags & NggFlagEnableBackfaceCulling);
   nggControl.enableFrustumCulling = (options.nggFlags & NggFlagEnableFrustumCulling);
   nggControl.enableBoxFilterCulling = (options.nggFlags & NggFlagEnableBoxFilterCulling);
@@ -217,10 +215,9 @@ void PatchResourceCollect::setNggControl(Module *module) {
     if (options.nggFlags & NggFlagForceCullingMode)
       nggControl.passthroughMode = false;
     else {
-      nggControl.passthroughMode = !nggControl.enableVertexReuse && !nggControl.enableBackfaceCulling &&
-                                   !nggControl.enableFrustumCulling && !nggControl.enableBoxFilterCulling &&
-                                   !nggControl.enableSphereCulling && !nggControl.enableSmallPrimFilter &&
-                                   !nggControl.enableCullDistanceCulling;
+      nggControl.passthroughMode = !nggControl.enableBackfaceCulling && !nggControl.enableFrustumCulling &&
+                                   !nggControl.enableBoxFilterCulling && !nggControl.enableSphereCulling &&
+                                   !nggControl.enableSmallPrimFilter && !nggControl.enableCullDistanceCulling;
     }
 
     // NOTE: Further check if we have to turn on pass-through mode forcibly.
@@ -234,18 +231,7 @@ void PatchResourceCollect::setNggControl(Module *module) {
     LLPC_OUTS("EnableNgg                    = " << nggControl.enableNgg << "\n");
     LLPC_OUTS("EnableGsUse                  = " << nggControl.enableGsUse << "\n");
     LLPC_OUTS("PassthroughMode              = " << nggControl.passthroughMode << "\n");
-    LLPC_OUTS("CompactMode                  = ");
-    switch (nggControl.compactMode) {
-    case NggCompactDisable:
-      LLPC_OUTS("Disable\n");
-      break;
-    case NggCompactVertices:
-      LLPC_OUTS("Vertices\n");
-      break;
-    default:
-      break;
-    }
-    LLPC_OUTS("EnableVertexReuse            = " << nggControl.enableVertexReuse << "\n");
+    LLPC_OUTS("CompactVertex                = " << nggControl.compactVertex << "\n");
     LLPC_OUTS("EnableBackfaceCulling        = " << nggControl.enableBackfaceCulling << "\n");
     LLPC_OUTS("EnableFrustumCulling         = " << nggControl.enableFrustumCulling << "\n");
     LLPC_OUTS("EnableBoxFilterCulling       = " << nggControl.enableBoxFilterCulling << "\n");
@@ -371,8 +357,8 @@ bool PatchResourceCollect::canUseNggCulling(Module *module) {
   }
 
   // Check resource usage, disable culling if there are resource write operations (including atomic operations) in
-  // non-GS NGG cases. This is because such write operations have side effect in execution sequences. But in GS NGG
-  // cases, we can still enable culling. Culling is performed after GS execution.
+  // NGG cases when API GS is not present. This is because such write operations have side effect in execution
+  // sequences. But when GS is present, we can still enable culling. Culling is performed after GS execution.
   if (!hasGs) {
     const auto resUsage = m_pipelineState->getShaderResourceUsage(hasTs ? ShaderStageTessEval : ShaderStageVertex);
     if (resUsage->resourceWrite)
@@ -562,7 +548,7 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
     if (useAdjacency)
       esMinVertsPerSubgroup = inVertsPerPrim;
 
-    // For normal primitives, the VGT only checks if they are past the ES verts per sub-group after allocating a full
+    // For normal primitives, the VGT only checks if they are past the ES verts per subgroup after allocating a full
     // GS primitive and if they are, kick off a new sub group. But if those additional ES vertices are unique
     // (e.g. not reused) we need to make sure there is enough LDS space to account for those ES verts beyond
     // ES_VERTS_PER_SUBGRP.
@@ -641,15 +627,15 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
       const unsigned gsVsRingItemSize =
           hasGs ? std::max(1u, 4 * gsResUsage->inOutUsage.outputMapLocCount * geometryMode.outputVertices) : 0;
 
-      const unsigned esExtraLdsSize = NggLdsManager::calcEsExtraLdsSize(m_pipelineState) / 4; // In dwords
-      const unsigned gsExtraLdsSize = NggLdsManager::calcGsExtraLdsSize(m_pipelineState) / 4; // In dwords
+      const auto &ldsGeneralUsage = NggPrimShader::layoutPrimShaderLds(m_pipelineState);
+      const bool needsLds = ldsGeneralUsage.needsLds;
+      const unsigned esExtraLdsSize = ldsGeneralUsage.esExtraLdsSize; // In dwords
+      const unsigned gsExtraLdsSize = ldsGeneralUsage.gsExtraLdsSize; // In dwords
 
-      // NOTE: Primitive amplification factor must be at least 1. And for NGG GS mode, we force number of output
+      // NOTE: Primitive amplification factor must be at least 1. And for NGG with API GS, we force number of output
       // primitives to be equal to that of output vertices regardless of the output primitive type by emitting
-      // invalid primitives. This is to simplify the algorithmic design of NGG GS and improve its efficiency.
+      // invalid primitives. This is to simplify the algorithmic design and improve its efficiency.
       unsigned primAmpFactor = std::max(1u, geometryMode.outputVertices);
-
-      const bool needsLds = NggLdsManager::needsLds(m_pipelineState);
 
       unsigned esVertsPerSubgroup = 0;
       unsigned gsPrimsPerSubgroup = 0;
@@ -909,7 +895,7 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         rayQueryLdsStackSize = MaxRayQueryLdsStackEntries * MaxRayQueryThreadsPerGroup;
 #endif
 
-      // Use the client-specified amount of LDS space per sub-group. If they specified zero, they want us to
+      // Use the client-specified amount of LDS space per subgroup. If they specified zero, they want us to
       // choose a reasonable default. The final amount must be 128-dword aligned.
       // TODO: Accept DefaultLdsSizePerSubgroup from panel setting
       unsigned maxLdsSize = Gfx9::DefaultLdsSizePerSubgroup;
@@ -919,9 +905,9 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
 
       // If total LDS usage is too big, refactor partitions based on ratio of ES-GS item sizes.
       if (gsOnChipLdsSize > maxLdsSize) {
-        // Our target GS primitives per sub-group was too large
+        // Our target GS primitives per subgroup was too large
 
-        // Calculate the maximum number of GS primitives per sub-group that will fit into LDS, capped
+        // Calculate the maximum number of GS primitives per subgroup that will fit into LDS, capped
         // by the maximum that the hardware can support.
         unsigned availableLdsSize = maxLdsSize - esGsExtraLdsDwords;
         gsPrimsPerSubgroup =
@@ -1067,8 +1053,8 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
 
   LLPC_OUTS("===============================================================================\n");
   LLPC_OUTS("// LLPC geometry calculation factor results\n\n");
-  LLPC_OUTS("ES vertices per sub-group: " << gsResUsage->inOutUsage.gs.calcFactor.esVertsPerSubgroup << "\n");
-  LLPC_OUTS("GS primitives per sub-group: " << gsResUsage->inOutUsage.gs.calcFactor.gsPrimsPerSubgroup << "\n");
+  LLPC_OUTS("ES vertices per subgroup: " << gsResUsage->inOutUsage.gs.calcFactor.esVertsPerSubgroup << "\n");
+  LLPC_OUTS("GS primitives per subgroup: " << gsResUsage->inOutUsage.gs.calcFactor.gsPrimsPerSubgroup << "\n");
   LLPC_OUTS("\n");
   LLPC_OUTS("ES-GS LDS size (in dwords): " << gsResUsage->inOutUsage.gs.calcFactor.esGsLdsSize << "\n");
   LLPC_OUTS("On-chip GS LDS size (in dwords): " << gsResUsage->inOutUsage.gs.calcFactor.gsOnChipLdsSize << "\n");
@@ -1078,21 +1064,21 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
   LLPC_OUTS("\n");
 
   if (hasGs) {
-    LLPC_OUTS("GS stream item size:\n");
+    LLPC_OUTS("GS stream item sizes (in dwords):\n");
     for (unsigned i = 0; i < MaxGsStreams; ++i) {
       unsigned streamItemSize = gsResUsage->inOutUsage.gs.outLocCount[i] * geometryMode.outputVertices * 4;
-      LLPC_OUTS("    stream " << i << " = " << streamItemSize);
+      LLPC_OUTS("    stream[" << i << "] = " << streamItemSize);
 
       if (m_pipelineState->enableXfb()) {
-        LLPC_OUTS(", XFB buffer = ");
         const auto &streamXfbBuffers = m_pipelineState->getStreamXfbBuffers();
-        for (unsigned j = 0; j < MaxTransformFeedbackBuffers; ++j) {
-          if ((streamXfbBuffers[i] & (1 << j)) != 0) {
-            LLPC_OUTS(j);
-            if (j != MaxTransformFeedbackBuffers - 1)
-              LLPC_OUTS(", ");
+        LLPC_OUTS(", XFB buffers = { ");
+        if (streamXfbBuffers[i] != 0) {
+          for (unsigned j = 0; j < MaxTransformFeedbackBuffers; ++j) {
+            if ((streamXfbBuffers[i] & (1 << j)) != 0)
+              LLPC_OUTS(j << " ");
           }
         }
+        LLPC_OUTS("}");
       }
 
       LLPC_OUTS("\n");
@@ -1355,16 +1341,15 @@ void PatchResourceCollect::visitCallInst(CallInst &callInst) {
   } else if (mangledName.startswith(lgcName::OutputExportXfb)) {
     auto outputValue = callInst.getArgOperand(callInst.arg_size() - 1);
     if (isa<UndefValue>(outputValue)) {
-      // NOTE: If an output value is undefined, we can safely drop it and remove the transform feedback output export
-      // call.
+      // NOTE: If an output value is undefined, we can safely drop it and remove the transform feedback export call.
       m_deadCalls.push_back(&callInst);
     } else if (m_pipelineState->enableSwXfb()) {
-      // Collect transform feedback output export calls, used in SW-emulated stream-out. For GS, the collecting will
+      // Collect transform feedback export calls, used in SW-emulated stream-out. For GS, the collecting will
       // be done when we generate copy shader since GS is primitive-based.
       if (m_shaderStage != ShaderStageGeometry) {
         auto &inOutUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage;
-        // A transform feedback output export call is expected to be <4 x dword> at most
-        inOutUsage.xfbOutputExpCount += outputValue->getType()->getPrimitiveSizeInBits() > 128 ? 2 : 1;
+        // A transform feedback export call is expected to be <4 x dword> at most
+        inOutUsage.xfbExpCount += outputValue->getType()->getPrimitiveSizeInBits() > 128 ? 2 : 1;
       }
     }
   }
@@ -1628,8 +1613,12 @@ void PatchResourceCollect::matchGenericInOut() {
 
   // Do input matching and location remapping
   bool packInput = m_pipelineState->canPackInput(m_shaderStage);
-  if (m_shaderStage == ShaderStageTessControl && m_tcsInputHasDynamicIndexing)
+  if (m_shaderStage == ShaderStageTessControl && m_tcsInputHasDynamicIndexing) {
     packInput = false;
+    // Disable to pack VS-TCS
+    m_pipelineState->setPackInput(m_shaderStage, false);
+    m_pipelineState->setPackOutput(ShaderStageVertex, false);
+  }
   if (packInput)
     updateInputLocInfoMapWithPack();
   else
@@ -1638,7 +1627,7 @@ void PatchResourceCollect::matchGenericInOut() {
   // Do output matching and location remapping
   bool packOutput = m_pipelineState->canPackOutput(m_shaderStage);
   if (m_shaderStage == ShaderStageVertex && m_tcsInputHasDynamicIndexing)
-    packOutput = false;
+    assert(!packOutput);
   if (packOutput) {
     // OutputLocInfoMap is used for computing the shader hash and looking remapped location
     updateOutputLocInfoMapWithPack();
@@ -2985,11 +2974,6 @@ void PatchResourceCollect::updateInputLocInfoMapWithPack() {
     InOutLocationInfo origLocInfo;
     origLocInfo.setLocation(cast<ConstantInt>(call->getOperand(0))->getZExtValue() + locOffset);
     origLocInfo.setComponent(cast<ConstantInt>(call->getOperand(compIdxArgIdx))->getZExtValue());
-    if (isFs && isInterpolant) {
-      const unsigned interpMode = cast<ConstantInt>(call->getOperand(3))->getZExtValue();
-      origLocInfo.setFlat(interpMode == InOutInfo::InterpModeFlat);
-      origLocInfo.setCustom(interpMode == InOutInfo::InterpModeCustom);
-    }
     InOutLocationInfoMap::const_iterator mapIter;
     assert(m_locationInfoMapManager->findMap(origLocInfo, mapIter));
     m_locationInfoMapManager->findMap(origLocInfo, mapIter);
@@ -3037,18 +3021,8 @@ void PatchResourceCollect::updateOutputLocInfoMapWithPack() {
       xfbOutputLocs[locInfo.getStreamId()].insert(locInfo.getLocation());
     }
 
-    // Collect flat-shading locations and custom interpolation locations
-    std::set<unsigned> flatInputLocs;
-    std::set<unsigned> customInputLocs;
-    for (const auto &locInfoPair : nextStageInputLocInfoMap) {
-      const auto &locInfo = locInfoPair.first;
-      if (locInfo.isFlat())
-        flatInputLocs.insert(locInfo.getLocation());
-      else if (locInfo.isCustom())
-        customInputLocs.insert(locInfo.getLocation());
-    }
-
-    // Add dead calls
+    // Store the output calls that have no corresponding input in FS
+    std::vector<CallInst *> noMappedCalls;
     for (auto call : m_outputCalls) {
       InOutLocationInfo origLocInfo;
       origLocInfo.setLocation(cast<ConstantInt>(call->getOperand(0))->getZExtValue());
@@ -3059,43 +3033,41 @@ void PatchResourceCollect::updateOutputLocInfoMapWithPack() {
         origLocInfo.setStreamId(streamId);
       }
       const unsigned origLocation = origLocInfo.getLocation();
-      bool isUsed = xfbOutputLocs[streamId].count(origLocation) > 0 || flatInputLocs.count(origLocation) > 0 ||
-                    customInputLocs.count(origLocation) > 0 || nextStageInputLocInfoMap.count(origLocInfo) > 0;
-      if (!isUsed)
-        m_deadCalls.push_back(call);
-    }
-
-    auto *locInfoMap = &nextStageInputLocInfoMap;
-
-    // If the outputs are allowed to have no matching inputs, such as XFB output and non-raster streams outputs, we
-    // should build the output map based on output info, otherwise, update the output map via the input map of the next
-    // stage.
-    if (xfbOutLocInfoMap.size() > 0 || xfbOutputLocs[1].size() > 0 || xfbOutputLocs[2].size() > 0 ||
-        xfbOutputLocs[3].size() > 0) {
-      std::vector<InOutLocationInfo> outLocInfos;
-      for (auto call : m_outputCalls) {
-        InOutLocationInfo origLocInfo;
-        origLocInfo.setLocation(cast<ConstantInt>(call->getOperand(0))->getZExtValue());
-        origLocInfo.setComponent(cast<ConstantInt>(call->getOperand(1))->getZExtValue());
-        if (m_shaderStage == ShaderStageGeometry)
-          origLocInfo.setStreamId(cast<ConstantInt>(call->getOperand(2))->getZExtValue());
-        if (flatInputLocs.count(origLocInfo.getLocation()))
-          origLocInfo.setFlat(true);
-        else if (customInputLocs.count(origLocInfo.getLocation()))
-          origLocInfo.setCustom(true);
-        outLocInfos.push_back(origLocInfo);
+      const bool hasNoMappedInput = (nextStageInputLocInfoMap.find(origLocInfo) == nextStageInputLocInfoMap.end());
+      if (hasNoMappedInput) {
+        if (xfbOutputLocs[streamId].count(origLocation) == 0)
+          m_deadCalls.push_back(call);
+        else
+          noMappedCalls.push_back(call);
       }
-      m_locationInfoMapManager->createMap(outLocInfos, m_shaderStage);
-      locInfoMap = &m_locationInfoMapManager->getMap();
     }
-
-    // Update the output map
-    for (auto &locInfoPair : *locInfoMap) {
+    // The output map of current stage contains at most two parts: the first part is consistent with FS input map and
+    // the second part is built from the no mapped calls.
+    std::vector<InOutLocationInfo> outLocInfos;
+    for (auto call : noMappedCalls) {
       InOutLocationInfo origLocInfo;
-      origLocInfo.setStreamId(locInfoPair.first.getStreamId());
-      origLocInfo.setLocation(locInfoPair.first.getLocation());
-      origLocInfo.setComponent(locInfoPair.first.getComponent());
-      outputLocInfoMap.insert({origLocInfo, locInfoPair.second});
+      origLocInfo.setLocation(cast<ConstantInt>(call->getOperand(0))->getZExtValue());
+      origLocInfo.setComponent(cast<ConstantInt>(call->getOperand(1))->getZExtValue());
+      if (m_shaderStage == ShaderStageGeometry)
+        origLocInfo.setStreamId(cast<ConstantInt>(call->getOperand(2))->getZExtValue());
+      outLocInfos.push_back(origLocInfo);
+    }
+    m_locationInfoMapManager->createMap(outLocInfos, m_shaderStage);
+    const auto &calcOutLocInfoMap = m_locationInfoMapManager->getMap();
+
+    outputLocInfoMap = nextStageInputLocInfoMap;
+    unsigned newLocMax = 0;
+    for (const auto &entry : outputLocInfoMap)
+      newLocMax = std::max(newLocMax, entry.second.getLocation() + 1);
+    // Update output map
+    for (const auto &entry : calcOutLocInfoMap) {
+      InOutLocationInfo origLocInfo;
+      origLocInfo.setStreamId(entry.first.getStreamId());
+      origLocInfo.setLocation(entry.first.getLocation());
+      origLocInfo.setComponent(entry.first.getComponent());
+      InOutLocationInfo newLocInfo(entry.second);
+      newLocInfo.setLocation(newLocInfo.getLocation() + newLocMax);
+      outputLocInfoMap.insert({origLocInfo, newLocInfo});
     }
 
     // update output count per stream for GS
@@ -3554,8 +3526,8 @@ void InOutLocationInfoMapManager::addSpan(CallInst *call, ShaderStage shaderStag
 
   if (isFs && isInterpolant) {
     const unsigned interpMode = cast<ConstantInt>(call->getOperand(3))->getZExtValue();
-    span.firstLocationInfo.setFlat(interpMode == InOutInfo::InterpModeFlat);
-    span.firstLocationInfo.setCustom(interpMode == InOutInfo::InterpModeCustom);
+    span.compatibilityInfo.isFlat = interpMode == InOutInfo::InterpModeFlat;
+    span.compatibilityInfo.isCustom = interpMode == InOutInfo::InterpModeCustom;
   }
   m_locationSpans.insert(span);
 }

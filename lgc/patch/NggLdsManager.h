@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2018-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2018-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -50,7 +50,7 @@ enum NggLdsRegionType {
   LdsRegionVertPosData,       // Vertex position data
   LdsRegionVertCullInfo,      // Vertex cull info
   LdsRegionXfbStatInfo,       // Transform feedback statistics info
-  LdsRegionVertCountInWaves,  // Vertex count accumulated per wave (8 potential waves) and per sub-group
+  LdsRegionVertCountInWaves,  // Vertex count accumulated per wave (8 potential waves) and per subgroup
   LdsRegionVertThreadIdMap,   // Vertex thread ID map (compacted -> uncompacted), for vertex compaction
 
   LdsRegionEsBeginRange = LdsRegionDistribPrimId,
@@ -61,9 +61,9 @@ enum NggLdsRegionType {
   //
   LdsRegionEsGsRing,            // ES-GS ring
   LdsRegionOutPrimData,         // GS output primitive data
-  LdsRegionOutPrimCountInWaves, // GS output primitive count accumulated per wave (8 potential waves) and per sub-group
+  LdsRegionOutPrimCountInWaves, // GS output primitive count accumulated per wave (8 potential waves) and per subgroup
   LdsRegionOutPrimThreadIdMap,  // GS output primitive thread ID map (compacted -> uncompacted)
-  LdsRegionOutVertCountInWaves, // GS output vertex count accumulated per wave (8 potential waves) and per sub-group
+  LdsRegionOutVertCountInWaves, // GS output vertex count accumulated per wave (8 potential waves) and per subgroup
   LdsRegionOutVertThreadIdMap,  // GS output vertex thread ID map (compacted -> uncompacted), for vertex compaction
   LdsRegionGsXfbStatInfo,       // GS transform feedback statistics info
   LdsRegionGsVsRing,            // GS-VS ring

@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2018-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2018-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -122,8 +122,6 @@ void PatchPeepholeOpt::visitIntToPtr(IntToPtrInst &intToPtr) {
 
   // Create a getelementptr instruction (using offset / size).
   const DataLayout &dataLayout = intToPtr.getModule()->getDataLayout();
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(intToPtr.getType(), elementType));
   const uint64_t size = dataLayout.getTypeAllocSize(elementType);
   APInt index = constOffset->getValue().udiv(size);
   if (constOffset->getValue().urem(size) != 0)

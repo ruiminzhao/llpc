@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -158,7 +158,7 @@ private:
 
   PipelineSystemValues m_pipelineSysValues; // Cache of ShaderSystemValues objects, one per shader stage
 
-  std::unique_ptr<llvm::IRBuilder<>> m_builder; // LLVM IR builder
+  llvm::IRBuilder<> m_builder; // LLVM IR builder
 
   // The wave/thread info used for control shader branching
   struct {

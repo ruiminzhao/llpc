@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -65,7 +65,5 @@ void redirectLogOutput(bool restoreToDefault, unsigned optionCount, const char *
 
 // Enable/disable the output for debugging.
 void enableDebugOutput(bool restore);
-
-bool GetOpaquePointersFlag();
 
 } // namespace Llpc

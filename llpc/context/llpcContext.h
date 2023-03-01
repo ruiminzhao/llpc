@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -39,6 +39,10 @@
 #include "llvm/Target/TargetMachine.h"
 #include <unordered_map>
 #include <unordered_set>
+
+namespace llvm_dialects {
+class DialectContext;
+}
 
 namespace Llpc {
 
@@ -130,6 +134,7 @@ private:
   std::unique_ptr<lgc::LgcContext> m_builderContext; // Builder context
 
   std::unique_ptr<llvm::TargetMachine> m_targetMachine; // Target machine
+  std::unique_ptr<llvm_dialects::DialectContext> m_dialectContext;
 
   unsigned m_useCount = 0; // Number of times this context is used.
 };

@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2018-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2018-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -87,7 +87,7 @@ bool SpirvLowerInstMetaRemove::runImpl(Module &module) {
 
   // Remove any named metadata in the module that starts "spirv.".
   SmallVector<NamedMDNode *, 8> nodesToRemove;
-  for (auto &namedMdNode : m_module->getNamedMDList()) {
+  for (auto &namedMdNode : m_module->named_metadata()) {
     if (namedMdNode.getName().startswith(gSPIRVMD::Prefix))
       nodesToRemove.push_back(&namedMdNode);
   }

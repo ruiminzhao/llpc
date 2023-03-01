@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -50,8 +50,8 @@ static const BuiltInKind BuiltInSamplePatternIdx = static_cast<BuiltInKind>(0x10
 static const BuiltInKind BuiltInGsWaveId = static_cast<BuiltInKind>(0x1000000A);
 
 // Internal builts-ins for compute input when thread id is swizzled
-static const BuiltInKind BuiltInHwLocalInvocationId = static_cast<BuiltInKind>(0x1000000B);
-static const BuiltInKind BuiltInHwLocalInvocationIndex = static_cast<BuiltInKind>(0x1000000C);
+static const BuiltInKind BuiltInUnswizzledLocalInvocationId = static_cast<BuiltInKind>(0x1000000B);
+static const BuiltInKind BuiltInUnswizzledLocalInvocationIndex = static_cast<BuiltInKind>(0x1000000C);
 
 // Names used for calls added to IR to represent various actions internally.
 namespace lgcName {
@@ -70,7 +70,6 @@ const static char OutputExportXfb[] = "lgc.output.export.xfb.";
 const static char TfBufferStore[] = "lgc.tfbuffer.store.";
 const static char StreamOutBufferStore[] = "lgc.streamoutbuffer.store";
 const static char ReconfigureLocalInvocationId[] = "lgc.reconfigure.local.invocation.id";
-const static char SwizzleLocalInvocationId[] = "lgc.swizzle.local.invocation.id";
 const static char SwizzleWorkgroupId[] = "lgc.swizzle.workgroup.id";
 
 const static char MeshTaskCallPrefix[] = "lgc.mesh.task.";
@@ -103,11 +102,6 @@ const static char SpecialUserData[] = "lgc.special.user.data.";
 // Get shader input. Arg is ShaderInput enum value.
 const static char ShaderInput[] = "lgc.shader.input.";
 
-const static char LaterCallPrefix[] = "lgc.late.";
-const static char LateLaunderFatPointer[] = "lgc.late.launder.fat.pointer";
-const static char LateBufferLength[] = "lgc.late.buffer.desc.length";
-const static char LateBufferPtrDiff[] = "lgc.late.buffer.ptrdiff";
-
 // Names of global variables
 const static char ImmutableSamplerGlobal[] = "lgc.immutable.sampler";
 const static char ImmutableConvertingSamplerGlobal[] = "lgc.immutable.converting.sampler";
@@ -116,30 +110,11 @@ const static char ImmutableConvertingSamplerGlobal[] = "lgc.immutable.converting
 const static char EsGsEntryPoint[] = "lgc.shader.ESGS.main";
 const static char LsHsEntryPoint[] = "lgc.shader.LSHS.main";
 
-const static char NggEsEntryPoint[] = "lgc.ngg.ES.main";
-const static char NggEsCullDataFetch[] = "lgc.ngg.ES.cull.data.fetch";
-const static char NggEsDeferredVertexExport[] = "lgc.ngg.ES.deferred.vertex.export";
-const static char NggEsXfbOutputFetch[] = "lgc.ngg.ES.xfb.output.fetch";
 const static char NggAttribExport[] = "lgc.ngg.attrib.export";
-const static char NggXfbOutputExport[] = "lgc.ngg.xfb.output.export.";
-
-const static char NggGsEntryPoint[] = "lgc.ngg.GS.main";
-const static char NggGsOutputExport[] = "lgc.ngg.GS.output.export.";
-const static char NggGsOutputImport[] = "lgc.ngg.GS.output.import.";
-const static char NggGsEmit[] = "lgc.ngg.GS.emit";
-const static char NggGsCut[] = "lgc.ngg.GS.cut";
-const static char NggGsXfbOutputFetch[] = "lgc.ngg.GS.xfb.output.fetch";
-
-const static char NggCopyShaderEntryPoint[] = "lgc.ngg.COPY.main";
+const static char NggXfbExport[] = "lgc.ngg.xfb.export.";
+const static char NggWriteGsOutput[] = "lgc.ngg.write.GS.output.";
+const static char NggReadGsOutput[] = "lgc.ngg.read.GS.output.";
 const static char NggPrimShaderEntryPoint[] = "lgc.shader.PRIM.main";
-
-const static char NggCullingFetchReg[] = "lgc.ngg.culling.fetchreg";
-const static char NggCullingBackface[] = "lgc.ngg.culling.backface";
-const static char NggCullingFrustum[] = "lgc.ngg.culling.frustum";
-const static char NggCullingBoxFilter[] = "lgc.ngg.culling.boxfilter";
-const static char NggCullingSphere[] = "lgc.ngg.culling.sphere";
-const static char NggCullingSmallPrimFilter[] = "lgc.ngg.culling.smallprimfilter";
-const static char NggCullingCullDistance[] = "lgc.ngg.culling.culldistance";
 
 const static char EntryPointPrefix[] = "lgc.shader.";
 const static char CopyShaderEntryPoint[] = "lgc.shader.COPY.main";

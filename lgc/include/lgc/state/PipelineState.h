@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -71,11 +71,10 @@ enum NggCompactMode : unsigned {
 
 // Represents NGG tuning options
 struct NggControl {
-  bool enableNgg;             // Enable NGG mode, use an implicit primitive shader
-  bool enableGsUse;           // Enable NGG use on geometry shader
-  NggCompactMode compactMode; // Compaction mode after culling operations
+  bool enableNgg;     // Enable NGG mode, use an implicit primitive shader
+  bool enableGsUse;   // Enable NGG use on geometry shader
+  bool compactVertex; // Enable vertex compaction after culling operations
 
-  bool enableVertexReuse;         // Enable optimization to cull duplicate vertices
   bool enableBackfaceCulling;     // Enable culling of primitives that don't meet facing criteria
   bool enableFrustumCulling;      // Enable discarding of primitives outside of view frustum
   bool enableBoxFilterCulling;    // Enable simpler frustum culler that is less accurate
@@ -90,15 +89,14 @@ struct NggControl {
                              // Only valid if the NGG backface culler is enabled.
                              // A value of 0 will disable the threshold.
 
-  NggSubgroupSizing subgroupSizing; // NGG sub-group sizing type
+  NggSubgroupSizing subgroupSizing; // NGG subgroup sizing type
 
   unsigned primsPerSubgroup; // Preferred number of GS primitives to pack into a primitive shader
-                             // sub-group
+                             // subgroup
 
-  unsigned vertsPerSubgroup; // Preferred number of vertices consumed by a primitive shader sub-group
+  unsigned vertsPerSubgroup; // Preferred number of vertices consumed by a primitive shader subgroup
 
-  bool passthroughMode;                          // Whether NGG passthrough mode is enabled
-  Util::Abi::PrimShaderCbLayout primShaderTable; // Primitive shader table (only some registers are used)
+  bool passthroughMode; // Whether NGG passthrough mode is enabled
 };
 
 // Represents transform feedback state metadata
@@ -302,6 +300,9 @@ public:
   // Checks if row export for mesh shader is enabled or not
   bool enableMeshRowExport() const;
 
+  // Checks if register field value format is used or not
+  bool useRegisterFieldFormat() const { return m_registerFieldFormat; }
+
   // Checks if SW-emulated stream-out should be enabled
   bool enableSwXfb();
 
@@ -378,6 +379,14 @@ public:
 
   // Get transform feedback buffers used for each stream
   std::array<int, MaxGsStreams> &getStreamXfbBuffers() { return m_xfbStateMetadata.streamXfbBuffers; }
+
+  // Set user data for a specific shader stage
+  void setUserDataMap(ShaderStage shaderStage, llvm::ArrayRef<unsigned> userDataValues) {
+    m_userDataMaps[shaderStage].append(userDataValues.begin(), userDataValues.end());
+  }
+
+  // Get user data for a specific shader stage
+  llvm::ArrayRef<unsigned> getUserDataMap(ShaderStage shaderStage) const { return m_userDataMaps[shaderStage]; }
 
   // -----------------------------------------------------------------------------------------------------------------
   // Utility method templates to read and write IR metadata, used by PipelineState and ShaderModes
@@ -511,6 +520,7 @@ private:
 
   bool m_gsOnChip = false;                                                     // Whether to use GS on-chip mode
   bool m_meshRowExport = false;                                                // Enable mesh shader row export or not
+  bool m_registerFieldFormat = false;                                          // Use register field format
   NggControl m_nggControl = {};                                                // NGG control settings
   ShaderModes m_shaderModes;                                                   // Shader modes for this pipeline
   unsigned m_deviceIndex = 0;                                                  // Device index
@@ -528,6 +538,7 @@ private:
   bool m_inputPackState[ShaderStageGfxCount] = {};  // The input packable state per shader stage
   bool m_outputPackState[ShaderStageGfxCount] = {}; // The output packable state per shader stage
   XfbStateMetadata m_xfbStateMetadata = {};         // Transform feedback state metadata
+  llvm::SmallVector<unsigned, 32> m_userDataMaps[ShaderStageCountInternal]; // The user data per-shader
 };
 
 // =====================================================================================================================

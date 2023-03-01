@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -435,27 +435,27 @@ void ConfigBuilder::buildPipelineNggVsFsRegConfig() {
   GfxIpVersion gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
   assert(gfxIp.major >= 10);
 
-  const auto nggControl = m_pipelineState->getNggControl();
-  assert(nggControl->enableNgg);
-
   PipelineNggVsFsRegConfig config(gfxIp);
 
-  addApiHwShaderMapping(ShaderStageVertex, Util::Abi::HwShaderGs);
   addApiHwShaderMapping(ShaderStageFragment, Util::Abi::HwShaderPs);
 
-  setPipelineType(Util::Abi::PipelineType::Ngg);
-
-  SET_REG_FIELD(&config, VGT_SHADER_STAGES_EN, MAX_PRIMGRP_IN_WAVE, 2);
-
-  SET_REG_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_EN, true);
-  SET_REG_GFX10_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_PASSTHRU_EN, nggControl->passthroughMode);
-  if (gfxIp.major >= 11) {
-    SET_REG_GFX10_4_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_PASSTHRU_NO_MSG,
-                               nggControl->passthroughMode && !m_pipelineState->enableSwXfb());
-    SET_REG_GFX10_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, NGG_WAVE_ID_EN, m_pipelineState->enableSwXfb());
-  }
-
   if (m_pipelineState->hasShaderStage(ShaderStageVertex)) {
+    const auto nggControl = m_pipelineState->getNggControl();
+    assert(nggControl->enableNgg);
+
+    addApiHwShaderMapping(ShaderStageVertex, Util::Abi::HwShaderGs);
+    setPipelineType(Util::Abi::PipelineType::Ngg);
+
+    SET_REG_FIELD(&config, VGT_SHADER_STAGES_EN, MAX_PRIMGRP_IN_WAVE, 2);
+
+    SET_REG_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_EN, true);
+    SET_REG_GFX10_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_PASSTHRU_EN, nggControl->passthroughMode);
+    if (gfxIp.major >= 11) {
+      SET_REG_GFX10_4_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, PRIMGEN_PASSTHRU_NO_MSG,
+                                 nggControl->passthroughMode && !m_pipelineState->enableSwXfb());
+      SET_REG_GFX10_PLUS_FIELD(&config, VGT_SHADER_STAGES_EN, NGG_WAVE_ID_EN, m_pipelineState->enableSwXfb());
+    }
+
     buildPrimShaderRegConfig<PipelineNggVsFsRegConfig>(ShaderStageVertex, ShaderStageInvalid, &config);
 
     SET_REG_FIELD(&config, VGT_SHADER_STAGES_EN, ES_EN, ES_STAGE_REAL);
@@ -472,24 +472,24 @@ void ConfigBuilder::buildPipelineNggVsFsRegConfig() {
     if (m_pipelineState->getTargetInfo().getGpuProperty().supportShaderPowerProfiling) {
       SET_REG_FIELD(&config.primShaderRegs, SPI_SHADER_PGM_CHKSUM_GS, CHECKSUM, checksum);
     }
+
+    regIA_MULTI_VGT_PARAM iaMultiVgtParam = {};
+
+    // When non-patch primitives are used without tessellation enabled, PRIMGROUP_SIZE must be at least 4,
+    // and must be even if there are more than 2 shader engines on the GPU.
+    unsigned primGroupSize = 128;
+    unsigned numShaderEngines = m_pipelineState->getTargetInfo().getGpuProperty().numShaderEngines;
+    if (numShaderEngines > 2)
+      primGroupSize = alignTo(primGroupSize, 2);
+
+    iaMultiVgtParam.bits.PRIMGROUP_SIZE = primGroupSize - 1;
+
+    SET_REG(&config, IA_MULTI_VGT_PARAM_PIPED, iaMultiVgtParam.u32All);
   }
 
   if (m_pipelineState->hasShaderStage(ShaderStageFragment)) {
     buildPsRegConfig<PipelineNggVsFsRegConfig>(ShaderStageFragment, &config);
   }
-
-  regIA_MULTI_VGT_PARAM iaMultiVgtParam = {};
-
-  // When non-patch primitives are used without tessellation enabled, PRIMGROUP_SIZE must be at least 4, and must be
-  // even if there are more than 2 shader engines on the GPU.
-  unsigned primGroupSize = 128;
-  unsigned numShaderEngines = m_pipelineState->getTargetInfo().getGpuProperty().numShaderEngines;
-  if (numShaderEngines > 2)
-    primGroupSize = alignTo(primGroupSize, 2);
-
-  iaMultiVgtParam.bits.PRIMGROUP_SIZE = primGroupSize - 1;
-
-  SET_REG(&config, IA_MULTI_VGT_PARAM_PIPED, iaMultiVgtParam.u32All);
 
   appendConfig(config);
 }
@@ -952,6 +952,8 @@ void ConfigBuilder::buildLsHsRegConfig(ShaderStage shaderStage1, ShaderStage sha
       lsVgprCompCnt = 3; // Enable all LS VGPRs (LS VGPR2 - VGPR5)
     else
       lsVgprCompCnt = 1; // Must enable relative vertex ID (LS VGPR2 and VGPR3)
+  } else {
+    llvm_unreachable("Not implemented!");
   }
   SET_REG_FIELD(&config->lsHsRegs, SPI_SHADER_PGM_RSRC1_HS, LS_VGPR_COMP_CNT, lsVgprCompCnt);
 
@@ -1010,8 +1012,8 @@ void ConfigBuilder::buildLsHsRegConfig(ShaderStage shaderStage1, ShaderStage sha
   // Minimum and maximum tessellation factors supported by the hardware.
   constexpr float minTessFactor = 1.0f;
   constexpr float maxTessFactor = 64.0f;
-  SET_REG(&config->lsHsRegs, VGT_HOS_MIN_TESS_LEVEL, FloatToBits(minTessFactor));
-  SET_REG(&config->lsHsRegs, VGT_HOS_MAX_TESS_LEVEL, FloatToBits(maxTessFactor));
+  SET_REG(&config->lsHsRegs, VGT_HOS_MIN_TESS_LEVEL, bit_cast<uint32_t>(minTessFactor));
+  SET_REG(&config->lsHsRegs, VGT_HOS_MAX_TESS_LEVEL, bit_cast<uint32_t>(maxTessFactor));
 
   // Set VGT_LS_HS_CONFIG
   SET_REG_FIELD(&config->lsHsRegs, VGT_LS_HS_CONFIG, NUM_PATCHES, calcFactor.patchCountPerThreadGroup);
@@ -1646,16 +1648,14 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
     spiPsInputCntl.bits.FLAT_SHADE = interpInfoElem.flat && !interpInfoElem.isPerPrimitive;
     spiPsInputCntl.bits.OFFSET = interpInfoElem.loc;
     if (gfxIp.major >= 11 && interpInfoElem.isPerPrimitive) {
-      const auto preStage = m_pipelineState->getPrevShaderStage(ShaderStageFragment);
-      if (preStage == ShaderStageMesh) {
-        // NOTE: HW allocates and manages attribute ring based on the register fields: VS_EXPORT_COUNT and
-        // PRIM_EXPORT_COUNT. When VS_EXPORT_COUNT = 0, HW assumes there is still a vertex attribute exported even
-        // though this is not what we want. Hence, we should reserve param0 as a dummy vertex attribute and all
-        // primitive attributes are moved after it.
-        bool hasNoVertexAttrib = m_pipelineState->getShaderResourceUsage(ShaderStageMesh)->inOutUsage.expCount == 0;
-        if (hasNoVertexAttrib)
-          ++spiPsInputCntl.bits.OFFSET;
-      }
+      // NOTE: HW allocates and manages attribute ring based on the register fields: VS_EXPORT_COUNT and
+      // PRIM_EXPORT_COUNT. When VS_EXPORT_COUNT = 0, HW assumes there is still a vertex attribute exported even
+      // though this is not what we want. Hence, we should reserve param0 as a dummy vertex attribute and all
+      // primitive attributes are moved after it.
+      const bool hasNoVertexAttrib = resUsage->inOutUsage.inputMapLocCount == 0; // No vertex attribute
+      if (hasNoVertexAttrib)
+        ++spiPsInputCntl.bits.OFFSET;
+
       spiPsInputCntl.gfx11.PRIM_ATTR = true;
     }
 
@@ -1916,19 +1916,14 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   unsigned workgroupSizes[3] = {};
   if (shaderStage == ShaderStageCompute) {
     const auto &builtInUsage = resUsage->builtInUsage.cs;
-    switch (static_cast<WorkgroupLayout>(builtInUsage.workgroupLayout)) {
-    case WorkgroupLayout::Unknown:
-    case WorkgroupLayout::Linear:
-      workgroupSizes[0] = computeMode.workgroupSizeX;
-      workgroupSizes[1] = computeMode.workgroupSizeY;
-      workgroupSizes[2] = computeMode.workgroupSizeZ;
-      break;
-    case WorkgroupLayout::Quads:
-    case WorkgroupLayout::SexagintiQuads:
+    if (builtInUsage.foldWorkgroupXY) {
       workgroupSizes[0] = computeMode.workgroupSizeX * computeMode.workgroupSizeY;
       workgroupSizes[1] = computeMode.workgroupSizeZ;
       workgroupSizes[2] = 1;
-      break;
+    } else {
+      workgroupSizes[0] = computeMode.workgroupSizeX;
+      workgroupSizes[1] = computeMode.workgroupSizeY;
+      workgroupSizes[2] = computeMode.workgroupSizeZ;
     }
   } else {
     assert(shaderStage == ShaderStageTask);

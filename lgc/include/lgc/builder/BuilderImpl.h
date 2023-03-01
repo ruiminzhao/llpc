@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -292,7 +292,7 @@ public:
 
   // Create a load of a buffer descriptor.
   llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
-                                    llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
+                                    const llvm::Twine &instName) override final;
 
   // Create a get of the stride (in bytes) of a descriptor.
   llvm::Value *CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
@@ -304,14 +304,6 @@ public:
 
   // Create a load of the push constants pointer.
   llvm::Value *CreateLoadPushConstantsPtr(llvm::Type *returnTy, const llvm::Twine &instName) override final;
-
-  // Create a buffer length query based on the specified descriptor.
-  llvm::Value *CreateGetBufferDescLength(llvm::Value *const bufferDesc, llvm::Value *offset,
-                                         const llvm::Twine &instName = "") override final;
-
-  // Return the i64 difference between two pointers, dividing out the size of the pointed-to objects.
-  llvm::Value *CreatePtrDiff(llvm::Type *ty, llvm::Value *lhs, llvm::Value *rhs,
-                             const llvm::Twine &instName = "") override final;
 
 private:
   DescBuilder() = delete;
@@ -517,8 +509,8 @@ public:
 
   // Create a write to an XFB (transform feedback / streamout) buffer.
   llvm::Instruction *CreateWriteXfbOutput(llvm::Value *valueToWrite, bool isBuiltIn, unsigned location,
-                                          unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
-                                          InOutInfo outputInfo) override final;
+                                          unsigned component, unsigned xfbBuffer, unsigned xfbStride,
+                                          llvm::Value *xfbOffset, InOutInfo outputInfo) override final;
 
   // Create a read of barycoord input value.
   llvm::Value *CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
@@ -680,6 +672,9 @@ public:
 
   // Create a "kill". Only allowed in a fragment shader.
   llvm::Instruction *CreateKill(const llvm::Twine &instName) override final;
+
+  // Create a "debug break".
+  llvm::Instruction *CreateDebugBreak(const llvm::Twine &instName) override final;
 
   // Create a "readclock".
   llvm::Instruction *CreateReadClock(bool realtime, const llvm::Twine &instName) override final;

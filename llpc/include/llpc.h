@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2016-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -44,7 +44,9 @@ using Vkgc::FsOutInfo;
 using Vkgc::GfxIpVersion;
 using Vkgc::GraphicsPipelineBuildInfo;
 using Vkgc::MaxColorTargets;
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION > 60
 using Vkgc::NggCompactDisable;
+#endif
 using Vkgc::NggSubgroupSizingType;
 using Vkgc::OutputAllocFunc;
 using Vkgc::PipelineOptions;

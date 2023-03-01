@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -31,9 +31,11 @@
 #include "lgc/patch/PatchBufferOp.h"
 #include "lgc/Builder.h"
 #include "lgc/LgcContext.h"
+#include "lgc/LgcDialect.h"
 #include "lgc/state/IntrinsDefs.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
+#include "llvm-dialects/Dialect/Visitor.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -82,6 +84,7 @@ bool PatchBufferOp::runImpl(Function &function, PipelineState *pipelineState,
   m_pipelineState = pipelineState;
   m_isDivergent = std::move(isDivergent);
   m_context = &function.getContext();
+  m_offsetType = PointerType::get(*m_context, ADDR_SPACE_CONST_32BIT);
 
   IRBuilder<> builder(*m_context);
   m_builder = &builder;
@@ -441,15 +444,7 @@ void PatchBufferOp::visitBitCastInst(BitCastInst &bitCastInst) {
   if (destType->getPointerAddressSpace() != ADDR_SPACE_BUFFER_FAT_POINTER)
     return;
 
-  m_builder->SetInsertPoint(&bitCastInst);
-
-  Replacement pointer = getRemappedValue(bitCastInst.getOperand(0));
-
-  Value *const newBitCast = m_builder->CreateBitCast(pointer.second, getRemappedType(bitCastInst.getDestTy()));
-
-  copyMetadata(newBitCast, &bitCastInst);
-
-  m_replacementMap[&bitCastInst] = std::make_pair(pointer.first, newBitCast);
+  m_replacementMap[&bitCastInst] = getRemappedValue(bitCastInst.getOperand(0));
 }
 
 // =====================================================================================================================
@@ -457,105 +452,68 @@ void PatchBufferOp::visitBitCastInst(BitCastInst &bitCastInst) {
 //
 // @param callInst : The instruction
 void PatchBufferOp::visitCallInst(CallInst &callInst) {
-  Function *const calledFunc = callInst.getCalledFunction();
+  static auto visitor =
+      llvm_dialects::VisitorBuilder<PatchBufferOp>()
+          .add<BufferDescToPtrOp>([](PatchBufferOp &self, BufferDescToPtrOp &descToPtr) {
+            Constant *const nullPointer = ConstantPointerNull::get(self.m_offsetType);
+            self.m_replacementMap[&descToPtr] = std::make_pair(descToPtr.getDesc(), nullPointer);
 
-  // If the call does not have a called function, bail.
-  if (!calledFunc)
-    return;
+            // Check for any invariant starts that use the pointer.
+            if (self.removeUsersForInvariantStarts(&descToPtr))
+              self.m_invariantSet.insert(descToPtr.getDesc());
 
-  const StringRef callName(calledFunc->getName());
+            // If the incoming index to the fat pointer launder was divergent, remember it.
+            if (self.m_isDivergent(*descToPtr.getDesc()))
+              self.m_divergenceSet.insert(descToPtr.getDesc());
+          })
+          .add<BufferLengthOp>([](PatchBufferOp &self, BufferLengthOp &bufferLength) {
+            Replacement pointer = self.getRemappedValue(bufferLength.getPointer());
 
-  // If the call is not a late intrinsic call we need to replace, bail.
-  if (!callName.startswith(lgcName::LaterCallPrefix))
-    return;
+            // Extract element 2 which is the NUM_RECORDS field from the buffer descriptor.
+            Value *const bufferDesc = pointer.first;
+            Value *numRecords = self.m_builder->CreateExtractElement(bufferDesc, 2);
+            Value *offset = bufferLength.getOffset();
+
+            // If null descriptors are allowed, we must guarantee a 0 result for a null buffer descriptor.
+            //
+            // What we implement here is in fact more robust: ensure that the subtraction of the offset is clamped to 0.
+            // The backend should be able to achieve this with a single additional ALU instruction (e.g. s_max_u32).
+            if (self.m_pipelineState->getOptions().allowNullDescriptor) {
+              Value *const underflow = self.m_builder->CreateICmpUGT(offset, numRecords);
+              numRecords = self.m_builder->CreateSelect(underflow, offset, numRecords);
+            }
+
+            numRecords = self.m_builder->CreateSub(numRecords, offset);
+
+            // Record the call instruction so we remember to delete it later.
+            self.m_replacementMap[&bufferLength] = std::make_pair(nullptr, nullptr);
+
+            bufferLength.replaceAllUsesWith(numRecords);
+          })
+          .add<BufferPtrDiffOp>([](PatchBufferOp &self, BufferPtrDiffOp &ptrDiff) {
+            Value *const lhs = ptrDiff.getLhs();
+            Value *const rhs = ptrDiff.getRhs();
+
+            Value *const lhsPtrToInt =
+                self.m_builder->CreatePtrToInt(self.getRemappedValue(lhs).second, self.m_builder->getInt32Ty());
+            Value *const rhsPtrToInt =
+                self.m_builder->CreatePtrToInt(self.getRemappedValue(rhs).second, self.m_builder->getInt32Ty());
+
+            self.copyMetadata(lhsPtrToInt, lhs);
+            self.copyMetadata(rhsPtrToInt, rhs);
+
+            Value *difference = self.m_builder->CreateSub(lhsPtrToInt, rhsPtrToInt);
+            difference = self.m_builder->CreateSExt(difference, self.m_builder->getInt64Ty());
+
+            // Record the call instruction so we remember to delete it later.
+            self.m_replacementMap[&ptrDiff] = std::make_pair(nullptr, nullptr);
+
+            ptrDiff.replaceAllUsesWith(difference);
+          })
+          .build();
 
   m_builder->SetInsertPoint(&callInst);
-
-  if (callName.equals(lgcName::LateLaunderFatPointer)) {
-    Constant *const nullPointer = ConstantPointerNull::get(getRemappedType(callInst.getType()));
-    m_replacementMap[&callInst] = std::make_pair(callInst.getArgOperand(0), nullPointer);
-
-    // Check for any invariant starts that use the pointer.
-    if (removeUsersForInvariantStarts(&callInst))
-      m_invariantSet.insert(callInst.getArgOperand(0));
-
-    // If the incoming index to the fat pointer launder was divergent, remember it.
-    if (m_isDivergent(*callInst.getArgOperand(0)))
-      m_divergenceSet.insert(callInst.getArgOperand(0));
-  } else if (callName.startswith(lgcName::LateBufferLength)) {
-    Replacement pointer = getRemappedValue(callInst.getArgOperand(0));
-
-    // Extract element 2 which is the NUM_RECORDS field from the buffer descriptor.
-    Value *const bufferDesc = pointer.first;
-    Value *numRecords = m_builder->CreateExtractElement(bufferDesc, 2);
-    Value *offset = callInst.getArgOperand(1);
-
-    // If null descriptors are allowed, we must guarantee a 0 result for a null buffer descriptor.
-    //
-    // What we implement here is in fact more robust: ensure that the subtraction of the offset is clamped to 0.
-    // The backend should be able to achieve this with a single additional ALU instruction (e.g. s_max_u32).
-    if (m_pipelineState->getOptions().allowNullDescriptor) {
-      Value *const underflow = m_builder->CreateICmpUGT(offset, numRecords);
-      numRecords = m_builder->CreateSelect(underflow, offset, numRecords);
-    }
-
-    numRecords = m_builder->CreateSub(numRecords, offset);
-
-    // Record the call instruction so we remember to delete it later.
-    m_replacementMap[&callInst] = std::make_pair(nullptr, nullptr);
-
-    callInst.replaceAllUsesWith(numRecords);
-  } else if (callName.startswith(lgcName::LateBufferPtrDiff)) {
-    Type *const ty = callInst.getArgOperand(0)->getType();
-    Value *const lhs = callInst.getArgOperand(1);
-    Value *const rhs = callInst.getArgOperand(2);
-
-    assert(lhs->getType()->isPointerTy() && lhs->getType()->getPointerAddressSpace() == ADDR_SPACE_BUFFER_FAT_POINTER &&
-           rhs->getType()->isPointerTy() && rhs->getType()->getPointerAddressSpace() == ADDR_SPACE_BUFFER_FAT_POINTER &&
-           "Argument to BufferPtrDiff is not a buffer fat pointer");
-
-    Value *const lhsPtrToInt = m_builder->CreatePtrToInt(getRemappedValue(lhs).second, m_builder->getInt64Ty());
-    Value *const rhsPtrToInt = m_builder->CreatePtrToInt(getRemappedValue(rhs).second, m_builder->getInt64Ty());
-
-    copyMetadata(lhsPtrToInt, lhs);
-    copyMetadata(rhsPtrToInt, rhs);
-
-    Value *const difference = m_builder->CreateSub(lhsPtrToInt, rhsPtrToInt);
-    Constant *const size = ConstantExpr::getSizeOf(ty);
-    Value *const elementDifference = m_builder->CreateExactSDiv(difference, size);
-
-    // Record the call instruction so we remember to delete it later.
-    m_replacementMap[&callInst] = std::make_pair(nullptr, nullptr);
-
-    callInst.replaceAllUsesWith(elementDifference);
-  } else
-    llvm_unreachable("Should never be called!");
-}
-
-// =====================================================================================================================
-// Visits "extractelement" instruction.
-//
-// @param extractElementInst : The instruction
-void PatchBufferOp::visitExtractElementInst(ExtractElementInst &extractElementInst) {
-  PointerType *const pointerType = dyn_cast<PointerType>(extractElementInst.getType());
-
-  // If the extract element is not extracting a pointer, bail.
-  if (!pointerType)
-    return;
-
-  // If the type we are GEPing into is not a fat pointer, bail.
-  if (pointerType->getAddressSpace() != ADDR_SPACE_BUFFER_FAT_POINTER)
-    return;
-
-  m_builder->SetInsertPoint(&extractElementInst);
-
-  Replacement pointer = getRemappedValue(extractElementInst.getVectorOperand());
-  Value *const index = extractElementInst.getIndexOperand();
-
-  Value *const pointerElem = m_builder->CreateExtractElement(pointer.second, index);
-  copyMetadata(pointerElem, &extractElementInst);
-
-  m_replacementMap[&extractElementInst] = std::make_pair(pointer.first, pointerElem);
+  visitor.visit(*this, callInst);
 }
 
 // =====================================================================================================================
@@ -576,7 +534,6 @@ void PatchBufferOp::visitGetElementPtrInst(GetElementPtrInst &getElemPtrInst) {
   Value *newGetElemPtr = nullptr;
   auto getElemPtrPtr = pointer.second;
   auto getElemPtrEltTy = getElemPtrInst.getSourceElementType();
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(getElemPtrPtr->getType()->getScalarType(), getElemPtrEltTy));
 
   if (getElemPtrInst.isInBounds())
     newGetElemPtr = m_builder->CreateInBoundsGEP(getElemPtrEltTy, getElemPtrPtr, indices);
@@ -586,46 +543,6 @@ void PatchBufferOp::visitGetElementPtrInst(GetElementPtrInst &getElemPtrInst) {
   copyMetadata(newGetElemPtr, &getElemPtrInst);
 
   m_replacementMap[&getElemPtrInst] = std::make_pair(pointer.first, newGetElemPtr);
-}
-
-// =====================================================================================================================
-// Visits "insertelement" instruction.
-//
-// @param insertElementInst : The instruction
-void PatchBufferOp::visitInsertElementInst(InsertElementInst &insertElementInst) {
-  Type *const type = insertElementInst.getType();
-
-  // If the type is not a vector, bail.
-  if (!type->isVectorTy())
-    return;
-
-  PointerType *const pointerType = dyn_cast<PointerType>(cast<VectorType>(type)->getElementType());
-
-  // If the extract element is not extracting from a vector of pointers, bail.
-  if (!pointerType)
-    return;
-
-  // If the type we are GEPing into is not a fat pointer, bail.
-  if (pointerType->getAddressSpace() != ADDR_SPACE_BUFFER_FAT_POINTER)
-    return;
-
-  m_builder->SetInsertPoint(&insertElementInst);
-
-  Replacement pointer = getRemappedValue(insertElementInst.getOperand(1));
-  Value *const index = pointer.second;
-
-  Value *indexVector = nullptr;
-
-  if (isa<UndefValue>(insertElementInst.getOperand(0)))
-    indexVector =
-        UndefValue::get(FixedVectorType::get(index->getType(), cast<FixedVectorType>(type)->getNumElements()));
-  else
-    indexVector = getRemappedValue(insertElementInst.getOperand(0)).second;
-
-  indexVector = m_builder->CreateInsertElement(indexVector, index, insertElementInst.getOperand(2));
-  copyMetadata(indexVector, &insertElementInst);
-
-  m_replacementMap[&insertElementInst] = std::make_pair(pointer.first, indexVector);
 }
 
 // =====================================================================================================================
@@ -663,7 +580,7 @@ void PatchBufferOp::visitLoadInst(LoadInst &loadInst) {
     newLoad->setSyncScopeID(loadInst.getSyncScopeID());
     copyMetadata(newLoad, &loadInst);
 
-    Constant *const nullPointer = ConstantPointerNull::get(getRemappedType(loadType));
+    Constant *const nullPointer = ConstantPointerNull::get(m_offsetType);
 
     m_replacementMap[&loadInst] = std::make_pair(newLoad, nullPointer);
 
@@ -848,7 +765,7 @@ void PatchBufferOp::visitPHINode(PHINode &phiNode) {
       m_divergenceSet.insert(bufferDesc);
   }
 
-  PHINode *const newPhiNode = m_builder->CreatePHI(getRemappedType(phiNode.getType()), incomings.size());
+  PHINode *const newPhiNode = m_builder->CreatePHI(m_offsetType, incomings.size());
   copyMetadata(newPhiNode, &phiNode);
 
   m_replacementMap[&phiNode] = std::make_pair(bufferDesc, newPhiNode);
@@ -1058,7 +975,6 @@ void PatchBufferOp::postVisitMemCpyInst(MemCpyInst &memCpyInst) {
         makeLoop(ConstantInt::get(lengthType, 0), length, ConstantInt::get(lengthType, stride), &memCpyInst);
 
     // Get the current index into our source pointer.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(src->getType()->getScalarType(), m_builder->getInt8Ty()));
     Value *const srcPtr = m_builder->CreateGEP(m_builder->getInt8Ty(), src, index);
     copyMetadata(srcPtr, &memCpyInst);
 
@@ -1070,7 +986,6 @@ void PatchBufferOp::postVisitMemCpyInst(MemCpyInst &memCpyInst) {
     copyMetadata(srcLoad, &memCpyInst);
 
     // Get the current index into our destination pointer.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(dest->getType()->getScalarType(), m_builder->getInt8Ty()));
     Value *const destPtr = m_builder->CreateGEP(m_builder->getInt8Ty(), dest, index);
     copyMetadata(destPtr, &memCpyInst);
 
@@ -1207,7 +1122,6 @@ void PatchBufferOp::postVisitMemSetInst(MemSetInst &memSetInst) {
         makeLoop(ConstantInt::get(lengthType, 0), length, ConstantInt::get(lengthType, stride), &memSetInst);
 
     // Get the current index into our destination pointer.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(dest->getType()->getScalarType(), m_builder->getInt8Ty()));
     Value *const destPtr = m_builder->CreateGEP(m_builder->getInt8Ty(), dest, index);
     copyMetadata(destPtr, &memSetInst);
 
@@ -1279,7 +1193,7 @@ PatchBufferOp::Replacement PatchBufferOp::getRemappedValueOrNull(Value *value) c
   }
 
   // Otherwise the value is a constant. Assume it is a null pointer and remap its type.
-  Constant *nullPointer = ConstantPointerNull::get(getRemappedType(value->getType()));
+  Constant *nullPointer = ConstantPointerNull::get(m_offsetType);
   return std::make_pair(nullptr, nullPointer);
 }
 
@@ -1335,16 +1249,6 @@ void PatchBufferOp::copyMetadata(Value *const dest, const Value *const src) cons
 
   for (auto metaNode : allMetaNodes)
     destInst->setMetadata(metaNode.first, metaNode.second);
-}
-
-// =====================================================================================================================
-// Get the remapped type for a fat pointer that is usable in indexing. We use the 32-bit wide constant address space for
-// this, as it means when we convert the GEP to an integer, the GEP can be converted losslessly to a 32-bit integer,
-// which just happens to be what the MUBUF instructions expect.
-//
-// @param type : The type to remap.
-PointerType *PatchBufferOp::getRemappedType(Type *const type) const {
-  return PointerType::getWithSamePointeeType(cast<PointerType>(type), ADDR_SPACE_CONST_32BIT);
 }
 
 // =====================================================================================================================

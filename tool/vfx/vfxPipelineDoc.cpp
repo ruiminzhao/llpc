@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -241,7 +241,6 @@ VfxPipelineStatePtr PipelineDocument::getDocument() {
       auto shaderSection = reinterpret_cast<SectionShader *>(m_sections[SectionTypeShader][i]);
       auto shaderInfoSection = reinterpret_cast<SectionShaderInfo *>(m_sections[SectionTypeShaderInfo][i]);
       VFX_ASSERT(shaderSection->getShaderStage() == shaderInfoSection->getShaderStage());
-      auto stage = shaderSection->getShaderStage();
 
       shaderSections[m_sections[SectionTypeShader][i]->getLineNum()] =
           std::pair<SectionShader *, SectionShaderInfo *>(shaderSection, shaderInfoSection);
@@ -518,6 +517,7 @@ void PipelineDocument::DeduplicateResourceMappingData(Vkgc::ResourceMappingData 
     auto iter = staticMap.find(key);
     if (iter == staticMap.end()) {
       auto result = staticMap.insert({key, descriptorRangeValue});
+      (void)result;
       VFX_ASSERT(result.second);
     } else {
       iter->second.visibility |= descriptorRangeValue.visibility;

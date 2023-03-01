@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -397,12 +397,10 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
 
   // Replayer implementations of DescBuilder methods
   case BuilderRecorder::Opcode::LoadBufferDesc: {
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(call->getType(), m_builder->getInt8Ty()));
-    return m_builder->CreateLoadBufferDesc(cast<ConstantInt>(args[0])->getZExtValue(), // descSet
-                                           cast<ConstantInt>(args[1])->getZExtValue(), // binding
-                                           args[2],                                    // descIndex
-                                           cast<ConstantInt>(args[3])->getZExtValue(), // flags
-                                           m_builder->getInt8Ty());                    // pointeeTy
+    return m_builder->CreateLoadBufferDesc(cast<ConstantInt>(args[0])->getZExtValue(),  // descSet
+                                           cast<ConstantInt>(args[1])->getZExtValue(),  // binding
+                                           args[2],                                     // descIndex
+                                           cast<ConstantInt>(args[3])->getZExtValue()); // flags
   }
 
   case BuilderRecorder::Opcode::GetDescStride:
@@ -421,17 +419,6 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
 
   case BuilderRecorder::Opcode::LoadPushConstantsPtr: {
     return m_builder->CreateLoadPushConstantsPtr(call->getType()); // returnTy
-  }
-
-  case BuilderRecorder::Opcode::GetBufferDescLength: {
-    return m_builder->CreateGetBufferDescLength(args[0],  // buffer descriptor
-                                                args[1]); // offset
-  }
-
-  case BuilderRecorder::Opcode::PtrDiff: {
-    return m_builder->CreatePtrDiff(args[0]->getType(), // ty
-                                    args[1],            // lhs
-                                    args[2]);           // rhs
   }
 
   // Replayer implementations of ImageBuilder methods
@@ -617,13 +604,14 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   }
 
   case BuilderRecorder::Opcode::WriteXfbOutput: {
-    InOutInfo outputInfo(cast<ConstantInt>(args[6])->getZExtValue());
+    InOutInfo outputInfo(cast<ConstantInt>(args[7])->getZExtValue());
     return m_builder->CreateWriteXfbOutput(args[0],                                    // Value to write
                                            cast<ConstantInt>(args[1])->getZExtValue(), // IsBuiltIn
                                            cast<ConstantInt>(args[2])->getZExtValue(), // Location/builtIn
-                                           cast<ConstantInt>(args[3])->getZExtValue(), // XFB buffer ID
-                                           cast<ConstantInt>(args[4])->getZExtValue(), // XFB stride
-                                           args[5],                                    // XFB byte offset
+                                           cast<ConstantInt>(args[3])->getZExtValue(), // Component
+                                           cast<ConstantInt>(args[4])->getZExtValue(), // XFB buffer ID
+                                           cast<ConstantInt>(args[5])->getZExtValue(), // XFB stride
+                                           args[6],                                    // XFB byte offset
                                            outputInfo);
   }
 
@@ -726,6 +714,9 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
   }
   case BuilderRecorder::Opcode::IsHelperInvocation: {
     return m_builder->CreateIsHelperInvocation();
+  }
+  case BuilderRecorder::Opcode::DebugBreak: {
+    return m_builder->CreateDebugBreak();
   }
   case BuilderRecorder::Opcode::EmitMeshTasks: {
     return m_builder->CreateEmitMeshTasks(args[0], args[1], args[2]);

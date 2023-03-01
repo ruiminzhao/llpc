@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -93,6 +93,14 @@ Instruction *MiscBuilder::CreateKill(const Twine &instName) {
   resUsage->builtInUsage.fs.discard = true;
 
   return CreateIntrinsic(Intrinsic::amdgcn_kill, {}, getFalse(), nullptr, instName);
+}
+
+// =====================================================================================================================
+// Create a "system halt"
+//
+// @param instName : Name to give instruction(s)
+Instruction *MiscBuilder::CreateDebugBreak(const Twine &instName) {
+  return CreateIntrinsic(Intrinsic::amdgcn_s_sethalt, {}, getInt32(1), nullptr, instName);
 }
 
 // =====================================================================================================================

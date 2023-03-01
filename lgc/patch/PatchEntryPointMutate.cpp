@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -69,6 +69,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <optional>
 
 #define DEBUG_TYPE "lgc-patch-entry-point-mutate"
 
@@ -357,13 +358,20 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
           // index.
           const ResourceNode *node;
           node = m_pipelineState->findResourceNode(searchType, set, binding).first;
+          if (!node) {
+            // Handle mutable descriptors
+            node = m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, set, binding).first;
+          }
           assert(node && "Could not find resource node");
           uint32_t descTableIndex = node - &m_pipelineState->getUserDataNodes().front();
           descriptorTable.resize(std::max(descriptorTable.size(), size_t(descTableIndex + 1)));
           descriptorTable[descTableIndex].users.push_back(call);
         }
       }
-    } else if (func.getName().startswith(lgcName::OutputExportXfb) && !func.use_empty()) {
+    } else if ((func.getName().startswith(lgcName::OutputExportXfb) && !func.use_empty()) ||
+               m_pipelineState->enableSwXfb()) {
+      // NOTE: For GFX11+, SW emulated stream-out will always use stream-out buffer descriptors and stream-out buffer
+      // offsets to calculate numbers of written primitives/dwords and update the counters.  auto lastVertexStage =
       auto lastVertexStage = m_pipelineState->getLastVertexProcessingStage();
       lastVertexStage = lastVertexStage == ShaderStageCopyShader ? ShaderStageGeometry : lastVertexStage;
       getUserDataUsage(lastVertexStage)->usesStreamOutTable = true;
@@ -1004,8 +1012,9 @@ uint64_t PatchEntryPointMutate::generateEntryPointArgTys(ShaderInputs *shaderInp
       unsigned numEntries = isSystemUserData ? 1 : dwordSize;
       assert((!isUnlinkedDescriptorSetValue(userDataArg.userDataValue) || dwordSize == 1) &&
              "Expecting descriptor set values to be one dword.  The linker cannot handle anything else.");
-      m_pipelineState->getPalMetadata()->setUserDataEntry(m_shaderStage, userDataIdx, userDataArg.userDataValue,
-                                                          numEntries);
+      if (!m_pipelineState->useRegisterFieldFormat())
+        m_pipelineState->getPalMetadata()->setUserDataEntry(m_shaderStage, userDataIdx, userDataArg.userDataValue,
+                                                            numEntries);
       if (isSystemUserData) {
         unsigned index = userDataArg.userDataValue - static_cast<unsigned>(UserDataMapping::GlobalTable);
         auto &specialUserData = getUserDataUsage(m_shaderStage)->specialUserData;
@@ -1042,6 +1051,32 @@ uint64_t PatchEntryPointMutate::generateEntryPointArgTys(ShaderInputs *shaderInp
 
   // Push the fixed system (not user data) register args.
   inRegMask |= shaderInputs->getShaderArgTys(m_pipelineState, m_shaderStage, argTys, argNames, argOffset);
+
+  if (m_pipelineState->useRegisterFieldFormat()) {
+    constexpr unsigned NumUserSgprs = 32;
+    unsigned numUserDataSgprs = 16;
+    if (m_pipelineState->getTargetInfo().getGfxIpVersion().major >= 9 && m_shaderStage != ShaderStageCompute &&
+        m_shaderStage != ShaderStageTask)
+      numUserDataSgprs = 32;
+
+    constexpr unsigned InvalidMapVal = static_cast<unsigned>(UserDataMapping::Invalid);
+    SmallVector<unsigned, NumUserSgprs> userDataMap;
+    userDataMap.resize(NumUserSgprs, InvalidMapVal);
+    userDataIdx = 0;
+    for (const auto &userDataArg : unspilledArgs) {
+      unsigned dwordSize = userDataArg.argDwordSize;
+      if (userDataArg.userDataValue != InvalidMapVal) {
+        bool isSystemUserData = isSystemUserDataValue(userDataArg.userDataValue);
+        unsigned numEntries = isSystemUserData ? 1 : dwordSize;
+        unsigned userDataValue = userDataArg.userDataValue;
+        unsigned idx = userDataIdx;
+        while (numEntries--)
+          userDataMap[idx++] = userDataValue++;
+      }
+      userDataIdx += dwordSize;
+    }
+    m_pipelineState->setUserDataMap(m_shaderStage, userDataMap);
+  }
 
   return inRegMask;
 }
@@ -1491,7 +1526,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
                                                            IRBuilder<> &builder,
                                                            SmallVectorImpl<UserDataArg> &unspilledArgs) {
 
-  Optional<UserDataArg> spillTableArg;
+  std::optional<UserDataArg> spillTableArg;
 
   auto userDataUsage = getUserDataUsage(m_shaderStage);
   if (!userDataUsage->spillTable.users.empty() || userDataUsage->pushConstSpill ||

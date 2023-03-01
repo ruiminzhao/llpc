@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -706,7 +706,7 @@ public:
   };
 
   // Get the type of pointer returned by CreateLoadBufferDesc.
-  llvm::PointerType *getBufferDescTy(llvm::Type *pointeeTy);
+  llvm::PointerType *getBufferDescTy();
 
   // Create a load of a buffer descriptor.
   //
@@ -717,10 +717,9 @@ public:
   // @param binding : Descriptor binding
   // @param descIndex : Descriptor index
   // @param flags : BufferFlag* bit settings
-  // @param pointeeTy : Type that the returned pointer should point to.
   // @param instName : Name to give instruction(s)
   virtual llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
-                                            llvm::Type *pointeeTy, const llvm::Twine &instName = "") = 0;
+                                            const llvm::Twine &instName = "") = 0;
 
   // Get the type of a descriptor
   //
@@ -765,25 +764,6 @@ public:
   // @param returnTy : Return type of the load
   // @param instName : Name to give instruction(s)
   virtual llvm::Value *CreateLoadPushConstantsPtr(llvm::Type *returnTy, const llvm::Twine &instName = "") = 0;
-
-  // Create a buffer length query based on the specified descriptor, subtracting an offset from the length. The result
-  // is 0 for a null descriptor when allowNullDescriptor is enabled.
-  //
-  // @param bufferDesc : The buffer descriptor to query.
-  // @param offset: The offset to subtract from the buffer length.
-  // @param instName : Name to give instruction(s)
-  virtual llvm::Value *CreateGetBufferDescLength(llvm::Value *const bufferDesc, llvm::Value *offset,
-                                                 const llvm::Twine &instName = "") = 0;
-
-  // Return the i64 difference between two pointers, dividing out the size of the pointed-to objects.
-  // For buffer fat pointers, delays the translation to patch phase.
-  //
-  // @param ty : Element type of the pointers.
-  // @param lhs : Left hand side of the subtraction.
-  // @param rhs : Reft hand side of the subtraction.
-  // @param instName : Name to give instruction(s)
-  virtual llvm::Value *CreatePtrDiff(llvm::Type *ty, llvm::Value *lhs, llvm::Value *rhs,
-                                     const llvm::Twine &instName = "") = 0;
 
   // -----------------------------------------------------------------------------------------------------------------
   // Image operations
@@ -1217,15 +1197,16 @@ public:
   // of those correspondences is actually used when writing to XFB for each affected vertex.
   //
   // @param valueToWrite : Value to write
-  // @param isBuiltIn : True for built-in, false for user output (ignored if not GS)
-  // @param location : Location (row) or built-in kind of output (ignored if not GS)
+  // @param isBuiltIn : True for built-in, false for user output
+  // @param location : Location (row) or built-in kind of output
+  // @param component : Component offset of inputs and outputs (ignored if built-in)
   // @param xfbBuffer : XFB buffer ID
   // @param xfbStride : XFB stride
   // @param xfbOffset : XFB byte offset
   // @param outputInfo : Extra output info (GS stream ID)
   virtual llvm::Instruction *CreateWriteXfbOutput(llvm::Value *valueToWrite, bool isBuiltIn, unsigned location,
-                                                  unsigned xfbBuffer, unsigned xfbStride, llvm::Value *xfbOffset,
-                                                  InOutInfo outputInfo) = 0;
+                                                  unsigned component, unsigned xfbBuffer, unsigned xfbStride,
+                                                  llvm::Value *xfbOffset, InOutInfo outputInfo) = 0;
 
   // Get the type of a built-in -- static edition of the method below, so you can use it without a Builder object.
   //
@@ -1423,6 +1404,11 @@ public:
   //
   // @param instName : Name to give instruction(s)
   virtual llvm::Instruction *CreateKill(const llvm::Twine &instName = "") = 0;
+
+  // Create a "debug break".
+  //
+  // @param instName : Name to give instruction(s)
+  virtual llvm::Instruction *CreateDebugBreak(const llvm::Twine &instName = "") = 0;
 
   // Create a "readclock".
   //

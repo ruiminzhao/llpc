@@ -1,7 +1,7 @@
 ##
  #######################################################################################################################
  #
- #  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ #  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  #
  #  Permission is hereby granted, free of charge, to any person obtaining a copy
  #  of this software and associated documentation files (the "Software"), to deal
@@ -38,6 +38,7 @@ add_llvm_library(LLVMlgc LINK_COMPONENTS
     CodeGen
     Core
     InstCombine
+    IRPrinter
     ipo
     Linker
     MC
@@ -47,6 +48,7 @@ add_llvm_library(LLVMlgc LINK_COMPONENTS
     SelectionDAG
     Support
     Target
+    TargetParser
     TransformUtils
     Vectorize
 )
@@ -55,6 +57,9 @@ target_link_libraries(LLVMlgc PUBLIC llvm_dialects)
 
 ### Cached Project Options #############################################################################################
 option(LLPC_BUILD_NAVI12 "LLPC support for NAVI12?" OFF)
+option(LLPC_BUILD_REMBRANDT "LLPC support for REMBRANDT?" OFF)
+option(LLPC_BUILD_RAPHAEL "LLPC support for RAPHAEL?" OFF)
+option(LLPC_BUILD_MENDOCINO "LLPC support for MENDOCINO?" OFF)
 option(LLPC_ENABLE_WERROR "Build LLPC with more errors" OFF)
 
 ### Compiler Options ###################################################################################################
@@ -67,8 +72,14 @@ set(LGC_TABLEGEN_EXE llvm-dialects-tblgen)
 set(LGC_TABLEGEN_TARGET llvm-dialects-tblgen)
 set(LLVM_TARGET_DEFINITIONS interface/lgc/LgcDialect.td)
 
+if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/interface/lgc)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/interface/lgc")
+endif()
 tablegen(LGC interface/lgc/LgcDialect.h.inc -gen-dialect-decls --dialect lgc
     EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../imported/llvm-dialects/include)
+if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/state)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/state")
+endif()
 tablegen(LGC state/LgcDialect.cpp.inc -gen-dialect-defs --dialect lgc
     EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../imported/llvm-dialects/include)
 add_public_tablegen_target(LgcDialectTableGen)
@@ -98,6 +109,24 @@ target_compile_definitions(LLVMlgc PRIVATE CHIP_HDR_RENOIR)
         CHIP_HDR_NAVI12
     )
   endif()
+  if(LLPC_BUILD_REMBRANDT)
+    target_compile_definitions(LLVMlgc PRIVATE
+        LLPC_BUILD_REMBRANDT
+        CHIP_HDR_REMBRANDT
+    )
+  endif()
+  if(LLPC_BUILD_RAPHAEL)
+    target_compile_definitions(LLVMlgc PRIVATE
+        LLPC_BUILD_RAPHAEL
+        CHIP_HDR_RAPHAEL
+    )
+  endif()
+  if(LLPC_BUILD_MENDOCINO)
+    target_compile_definitions(LLVMlgc PRIVATE
+        LLPC_BUILD_MENDOCINO
+        CHIP_HDR_MENDOCINO
+    )
+  endif()
 
 if(WIN32)
     target_compile_definitions(LLVMlgc PRIVATE
@@ -120,7 +149,8 @@ PRIVATE
 
 #if VKI_RAY_TRACING
 if(VKI_RAY_TRACING)
-  target_compile_definitions(LLVMlgc PRIVATE VKI_RAY_TRACING=1)
+  # Public as it is used in the LGC interface.
+  target_compile_definitions(LLVMlgc PUBLIC VKI_RAY_TRACING=1)
 endif()
 #endif
 
@@ -161,7 +191,6 @@ target_sources(LLVMlgc PRIVATE
     patch/Gfx9Chip.cpp
     patch/Gfx9ConfigBuilder.cpp
     patch/MeshTaskShader.cpp
-    patch/NggLdsManager.cpp
     patch/NggPrimShader.cpp
     patch/Patch.cpp
     patch/PatchBufferOp.cpp
@@ -188,6 +217,7 @@ target_sources(LLVMlgc PRIVATE
     patch/VertexFetch.cpp
     patch/PatchImageOpCollect.cpp
     patch/PatchWaveSizeAdjust.cpp
+    patch/RegisterMetadataBuilder.cpp
 )
 
 # lgc/state

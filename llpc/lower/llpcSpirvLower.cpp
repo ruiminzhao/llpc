@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -239,7 +239,14 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
 #endif
   passMgr.addPass(GlobalOptPass());
   passMgr.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
-  passMgr.addPass(createModuleToFunctionPassAdaptor(InstCombinePass(2)));
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 452298
+  // Old version of the code
+  unsigned instCombineOpt = 2;
+#else
+  // New version of the code (also handles unknown version, which we treat as latest)
+  auto instCombineOpt = InstCombineOptions().setMaxIterations(2);
+#endif
+  passMgr.addPass(createModuleToFunctionPassAdaptor(InstCombinePass(instCombineOpt)));
   passMgr.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
   passMgr.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass()));
 

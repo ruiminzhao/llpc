@@ -47,7 +47,9 @@
 #include "SPIRVValue.h"
 #include "llpcCompiler.h"
 #include "llpcContext.h"
+#include "llpcDialect.h"
 #include "llpcPipelineContext.h"
+#include "lgc/LgcDialect.h"
 #include "lgc/Pipeline.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -1183,28 +1185,71 @@ Value *SPIRVToLLVM::transCmpInst(SPIRVValue *bv, BasicBlock *bb, Function *f) {
 // @param t : type which will be transposed.
 static Type *getTransposedType(Type *t) {
   assert(t->isArrayTy() && t->getArrayElementType()->isStructTy());
-  Type *const columnVectorType = t->getArrayElementType()->getStructElementType(0);
-  assert(columnVectorType->isArrayTy());
+  Type *const rowVectorType = t->getArrayElementType()->getStructElementType(0);
+  assert(rowVectorType->isArrayTy());
 
-  Type *const newColumnVectorType = ArrayType::get(columnVectorType->getArrayElementType(), t->getArrayNumElements());
-  Type *const transposedType = ArrayType::get(newColumnVectorType, columnVectorType->getArrayNumElements());
+  Type *const newColumnVectorType = ArrayType::get(rowVectorType->getArrayElementType(), t->getArrayNumElements());
+  Type *const transposedType = ArrayType::get(newColumnVectorType, rowVectorType->getArrayNumElements());
 
   return transposedType;
 }
 
 // =====================================================================================================================
+// Given the LLVM IR type of a part of SPIR-V matrix, return the part's "dimensionality" (i.e.: 0 for an element,
+// 1 for a column, 2 for the entire matrix)
+//
+static unsigned getMatrixPartDim(Type *type) {
+  if (auto *arrayType = dyn_cast<ArrayType>(type)) {
+    if (isa<ArrayType>(arrayType->getArrayElementType()))
+      return 2;
+    else
+      return 1;
+  }
+  if (isa<FixedVectorType>(type))
+    return 1;
+  assert(type->isIntegerTy() || type->isFloatingPointTy());
+  return 0;
+}
+
+// =====================================================================================================================
+// Create a GEP to an element of a row-major matrix. Return the pointer to the element and its alignment, assuming the
+// given matrix alignment.
+std::pair<Value *, Align> SPIRVToLLVM::createGepIntoRowMajorMatrix(Type *matrixType, Value *matrixPtr,
+                                                                   Align matrixAlign, Value *row, Value *col) {
+  // The matrix type is [nrows x {[ncols x T], pad}]
+  Value *zero = m_builder->getInt32(0);
+  Value *indices[] = {zero, row ? row : zero, zero, col ? col : zero};
+  Value *pointer = m_builder->CreateGEP(matrixType, matrixPtr, indices);
+  Align align = matrixAlign;
+  if (auto *gep = dyn_cast<GEPOperator>(pointer)) {
+    const DataLayout &dl = m_m->getDataLayout();
+    unsigned bitWidth = dl.getIndexSizeInBits(gep->getPointerAddressSpace());
+    MapVector<Value *, APInt> variableOffsets;
+    APInt constantOffset{bitWidth, 0};
+    bool success = gep->collectOffset(dl, bitWidth, variableOffsets, constantOffset);
+    (void)success;
+    assert(success);
+    align = commonAlignment(align, constantOffset.getZExtValue());
+    for (const auto &item : variableOffsets) {
+      align = commonAlignment(align, item.second.getZExtValue());
+    }
+  }
+  return {pointer, align};
+}
+
+// =====================================================================================================================
 // Post process the module to remove row major matrix uses.
 bool SPIRVToLLVM::postProcessRowMajorMatrix() {
-  SmallVector<Value *, 8> valuesToRemove;
+  SmallVector<Instruction *, 8> valuesToRemove;
+  SmallVector<Function *> functionsToRemove;
 
   for (Function &func : m_m->functions()) {
     if (!func.getName().startswith(SpirvLaunderRowMajor))
       continue;
 
     // Remember to remove the function later.
-    valuesToRemove.push_back(&func);
+    functionsToRemove.push_back(&func);
 
-    Value *const zero = getBuilder()->getInt32(0);
     for (User *const user : func.users()) {
       CallInst *const call = dyn_cast<CallInst>(user);
 
@@ -1214,352 +1259,257 @@ bool SPIRVToLLVM::postProcessRowMajorMatrix() {
       valuesToRemove.push_back(call);
 
       Value *const matrix = call->getArgOperand(0);
+      Type *const matrixType = func.getArg(1)->getType();
       // Get return type of the function by transposing matrix type.
       Type *const destType = getTransposedType(func.getArg(1)->getType());
 
-      // TODO: Remove this when LLPC will switch fully to opaque pointers.
-      assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(call->getType(), destType));
       assert(destType->isArrayTy());
 
-      const unsigned columnCount = destType->getArrayNumElements();
+      const unsigned colCount = destType->getArrayNumElements();
       const unsigned rowCount = destType->getArrayElementType()->getArrayNumElements();
 
       Type *const matrixElementType = destType->getArrayElementType()->getArrayElementType();
 
-      // Due to the opaque pointer changes, which are removing information about pointer element type
-      // from the most of the instructions, 'valueToTypeMap' was introduced. This hash map is storing base
-      // types of created instructions in postProcessRowMajorMatrix. Because of this, 'valueMap' and
-      // 'valueToTypeMap' are now dependent on each other. If any instruction will be created in this
-      // function and later will be added to 'valueMap' then we have to ensure that base type of this
-      // newly created instruction will be also added to 'valueToTypeMap'
-      llvm::ValueMap<Value *, Value *> valueMap;
-      llvm::ValueMap<Value *, Type *> valueToTypeMap;
+      // Map a pointer to its corresponding (row, column) index (as i32) into the matrix. Either index may be null,
+      // indicating a constant 0.
+      DenseMap<Value *, std::pair<Value *, Value *>> valueMap;
 
-      // Initially populate the map with just our matrix source.
-      valueMap[call] = matrix;
-
-      valueToTypeMap[call] = destType;
-      valueToTypeMap[matrix] = func.getArg(1)->getType();
+      valueMap.try_emplace(call, nullptr, nullptr);
 
       SmallVector<Value *, 8> workList(call->user_begin(), call->user_end());
 
       while (!workList.empty()) {
-        Value *const value = workList.pop_back_val();
-
-        Instruction *const inst = cast<Instruction>(value);
-
-        getBuilder()->SetInsertPoint(inst);
+        auto *const inst = cast<Instruction>(workList.pop_back_val());
 
         // Remember to remove the instruction later.
         valuesToRemove.push_back(inst);
 
-        if (BitCastInst *const bitCast = dyn_cast<BitCastInst>(value)) {
-          // We need to handle bitcasts because we need to represent SPIR-V vectors in interface types
-          // (uniform, storagebuffer, pushconstant) as arrays because of alignment requirements. When we do a
-          // load/store of a vector we actually bitcast the array type to a vector, then do the load, so we
-          // need to handle these bitcasts here.
+        m_builder->SetInsertPoint(inst);
 
-          valueMap[bitCast] = valueMap[bitCast->getOperand(0)];
+        if (auto *const bitcast = dyn_cast<BitCastInst>(inst)) {
+          // Bitcasts should generally disappear with opaque pointers, but being able to look through them is correct
+          // and shouldn't hurt.
+          valueMap[bitcast] = valueMap.lookup(bitcast->getOperand(0));
+        } else if (auto *const gep = dyn_cast<GetElementPtrInst>(inst)) {
+          auto [row, col] = valueMap.lookup(gep->getPointerOperand());
+          Type *gepType = gep->getSourceElementType();
+          unsigned dim = getMatrixPartDim(gepType);
+          assert(gep->getNumIndices() <= dim + 1);
 
-          // Add all the users of this bitcast to the worklist for processing.
-          for (User *const user : bitCast->users())
-            workList.push_back(user);
-        } else if (GetElementPtrInst *const getElemPtr = dyn_cast<GetElementPtrInst>(value)) {
-          // For GEPs we need to handle four cases:
-          // 1. The GEP is just pointing at the base object (unlikely but technically legal).
-          // 2. The GEP is pointing at the column of the matrix. In this case because we are handling a row
-          //    major matrix we need to turn the single GEP into a vector of GEPs, one for each element of the
-          //    the column (because the memory is not contiguous).
-          // 3. The GEP is getting a scalar element from a previously GEP'ed column, which means we are
-          //    actually just extracting an element from the vector of GEPs that we created above.
-          // 4. The GEP is pointing at a scalar element of the matrix.
-
-          assert(valueMap.count(getElemPtr->getPointerOperand()) > 0);
-
-          Value *const remappedValue = valueMap[getElemPtr->getPointerOperand()];
-          assert(valueToTypeMap.count(remappedValue) > 0);
-          Type *const remappedBaseType = valueToTypeMap[remappedValue];
-
-          SmallVector<Value *, 8> indices;
-
-          for (Value *const index : getElemPtr->indices())
-            indices.push_back(index);
-
-          // Check that the first index is always zero.
-          assert(isa<ConstantInt>(indices[0]) && cast<ConstantInt>(indices[0])->isZero());
-
-          assert(indices.size() > 0 && indices.size() < 4);
-
-          // If the GEP is just pointing at the base object, just update the value map.
-          if (indices.size() == 1)
-            valueMap[getElemPtr] = remappedValue;
-          else if (remappedValue->getType()->isPointerTy()) {
-            // If the value is a pointer type, we are indexing into the original matrix.
-            Value *const remappedValueSplat = getBuilder()->CreateVectorSplat(rowCount, remappedValue);
-            Value *rowSplat = UndefValue::get(FixedVectorType::get(getBuilder()->getInt32Ty(), rowCount));
-
-            for (unsigned i = 0; i < rowCount; i++)
-              rowSplat = getBuilder()->CreateInsertElement(rowSplat, getBuilder()->getInt32(i), i);
-
-            Value *const columnSplat = getBuilder()->CreateVectorSplat(rowCount, indices[1]);
-
-            assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(remappedValueSplat->getType()->getScalarType(), remappedBaseType));
-
-            Value *newGetElemPtrIndices[] = {getBuilder()->getInt32(0), rowSplat, getBuilder()->getInt32(0),
-                                             columnSplat};
-
-            Value *const newGetElemPtr =
-                getBuilder()->CreateGEP(remappedBaseType, remappedValueSplat, newGetElemPtrIndices);
-
-            Type *const newGetElemBaseType = GetElementPtrInst::getIndexedType(remappedBaseType, newGetElemPtrIndices);
-            valueToTypeMap[newGetElemPtr] = newGetElemBaseType;
-
-            // Check if we are loading a scalar element of the matrix or not.
-            if (indices.size() > 2) {
-              Value *extractElem = getBuilder()->CreateExtractElement(newGetElemPtr, indices[2]);
-              valueMap[getElemPtr] = extractElem;
-
-              valueToTypeMap[extractElem] = GetElementPtrInst::getIndexedType(newGetElemBaseType, indices[2]);
-            } else
-              valueMap[getElemPtr] = newGetElemPtr;
-          } else {
-            // If we get here it means we are doing a subsequent GEP on a matrix row.
-            assert(remappedValue->getType()->isVectorTy());
-            assert(cast<VectorType>(remappedValue->getType())->getElementType()->isPointerTy());
-            Value *const extractElem = getBuilder()->CreateExtractElement(remappedValue, indices[1]);
-            valueMap[getElemPtr] = extractElem;
-
-            valueToTypeMap[extractElem] = GetElementPtrInst::getIndexedType(remappedBaseType, indices[1]);
+          auto idx_it = gep->idx_begin();
+          if (dim == 2) {
+            assert(cast<Constant>(*idx_it)->isNullValue());
+            idx_it++;
+            dim--;
           }
 
-          // Add all the users of this GEP to the worklist for processing.
-          for (User *const user : getElemPtr->users())
-            // Add only unique instructions to the list. If comparing the same pointers then
-            // GEP can be used twice by the same CmpInst as operand 0 and operand 1.
-            if (std::find(workList.begin(), workList.end(), user) == workList.end())
-              workList.push_back(user);
-        } else if (LoadInst *const load = dyn_cast<LoadInst>(value)) {
+          if (dim == 1 && idx_it != gep->idx_end()) {
+            Value *idx = *idx_it++;
+            idx = m_builder->CreateZExtOrTrunc(idx, m_builder->getInt32Ty());
+            if (col)
+              col = m_builder->CreateAdd(col, idx);
+            else
+              col = idx;
+            dim--;
+          }
+
+          if (dim == 0 && idx_it != gep->idx_end()) {
+            Value *idx = *idx_it++;
+            idx = m_builder->CreateZExtOrTrunc(idx, m_builder->getInt32Ty());
+            if (row)
+              row = m_builder->CreateAdd(row, idx);
+            else
+              row = idx;
+            dim--;
+          }
+
+          assert(idx_it == gep->idx_end());
+
+          valueMap.try_emplace(gep, row, col);
+        } else if (auto *const load = dyn_cast<LoadInst>(inst)) {
           // For loads we have to handle three cases:
           // 1. We are loading a full matrix, so do a load + transpose.
           // 2. We are loading a column of a matrix, and since this is represented as a vector of GEPs we need
           //    to issue a load for each element of this vector and recombine the result.
           // 3. We are loading a single scalar element, do a simple load.
 
-          Value *const pointer = valueMap[load->getPointerOperand()];
-          Type *const pointerType = pointer->getType();
-          assert(valueToTypeMap.count(pointer) > 0);
-          Type *const pointerElemType = valueToTypeMap[pointer];
-          // TODO: Remove this when LLPC will switch fully to opaque pointers.
-          assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerType->getScalarType(), pointerElemType));
+          auto [ptrRow, ptrCol] = valueMap.lookup(load->getPointerOperand());
+          unsigned dim = getMatrixPartDim(load->getType());
 
-          // If the remapped pointer type isn't a pointer, it's a vector of pointers instead.
-          if (!pointerType->isPointerTy()) {
-            assert(pointerType->isVectorTy());
+          assert(dim <= 1 || (!ptrCol || cast<Constant>(ptrCol)->isNullValue()));
+          assert(dim == 0 || (!ptrRow || cast<Constant>(ptrRow)->isNullValue()));
 
-            Value *newLoad = UndefValue::get(load->getType());
+          Type *columnType = nullptr;
+          if (dim == 2)
+            columnType = load->getType()->getArrayElementType();
+          else if (dim == 1)
+            columnType = load->getType();
 
-            for (unsigned i = 0; i < cast<FixedVectorType>(pointerType)->getNumElements(); i++) {
-              Value *const pointerElem = getBuilder()->CreateExtractElement(pointer, i);
-              // TODO: Remove this when LLPC will switch fully to opaque pointers.
-              assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerElem->getType(), pointerElemType));
+          Value *result = dim >= 1 ? PoisonValue::get(load->getType()) : nullptr;
+          Value *const columnInitial = dim >= 1 ? PoisonValue::get(columnType) : nullptr;
 
-              LoadInst *const newLoadElem =
-                  getBuilder()->CreateAlignedLoad(pointerElemType, pointerElem, load->getAlign(), load->isVolatile());
-              newLoadElem->setOrdering(load->getOrdering());
-              newLoadElem->setSyncScopeID(load->getSyncScopeID());
+          unsigned loadCol = 0;
+          do {
+            Value *col = ptrCol;
+            if (col && loadCol != 0)
+              col = m_builder->CreateAdd(col, m_builder->getInt32(loadCol));
+            if (!col)
+              col = m_builder->getInt32(loadCol);
 
-              if (load->getMetadata(LLVMContext::MD_nontemporal))
-                transNonTemporalMetadata(newLoadElem);
+            Value *columnResult = columnInitial;
 
-              newLoad = getBuilder()->CreateInsertElement(newLoad, newLoadElem, i);
-            }
+            unsigned loadRow = 0;
+            do {
+              Value *row = ptrRow;
+              if (row && loadRow != 0)
+                row = m_builder->CreateAdd(row, m_builder->getInt32(loadRow));
+              if (!row)
+                row = m_builder->getInt32(loadRow);
 
-            load->replaceAllUsesWith(newLoad);
-          } else if (isTypeWithPadRowMajorMatrix(pointerElemType)) {
-            Type *const newRowType = FixedVectorType::get(matrixElementType, columnCount);
-            Type *const newLoadType = ArrayType::get(newRowType, rowCount);
-            Value *newLoad = UndefValue::get(newLoadType);
-
-            // If we are loading a full row major matrix, need to load the rows and then transpose.
-            for (unsigned i = 0; i < rowCount; i++) {
-              Value *indices[] = {zero, getBuilder()->getInt32(i), zero};
-              Value *pointerElem = getBuilder()->CreateGEP(pointerElemType, pointer, indices);
-              Type *castType = GetElementPtrInst::getIndexedType(pointerElemType, indices);
-              // TODO: Remove this when LLPC will switch fully to opaque pointers.
-              assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerElem->getType(), castType));
-              assert(castType->isArrayTy());
-              Type *const newLoadElemType =
-                  FixedVectorType::get(castType->getArrayElementType(), castType->getArrayNumElements());
-              const unsigned addrSpace = pointerElem->getType()->getPointerAddressSpace();
-              castType = newLoadElemType->getPointerTo(addrSpace);
-              pointerElem = getBuilder()->CreateBitCast(pointerElem, castType);
-              // TODO: Remove this when LLPC will switch fully to opaque pointers.
-              assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerElem->getType(), newLoadElemType));
-
-              LoadInst *const newLoadElem =
-                  getBuilder()->CreateAlignedLoad(newLoadElemType, pointerElem, load->getAlign(), load->isVolatile());
-              newLoadElem->setOrdering(load->getOrdering());
-              newLoadElem->setSyncScopeID(load->getSyncScopeID());
+              auto [ptr, align] = createGepIntoRowMajorMatrix(matrixType, matrix, load->getAlign(), row, col);
+              LoadInst *const newLoad = m_builder->CreateAlignedLoad(matrixElementType, ptr, align, load->isVolatile());
+              newLoad->setOrdering(load->getOrdering());
+              newLoad->setSyncScopeID(load->getSyncScopeID());
 
               if (load->getMetadata(LLVMContext::MD_nontemporal))
-                transNonTemporalMetadata(newLoadElem);
+                transNonTemporalMetadata(newLoad);
 
-              newLoad = getBuilder()->CreateInsertValue(newLoad, newLoadElem, i);
-            }
+              if (dim == 0) {
+                columnResult = newLoad;
+              } else {
+                if (isa<ArrayType>(columnType))
+                  columnResult = m_builder->CreateInsertValue(columnResult, newLoad, loadRow);
+                else
+                  columnResult = m_builder->CreateInsertElement(columnResult, newLoad, loadRow);
+              }
 
-            load->replaceAllUsesWith(getBuilder()->CreateTransposeMatrix(newLoad));
-          } else {
-            // Otherwise we are loading a single element and it's a simple load.
-            // TODO: Remove this when LLPC will switch fully to opaque pointers.
-            assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointer->getType(), pointerElemType));
-            LoadInst *const newLoad =
-                getBuilder()->CreateAlignedLoad(pointerElemType, pointer, load->getAlign(), load->isVolatile());
-            newLoad->setOrdering(load->getOrdering());
-            newLoad->setSyncScopeID(load->getSyncScopeID());
+              ++loadRow;
+            } while (dim >= 1 && loadRow < rowCount);
 
-            if (load->getMetadata(LLVMContext::MD_nontemporal))
-              transNonTemporalMetadata(newLoad);
+            if (dim <= 1)
+              result = columnResult;
+            else
+              result = m_builder->CreateInsertValue(result, columnResult, loadCol);
 
-            load->replaceAllUsesWith(newLoad);
-          }
-        } else if (StoreInst *const store = dyn_cast<StoreInst>(value)) {
+            ++loadCol;
+          } while (dim == 2 && loadCol < colCount);
+
+          load->replaceAllUsesWith(result);
+
+          // don't add users to worklist
+          continue;
+        } else if (auto *const store = dyn_cast<StoreInst>(inst)) {
           // For stores we have to handle three cases:
           // 1. We are storing a full matrix, so do a transpose + store.
           // 2. We are storing a column of a matrix, and since this is represented as a vector of GEPs we need
           //    to extract each element and issue a store.
           // 3. We are storing a single scalar element, do a simple store.
 
-          Value *const pointer = valueMap[store->getPointerOperand()];
-          Type *const pointerType = pointer->getType();
+          auto [ptrRow, ptrCol] = valueMap.lookup(store->getPointerOperand());
+          unsigned dim = getMatrixPartDim(store->getValueOperand()->getType());
 
-          assert(valueToTypeMap.count(pointer) > 0);
-          Type *pointerElemType = valueToTypeMap[pointer];
-          // TODO: Remove this when LLPC will switch fully to opaque pointers.
-          assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointer->getType()->getScalarType(), pointerElemType));
+          assert(dim <= 1 || (!ptrCol || cast<Constant>(ptrCol)->isNullValue()));
+          assert(dim == 0 || (!ptrRow || cast<Constant>(ptrRow)->isNullValue()));
 
-          // If the remapped pointer type isn't a pointer, it's a vector of pointers instead.
-          if (!pointerType->isPointerTy()) {
-            assert(pointerType->isVectorTy());
+          unsigned storeCol = 0;
+          do {
+            Value *col = ptrCol;
+            if (col && storeCol != 0)
+              col = m_builder->CreateAdd(col, m_builder->getInt32(storeCol));
+            if (!col)
+              col = m_builder->getInt32(storeCol);
 
-            for (unsigned i = 0; i < cast<FixedVectorType>(pointerType)->getNumElements(); i++) {
-              Value *storeValueElem = store->getValueOperand();
+            Value *column;
+            if (dim <= 1)
+              column = store->getValueOperand();
+            else
+              column = m_builder->CreateExtractValue(store->getValueOperand(), storeCol);
 
-              if (storeValueElem->getType()->isArrayTy())
-                storeValueElem = getBuilder()->CreateExtractValue(storeValueElem, i);
-              else
-                storeValueElem = getBuilder()->CreateExtractElement(storeValueElem, i);
+            unsigned storeRow = 0;
+            do {
+              Value *row = ptrRow;
+              if (row && storeRow != 0)
+                row = m_builder->CreateAdd(row, m_builder->getInt32(storeRow));
+              if (!row)
+                row = m_builder->getInt32(storeRow);
 
-              Value *const pointerElem = getBuilder()->CreateExtractElement(pointer, i);
-
-              StoreInst *const newStoreElem =
-                  getBuilder()->CreateAlignedStore(storeValueElem, pointerElem, store->getAlign(), store->isVolatile());
-              newStoreElem->setOrdering(store->getOrdering());
-              newStoreElem->setSyncScopeID(store->getSyncScopeID());
-
-              if (store->getMetadata(LLVMContext::MD_nontemporal))
-                transNonTemporalMetadata(newStoreElem);
-            }
-          } else if (isTypeWithPadRowMajorMatrix(pointerElemType)) {
-            Value *storeValue = store->getValueOperand();
-
-            Type *const storeType = storeValue->getType();
-            Type *const storeElementType = storeType->getArrayElementType();
-            if (storeElementType->isArrayTy()) {
-              const unsigned columnCount = storeType->getArrayNumElements();
-              const unsigned rowCount = storeElementType->getArrayNumElements();
-
-              Type *const columnType = FixedVectorType::get(storeElementType->getArrayElementType(), rowCount);
-              Type *const matrixType = ArrayType::get(columnType, columnCount);
-
-              Value *matrix = UndefValue::get(matrixType);
-
-              for (unsigned column = 0, e = storeType->getArrayNumElements(); column < e; column++) {
-                Value *columnVal = UndefValue::get(columnType);
-
-                for (unsigned row = 0; row < rowCount; row++) {
-                  Value *const element = getBuilder()->CreateExtractValue(storeValue, {column, row});
-                  columnVal = getBuilder()->CreateInsertElement(columnVal, element, row);
-                }
-
-                matrix = getBuilder()->CreateInsertValue(matrix, columnVal, column);
+              Value *element;
+              if (dim == 0) {
+                element = column;
+              } else {
+                if (isa<ArrayType>(column->getType()))
+                  element = m_builder->CreateExtractValue(column, storeRow);
+                else
+                  element = m_builder->CreateExtractElement(column, storeRow);
               }
 
-              storeValue = matrix;
-            }
-
-            storeValue = getBuilder()->CreateTransposeMatrix(storeValue);
-
-            // If we are storing a full row major matrix, need to transpose then store the rows.
-            for (unsigned i = 0; i < rowCount; i++) {
-              Value *indices[] = {zero, getBuilder()->getInt32(i), zero};
-              Value *pointerElem = getBuilder()->CreateGEP(pointerElemType, pointer, indices);
-              Type *castType = GetElementPtrInst::getIndexedType(pointerElemType, indices);
-              // TODO: Remove this when LLPC will switch fully to opaque pointers.
-              assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(pointerElem->getType(), castType));
-              assert(castType->isArrayTy());
-              castType = FixedVectorType::get(castType->getArrayElementType(), castType->getArrayNumElements());
-              const unsigned addrSpace = pointerElem->getType()->getPointerAddressSpace();
-              castType = castType->getPointerTo(addrSpace);
-              pointerElem = getBuilder()->CreateBitCast(pointerElem, castType);
-
-              Value *const storeValueElem = getBuilder()->CreateExtractValue(storeValue, i);
-
-              StoreInst *const newStoreElem =
-                  getBuilder()->CreateAlignedStore(storeValueElem, pointerElem, store->getAlign(), store->isVolatile());
-              newStoreElem->setOrdering(store->getOrdering());
-              newStoreElem->setSyncScopeID(store->getSyncScopeID());
+              auto [ptr, align] = createGepIntoRowMajorMatrix(matrixType, matrix, store->getAlign(), row, col);
+              StoreInst *const newStore = m_builder->CreateAlignedStore(element, ptr, align, store->isVolatile());
+              newStore->setOrdering(store->getOrdering());
+              newStore->setSyncScopeID(store->getSyncScopeID());
 
               if (store->getMetadata(LLVMContext::MD_nontemporal))
-                transNonTemporalMetadata(newStoreElem);
-            }
-          } else {
-            // Otherwise we are storing a single element and it's a simple store.
-            StoreInst *const newStore = getBuilder()->CreateAlignedStore(store->getValueOperand(), pointer,
-                                                                         store->getAlign(), store->isVolatile());
-            newStore->setOrdering(store->getOrdering());
-            newStore->setSyncScopeID(store->getSyncScopeID());
+                transNonTemporalMetadata(newStore);
 
-            if (store->getMetadata(LLVMContext::MD_nontemporal))
-              transNonTemporalMetadata(newStore);
-          }
-        } else if (CallInst *const callInst = dyn_cast<CallInst>(value)) {
-          if (callInst->getCalledFunction()->getName().startswith(gSPIRVMD::NonUniform))
+              ++storeRow;
+            } while (dim >= 1 && storeRow < rowCount);
+            ++storeCol;
+          } while (dim == 2 && storeCol < colCount);
+
+          // don't add users to worklist
+          continue;
+        } else if (auto *const callInst = dyn_cast<CallInst>(inst)) {
+          if (callInst->getCalledFunction()->getName().startswith(gSPIRVMD::NonUniform)) {
+            // don't add users to worklist
             continue;
-        } else if (CmpInst *const cmpInst = dyn_cast<CmpInst>(value)) {
+          }
+
+          llvm_unreachable("laundered row-major matrix pointer should not be used by call");
+        } else if (auto *const cmpInst = dyn_cast<CmpInst>(inst)) {
           if (cmpInst->use_empty())
             continue;
 
           Value *lhs = cmpInst->getOperand(0);
           Value *rhs = cmpInst->getOperand(1);
-          if (Value *mapped = valueMap.lookup(lhs))
-            lhs = mapped;
-          if (Value *mapped = valueMap.lookup(rhs))
-            rhs = mapped;
+          auto [lhsRow, lhsCol] = valueMap.lookup(lhs);
+          if (lhsRow || lhsCol)
+            lhs = createGepIntoRowMajorMatrix(matrixType, matrix, {}, lhsRow, lhsCol).first;
+          auto [rhsRow, rhsCol] = valueMap.lookup(rhs);
+          if (rhsRow || rhsCol)
+            rhs = createGepIntoRowMajorMatrix(matrixType, matrix, {}, rhsRow, rhsCol).first;
 
-          Value *newCmpInst = getBuilder()->CreateCmp(cmpInst->getPredicate(), lhs, rhs, cmpInst->getName());
+          Value *newCmpInst = m_builder->CreateCmp(cmpInst->getPredicate(), lhs, rhs, cmpInst->getName());
           cmpInst->replaceAllUsesWith(newCmpInst);
           // Drop all references to eliminate double add to remove list.
           // This can happen when we are comparing pointers of two matrices of row major.
           cmpInst->dropAllReferences();
-        } else
+
+          // don't add users to worklist
+          continue;
+        } else {
           llvm_unreachable("Should never be called!");
+        }
+
+        for (User *const user : inst->users()) {
+          // Add only unique instructions to the list. The same pointer may be used twice due to compare instructions.
+          if (std::find(workList.begin(), workList.end(), user) == workList.end())
+            workList.push_back(user);
+        }
       }
     }
   }
 
-  const bool changed = (!valuesToRemove.empty());
+  const bool changed = !valuesToRemove.empty() || !functionsToRemove.empty();
 
   while (!valuesToRemove.empty()) {
-    Value *const value = valuesToRemove.pop_back_val();
-
-    if (Instruction *const inst = dyn_cast<Instruction>(value)) {
-      inst->dropAllReferences();
-      inst->eraseFromParent();
-    } else if (Function *const func = dyn_cast<Function>(value)) {
-      func->dropAllReferences();
-      func->eraseFromParent();
-    } else
-      llvm_unreachable("Should never be called!");
+    auto *const inst = valuesToRemove.pop_back_val();
+    inst->dropAllReferences();
+    inst->eraseFromParent();
+  }
+  while (!functionsToRemove.empty()) {
+    auto *const func = functionsToRemove.pop_back_val();
+    func->dropAllReferences();
+    func->eraseFromParent();
   }
 
   return changed;
@@ -1625,9 +1575,6 @@ std::pair<Type *, Value *> SPIRVToLLVM::createLaunderRowMajorMatrix(Type *const 
 Value *SPIRVToLLVM::addLoadInstRecursively(SPIRVType *const spvType, Value *loadPointer, Type *loadType,
                                            bool isVolatile, bool isCoherent, bool isNonTemporal) {
   assert(loadPointer->getType()->isPointerTy());
-
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(loadPointer->getType(), loadType));
 
   if (isTypeWithPadRowMajorMatrix(loadType)) {
     auto loadPair = createLaunderRowMajorMatrix(loadType, loadPointer);
@@ -1773,15 +1720,10 @@ void SPIRVToLLVM::addStoreInstRecursively(SPIRVType *const spvType, Value *store
                                           Value *storeValue, bool isVolatile, bool isCoherent, bool isNonTemporal) {
   assert(storePointer->getType()->isPointerTy());
 
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(storePointer->getType(), storeType));
-
   if (isTypeWithPadRowMajorMatrix(storeType)) {
     auto storePair = createLaunderRowMajorMatrix(storeType, storePointer);
     storePointer = storePair.second;
     storeType = storePair.first;
-    // TODO: Remove this when LLPC will switch fully to opaque pointers.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(storePointer->getType(), storeType));
   }
 
   const Align alignment = m_m->getDataLayout().getABITypeAlign(storeType);
@@ -1863,9 +1805,6 @@ void SPIRVToLLVM::addStoreInstRecursively(SPIRVType *const spvType, Value *store
 
     Type *storeType = nullptr;
 
-    // TODO: Remove this when LLPC will switch fully to opaque pointers.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(storePointer->getType(), alignmentType));
-
     // If the store was a bool or vector of bool, need to zext the storing value.
     if (spvType->isTypeBool() || (spvType->isTypeVector() && spvType->getVectorComponentType()->isTypeBool())) {
       storeValue = getBuilder()->CreateZExtOrBitCast(storeValue, alignmentType);
@@ -1905,9 +1844,6 @@ void SPIRVToLLVM::addStoreInstRecursively(SPIRVType *const spvType, Value *store
 Constant *SPIRVToLLVM::buildConstStoreRecursively(SPIRVType *const spvType, Type *const storePointerType,
                                                   Type *const storeType, Constant *constStoreValue) {
   assert(storePointerType->isPointerTy());
-
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(storePointerType, storeType));
 
   const unsigned addrSpace = storePointerType->getPointerAddressSpace();
 
@@ -2881,12 +2817,10 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpArrayLength>(SPIRVValue *
       lookupRemappedTypeElements(spvStruct->getType()->getPointerElementType(), memberIndex);
 
   StructType *const structType = cast<StructType>(getPointeeType(spvStruct));
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(structure->getType(), structType));
   const StructLayout *const structLayout = m_m->getDataLayout().getStructLayout(structType);
   const unsigned offset = static_cast<unsigned>(structLayout->getElementOffset(remappedMemberIndex));
   Value *const offsetVal = getBuilder()->getInt32(offset);
-  Value *const arrayBytes = getBuilder()->CreateGetBufferDescLength(structure, offsetVal);
+  Value *const arrayBytes = getBuilder()->create<BufferLengthOp>(structure, offsetVal);
 
   Type *const memberType = structType->getStructElementType(remappedMemberIndex)->getArrayElementType();
   const unsigned stride = static_cast<unsigned>(m_m->getDataLayout().getTypeSizeInBits(memberType) / 8);
@@ -2935,8 +2869,6 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpAccessChain>(SPIRVValue *
   const bool isBufferBlockPointer = isStorageClassExplicitlyLaidOut(m_bm, storageClass);
 
   Type *basePointeeType = getPointeeType(spvAccessChain->getBase());
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(base->getType(), basePointeeType));
 
   SmallVector<Value *, 8> gepIndices;
 
@@ -2954,7 +2886,10 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpAccessChain>(SPIRVValue *
       }
     }
 
-    base = getBuilder()->CreateGEP(basePointeeType, base, gepIndices, "", spvAccessChain->isInBounds());
+    if (spvAccessChain->isInBounds())
+      base = getBuilder()->CreateInBoundsGEP(basePointeeType, base, gepIndices);
+    else
+      base = getBuilder()->CreateGEP(basePointeeType, base, gepIndices);
 
     gepIndices.clear();
     gepIndices.push_back(getBuilder()->getInt32(0));
@@ -2963,7 +2898,7 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpAccessChain>(SPIRVValue *
   // Run over the indices and map the SPIR-V level indices to LLVM indices, which may be different because the LLVM
   // types may contain manual padding fields to model the power of Vulkan's layout options.
   // Additionally, break up the GEP sequence to handle some special cases like row major matrices.
-  for (Value *index : makeArrayRef(srcIndices).drop_front()) {
+  for (Value *index : ArrayRef(srcIndices).drop_front()) {
     switch (spvAccessType->getOpCode()) {
     case OpTypeStruct: {
       ConstantInt *constIndex = cast<ConstantInt>(index);
@@ -4120,6 +4055,11 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpExtInst>(SPIRVValue *cons
   case SPIRVEIS_ShaderTrinaryMinMaxAMD:
     return transTrinaryMinMaxExtInst(spvExtInst, block);
 
+  case SPIRVEIS_NonSemanticDebugBreak:
+    // Only one instruction for this extended instruction set
+    assert(spvExtInst->getExtOp() == NonSemanticDebugBreakDebugBreak);
+    return getBuilder()->CreateDebugBreak();
+
   case SPIRVEIS_Debug:
     return m_dbgTran.transDebugIntrinsic(spvExtInst, block);
 
@@ -4233,8 +4173,6 @@ template <> Value *SPIRVToLLVM::transValueWithOpcode<OpVariable>(SPIRVValue *con
 
   Type *const varType = transType(spvVar->getType()->getPointerElementType(), 0, true, true,
                                   isStorageClassExplicitlyLaidOut(m_bm, spvVar->getType()->getPointerStorageClass()));
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(ptrType, varType));
 
   SPIRVValue *const spvInitializer = spvVar->getInitializer();
 
@@ -4888,26 +4826,26 @@ Value *SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *bv, Function *f, Bas
       return mapValue(bv, ExtractElementInst::Create(transValue(ce->getComposite(), f, bb),
                                                      ConstantInt::get(*m_context, APInt(32, ce->getIndices()[0])),
                                                      bv->getName(), bb));
-    } else {
-      auto cv = transValue(ce->getComposite(), f, bb);
-      auto indexedTy = ExtractValueInst::getIndexedType(cv->getType(), ce->getIndices());
-      if (!indexedTy) {
-        // NOTE: "OpCompositeExtract" could extract a scalar component from a
-        // vector or a vector in an aggregate. But in LLVM, "extractvalue" is
-        // unable to do such thing. We have to replace it with "extractelement"
-        // + "extractelement" to achieve this purpose.
-        assert(ce->getType()->isTypeScalar());
-        std::vector<SPIRVWord> idxs = ce->getIndices();
-        auto lastIdx = idxs.back();
-        idxs.pop_back();
-
-        Value *v = ExtractValueInst::Create(cv, idxs, "", bb);
-        assert(v->getType()->isVectorTy());
-        return mapValue(
-            bv, ExtractElementInst::Create(v, ConstantInt::get(*m_context, APInt(32, lastIdx)), bv->getName(), bb));
-      }
-      return mapValue(bv, ExtractValueInst::Create(cv, ce->getIndices(), bv->getName(), bb));
     }
+
+    auto cv = transValue(ce->getComposite(), f, bb);
+    auto indexedTy = ExtractValueInst::getIndexedType(cv->getType(), ce->getIndices());
+    if (!indexedTy) {
+      // NOTE: "OpCompositeExtract" could extract a scalar component from a
+      // vector or a vector in an aggregate. But in LLVM, "extractvalue" is
+      // unable to do such thing. We have to replace it with "extractelement"
+      // + "extractelement" to achieve this purpose.
+      assert(ce->getType()->isTypeScalar());
+      std::vector<SPIRVWord> idxs = ce->getIndices();
+      auto lastIdx = idxs.back();
+      idxs.pop_back();
+
+      Value *v = ExtractValueInst::Create(cv, idxs, "", bb);
+      assert(v->getType()->isVectorTy());
+      return mapValue(
+          bv, ExtractElementInst::Create(v, ConstantInt::get(*m_context, APInt(32, lastIdx)), bv->getName(), bb));
+    }
+    return mapValue(bv, ExtractValueInst::Create(cv, ce->getIndices(), bv->getName(), bb));
   }
 
   case OpVectorExtractDynamic: {
@@ -4924,6 +4862,7 @@ Value *SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *bv, Function *f, Bas
                               transValue(ci->getComposite(), f, bb), transValue(ci->getObject(), f, bb),
                               ConstantInt::get(*m_context, APInt(32, ci->getIndices()[0])), bv->getName(), bb));
     }
+
     auto cv = transValue(ci->getComposite(), f, bb);
     auto indexedTy = ExtractValueInst::getIndexedType(cv->getType(), ci->getIndices());
     if (!indexedTy) {
@@ -5688,10 +5627,7 @@ static void printTypeName(Type *ty, raw_ostream &nameStream) {
   for (;;) {
     if (auto pointerTy = dyn_cast<PointerType>(ty)) {
       nameStream << "p" << pointerTy->getAddressSpace();
-      if (pointerTy->isOpaque())
-        return;
-      ty = pointerTy->getPointerElementType();
-      continue;
+      return;
     }
     if (auto arrayTy = dyn_cast<ArrayType>(ty)) {
       nameStream << "a" << arrayTy->getNumElements();
@@ -7127,51 +7063,78 @@ bool SPIRVToLLVM::translate(ExecutionModel entryExecModel, const char *entryName
       auto bv = m_bm->getVariable(i);
       if (bv->getStorageClass() == StorageClassOutput) {
         SPIRVWord xfbBuffer = InvalidValue;
-        if (bv->hasDecorate(DecorationXfbBuffer, 0, &xfbBuffer)) {
-          const unsigned indexOfBuffer = 2 * xfbBuffer;
-          xfbState[indexOfBuffer] = 0;
-          SPIRVWord streamId = InvalidValue;
-          if (bv->hasDecorate(DecorationStream, 0, &streamId))
-            xfbState[indexOfBuffer] = streamId;
+        // NOTE: XFbBuffer may be decorated on the pointer element
+        SPIRVType *pointerElemTy = bv->getType()->getPointerElementType();
+        SPIRVEntry *entries[2] = {bv, pointerElemTy};
+        unsigned memberCount = 0;
+        if (pointerElemTy->isTypeStruct())
+          memberCount = pointerElemTy->getStructMemberCount();
+        for (unsigned id = 0; id < 2; ++id) {
+          auto entry = entries[id];
+          if (entry->hasDecorate(DecorationXfbBuffer, 0, &xfbBuffer)) {
+            const unsigned indexOfBuffer = 2 * xfbBuffer;
+            xfbState[indexOfBuffer] = 0;
+            SPIRVWord streamId = InvalidValue;
+            if (entry->hasDecorate(DecorationStream, 0, &streamId))
+              xfbState[indexOfBuffer] = streamId;
 
-          SPIRVWord xfbStride = InvalidValue;
-          if (bv->hasDecorate(DecorationXfbStride, 0, &xfbStride)) {
-            const unsigned indexOfStride = indexOfBuffer + 1;
-            xfbState[indexOfStride] = xfbStride;
-          }
+            SPIRVWord xfbStride = InvalidValue;
+            if (entry->hasDecorate(DecorationXfbStride, 0, &xfbStride)) {
+              const unsigned indexOfStride = indexOfBuffer + 1;
+              xfbState[indexOfStride] = xfbStride;
+            }
+          } else if (id == 1) {
+            for (unsigned i = 0; i < memberCount; ++i) {
+              if (entry->hasMemberDecorate(i, DecorationXfbBuffer, 0, &xfbBuffer)) {
+                const unsigned indexOfBuffer = 2 * xfbBuffer;
+                xfbState[indexOfBuffer] = 0;
+                SPIRVWord streamId = InvalidValue;
+                if (entry->hasMemberDecorate(i, DecorationStream, 0, &streamId))
+                  xfbState[indexOfBuffer] = streamId;
 
-          // Update indexOfBuffer for block array, the N array-elements are captured by N consecutive buffers.
-          SPIRVType *bt = bv->getType()->getPointerElementType();
-          if (bt->isTypeArray()) {
-            assert(m_valueMap.find(bv) != m_valueMap.end());
-            auto output = cast<GlobalVariable>(m_valueMap[bv]);
-            MDNode *metaNode = output->getMetadata(gSPIRVMD::InOut);
-            assert(metaNode);
-            auto elemMeta = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
-            // Find the innermost array-element
-            auto elemTy = bt;
-            uint64_t elemCount = 0;
-            ShaderInOutMetadata outMetadata = {};
-            do {
-              assert(elemMeta->getNumOperands() == 4);
-              outMetadata.U64All[0] = cast<ConstantInt>(elemMeta->getOperand(2))->getZExtValue();
-              outMetadata.U64All[1] = cast<ConstantInt>(elemMeta->getOperand(3))->getZExtValue();
-              elemCount = elemTy->getArrayLength();
-
-              elemTy = elemTy->getArrayElementType();
-              elemMeta = cast<Constant>(elemMeta->getOperand(1));
-            } while (elemTy->isTypeArray());
-
-            if (outMetadata.IsBlockArray) {
-              // The even index (0,2,4,6) of !lgc.xfb.state metadata corresponds the buffer index (0~3).
-              const unsigned bufferIdx = outMetadata.XfbBuffer;
-              const int streamId = xfbState[2 * bufferIdx];
-              const unsigned stride = xfbState[2 * bufferIdx + 1];
-              for (unsigned idx = 0; idx < elemCount; ++idx) {
-                const unsigned indexOfBuffer = 2 * (bufferIdx + idx);
-                xfbState[indexOfBuffer] = streamId;
-                xfbState[indexOfBuffer + 1] = stride;
+                SPIRVWord xfbStride = InvalidValue;
+                if (entry->hasMemberDecorate(i, DecorationXfbStride, 0, &xfbStride)) {
+                  const unsigned indexOfStride = indexOfBuffer + 1;
+                  xfbState[indexOfStride] = xfbStride;
+                }
               }
+            }
+          }
+        }
+        if (xfbBuffer == InvalidValue)
+          continue;
+
+        // Update indexOfBuffer for block array, the N array-elements are captured by N consecutive buffers.
+        SPIRVType *bt = bv->getType()->getPointerElementType();
+        if (bt->isTypeArray()) {
+          assert(m_valueMap.find(bv) != m_valueMap.end());
+          auto output = cast<GlobalVariable>(m_valueMap[bv]);
+          MDNode *metaNode = output->getMetadata(gSPIRVMD::InOut);
+          assert(metaNode);
+          auto elemMeta = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
+          // Find the innermost array-element
+          auto elemTy = bt;
+          uint64_t elemCount = 0;
+          ShaderInOutMetadata outMetadata = {};
+          do {
+            assert(elemMeta->getNumOperands() == 4);
+            outMetadata.U64All[0] = cast<ConstantInt>(elemMeta->getOperand(2))->getZExtValue();
+            outMetadata.U64All[1] = cast<ConstantInt>(elemMeta->getOperand(3))->getZExtValue();
+            elemCount = elemTy->getArrayLength();
+
+            elemTy = elemTy->getArrayElementType();
+            elemMeta = cast<Constant>(elemMeta->getOperand(1));
+          } while (elemTy->isTypeArray());
+
+          if (outMetadata.IsBlockArray) {
+            // The even index (0,2,4,6) of !lgc.xfb.state metadata corresponds the buffer index (0~3).
+            const unsigned bufferIdx = outMetadata.XfbBuffer;
+            const int streamId = xfbState[2 * bufferIdx];
+            const unsigned stride = xfbState[2 * bufferIdx + 1];
+            for (unsigned idx = 0; idx < elemCount; ++idx) {
+              const unsigned indexOfBuffer = 2 * (bufferIdx + idx);
+              xfbState[indexOfBuffer] = streamId;
+              xfbState[indexOfBuffer + 1] = stride;
             }
           }
         }
@@ -7627,12 +7590,14 @@ bool SPIRVToLLVM::transShaderDecoration(SPIRVValue *bv, Value *v) {
 
     } else if (as == SPIRAS_Uniform || as == SPIRAS_TaskPayload) {
       // Translate decorations of blocks
-      // Remove array dimensions, it is useless for block metadata building
-      SPIRVType *blockTy = nullptr;
-
-      blockTy = bv->getType()->getPointerElementType();
-      while (blockTy->isTypeArray())
-        blockTy = blockTy->getArrayElementType();
+      SPIRVType *blockTy = bv->getType()->getPointerElementType();
+      // If not task payload, try to remove block array dimensions. Note that task
+      // payload doesn't have such dimensions.
+      if (as != SPIRAS_TaskPayload) {
+        // Remove array dimensions, it is useless for block metadata building
+        while (blockTy->isTypeArray())
+          blockTy = blockTy->getArrayElementType();
+      }
       bool isStructTy = blockTy->isTypeStruct();
 #if VKI_RAY_TRACING
       isStructTy = isStructTy || blockTy->isTypeAccelerationStructureKHR();
@@ -8080,21 +8045,13 @@ Constant *SPIRVToLLVM::buildShaderInOutMetadata(SPIRVType *bt, ShaderInOutDecora
     // Enable transform feedback buffer if transform feedback offset is declared, and then
     // find the minimum member transform feedback offset as starting block transform feedback offset
     for (auto memberIdx = 0; memberIdx < numMembers; ++memberIdx) {
-      if (bt->hasMemberDecorate(memberIdx, DecorationXfbBuffer, 0, &xfbBuffer))
-        inOutDec.XfbBuffer = xfbBuffer;
-
-      if (bt->hasMemberDecorate(memberIdx, DecorationXfbStride, 0, &xfbStride))
-        inOutDec.XfbStride = xfbStride;
-
       if (bt->hasMemberDecorate(memberIdx, DecorationOffset, 0, &xfbOffset)) {
-        // NOTE: Transform feedback is triggered only if "xfb_offset" is specified. And in such case, "xfb_stride"
-        // must be specified as well.
-        if (inOutDec.XfbStride > 0)
-          inOutDec.IsXfb = true;
         if (xfbOffset < blockXfbOffset)
           blockXfbOffset = xfbOffset;
       }
     }
+    if (blockXfbOffset == SPIRVID_INVALID)
+      blockXfbOffset = 0;
 
     for (auto memberIdx = 0; memberIdx < numMembers; ++memberIdx) {
       auto memberDec = inOutDec;
@@ -8141,6 +8098,12 @@ Constant *SPIRVToLLVM::buildShaderInOutMetadata(SPIRVType *bt, ShaderInOutDecora
         memberDec.Interp.Mode = InterpModeFlat;
       }
 
+      if (bt->hasMemberDecorate(memberIdx, DecorationXfbBuffer, 0, &xfbBuffer))
+        memberDec.XfbBuffer = xfbBuffer;
+
+      if (bt->hasMemberDecorate(memberIdx, DecorationXfbStride, 0, &xfbStride))
+        memberDec.XfbStride = xfbStride;
+
       auto memberTy = bt->getStructMemberType(memberIdx);
       bool alignTo64Bit = checkContains64BitType(memberTy);
       if (bt->hasMemberDecorate(memberIdx, DecorationOffset, 0, &xfbOffset)) {
@@ -8148,6 +8111,10 @@ Constant *SPIRVToLLVM::buildShaderInOutMetadata(SPIRVType *bt, ShaderInOutDecora
         // Then use DecorationOffset as starting XfbExtraOffset
         memberDec.XfbExtraOffset = xfbOffset - blockXfbOffset;
         memberDec.XfbOffset = blockXfbOffset;
+        // NOTE: Transform feedback is triggered only if "xfb_offset" is specified. And in such case, "xfb_stride"
+        // must be specified as well.
+        if (memberDec.XfbStride > 0)
+          memberDec.IsXfb = true;
       } else {
         if (alignTo64Bit)
           // Align next XfbExtraOffset to 64-bit (8 bytes)
@@ -8656,8 +8623,6 @@ Value *SPIRVToLLVM::transGLSLExtInst(SPIRVExtInst *extInst, BasicBlock *bb) {
     // Frexp: Store the exponent and return the mantissa.
     Type *pointeeType = getPointeeType(extInst->getValues(bArgs)[1]);
     exp = getBuilder()->CreateSExtOrTrunc(exp, pointeeType);
-    // TODO: Remove this when LLPC will switch fully to opaque pointers.
-    assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(args[1]->getType(), pointeeType));
     // Vectors are represented as arrays in memory, so we need to cast the pointer of array to pointer of vector before
     // storing.
     if (exp->getType()->isVectorTy()) {

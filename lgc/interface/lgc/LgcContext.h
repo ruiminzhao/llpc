@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -99,9 +99,6 @@ public:
   // Get LLVM context
   llvm::LLVMContext &getContext() const { return m_context; }
 
-  // Get the dialects context.
-  llvm_dialects::DialectContext &getDialectContext() const { return *m_dialectContext; }
-
   // Get the target machine.
   llvm::TargetMachine *getTargetMachine() const { return m_targetMachine; }
 
@@ -166,7 +163,6 @@ private:
   unsigned m_palAbiVersion = 0xFFFFFFFF;          // PAL pipeline ABI version to compile for
   PassManagerCache *m_passManagerCache = nullptr; // Pass manager cache and creator
   llvm::CodeGenOpt::Level m_initialOptLevel;      // Optimization level at initialization
-  std::unique_ptr<llvm_dialects::DialectContext> m_dialectContext;
 };
 
 } // namespace lgc

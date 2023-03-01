@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -168,8 +168,6 @@ Value *SpirvLowerRayTracingBuiltIn::processBuiltIn(GlobalVariable *global, Instr
   auto meta = mdconst::dyn_extract<Constant>(metaNode->getOperand(0));
   unsigned startOperand = 0;
   Type *globalTy = global->getValueType();
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(IS_OPAQUE_OR_POINTEE_TYPE_MATCHES(global->getType(), globalTy));
   if (globalTy->isArrayTy()) {
     assert(meta->getNumOperands() == 4);
     startOperand += 2;
@@ -196,8 +194,7 @@ Value *SpirvLowerRayTracingBuiltIn::processBuiltIn(GlobalVariable *global, Instr
     Value *rayDispatchWidthPtr =
         m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, offsetOfRayDispatchWidth, "");
     Type *int32x3Ty = FixedVectorType::get(m_builder->getInt32Ty(), 3);
-    Type *int32x3PtrTy = m_builder->getBufferDescTy(int32x3Ty);
-    input = m_builder->CreateLoad(int32x3Ty, m_builder->CreateBitCast(rayDispatchWidthPtr, int32x3PtrTy));
+    input = m_builder->CreateLoad(int32x3Ty, rayDispatchWidthPtr);
     break;
   }
   case BuiltInPrimitiveId: {
@@ -282,51 +279,49 @@ void SpirvLowerRayTracingBuiltIn::setShaderTableVariables(GlobalValue *global, S
                                                           Instruction *insertPos) {
   m_builder->SetInsertPoint(insertPos);
   Value *value = nullptr;
-  Type *int64PtrTy = m_builder->getBufferDescTy(m_builder->getInt64Ty());
-  Type *int32PtrTy = m_builder->getBufferDescTy(m_builder->getInt32Ty());
   Value *const bufferDesc = getDispatchRaysInfoDesc(insertPos);
 
   switch (tableKind) {
   case ShaderTable::RayGenTableAddr: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, rayGenerationTable);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt64Ty(), m_builder->CreateBitCast(valuePtr, int64PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt64Ty(), valuePtr);
     break;
   }
   case ShaderTable::MissTableAddr: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, missTable.baseAddress);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt64Ty(), m_builder->CreateBitCast(valuePtr, int64PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt64Ty(), valuePtr);
     break;
   }
   case ShaderTable::HitGroupTableAddr: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, hitGroupTable.baseAddress);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt64Ty(), m_builder->CreateBitCast(valuePtr, int64PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt64Ty(), valuePtr);
     break;
   }
   case ShaderTable::CallableTableAddr: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, callableTable.baseAddress);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt64Ty(), m_builder->CreateBitCast(valuePtr, int64PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt64Ty(), valuePtr);
     break;
   }
   case ShaderTable::MissTableStride: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, missTable.strideInBytes);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt32Ty(), m_builder->CreateBitCast(valuePtr, int32PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt32Ty(), valuePtr);
     break;
   }
   case ShaderTable::HitGroupTableStride: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, hitGroupTable.strideInBytes);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt32Ty(), m_builder->CreateBitCast(valuePtr, int32PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt32Ty(), valuePtr);
     break;
   }
   case ShaderTable::CallableTableStride: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, callableTable.strideInBytes);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt32Ty(), m_builder->CreateBitCast(valuePtr, int32PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt32Ty(), valuePtr);
     break;
   }
   case ShaderTable::ShaderRecordIndex: {
@@ -336,7 +331,7 @@ void SpirvLowerRayTracingBuiltIn::setShaderTableVariables(GlobalValue *global, S
   case ShaderTable::TraceRayGpuVirtAddr: {
     auto offset = offsetof(GpuRt::DispatchRaysInfoData, traceRayGpuVa);
     Value *valuePtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, m_builder->getInt32(offset), "");
-    value = m_builder->CreateLoad(m_builder->getInt64Ty(), m_builder->CreateBitCast(valuePtr, int64PtrTy));
+    value = m_builder->CreateLoad(m_builder->getInt64Ty(), valuePtr);
     break;
   }
   default: {
@@ -356,9 +351,8 @@ void SpirvLowerRayTracingBuiltIn::setShaderTableVariables(GlobalValue *global, S
 Value *SpirvLowerRayTracingBuiltIn::getDispatchRaysInfoDesc(Instruction *insertPos) {
   if (!m_dispatchRaysInfoDesc) {
     m_builder->SetInsertPoint(insertPos);
-    m_dispatchRaysInfoDesc =
-        m_builder->CreateLoadBufferDesc(TraceRayDescriptorSet, RayTracingResourceIndexDispatchRaysInfo,
-                                        m_builder->getInt32(0), 0, m_builder->getInt8Ty());
+    m_dispatchRaysInfoDesc = m_builder->CreateLoadBufferDesc(
+        TraceRayDescriptorSet, RayTracingResourceIndexDispatchRaysInfo, m_builder->getInt32(0), 0);
   }
   return m_dispatchRaysInfoDesc;
 }

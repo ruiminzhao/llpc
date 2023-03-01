@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -44,8 +44,6 @@ using namespace llvm;
 //
 // @param [in/out] outStream : Stream to write ELF to
 void GlueShader::compile(raw_pwrite_stream &outStream) {
-  auto dialectGuard = llvm_dialects::withDialects(m_lgcContext->getDialectContext());
-
   // Generate the glue shader IR module.
   std::unique_ptr<Module> module(generate());
 

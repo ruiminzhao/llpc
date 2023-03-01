@@ -1,6 +1,6 @@
 
 ; BEGIN_SHADERTEST
-; RUN: amdllpc -enable-opaque-pointers=true -v %gfxip %s | FileCheck -check-prefix=SHADERTEST %s
+; RUN: amdllpc -v %gfxip %s | FileCheck -check-prefix=SHADERTEST %s
 
 ; SHADERTEST-LABEL: {{^// LLPC}} SPIRV-to-LLVM translation results
 ; SHADERTEST: getelementptr{{.*}}<{ [8 x [4 x float]], i32 }>, ptr addrspace({{.*}}) @{{.*}}, i32 0,
@@ -33,6 +33,7 @@
                OpName %16 ""
                OpName %26 "fragColor"
                OpDecorate %12 ArrayStride 16
+               OpDecorate %26 Location 1
                OpMemberDecorate %14 0 Offset 0
                OpMemberDecorate %14 1 Offset 128
                OpDecorate %14 Block

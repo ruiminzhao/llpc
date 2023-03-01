@@ -1,7 +1,7 @@
 ##
  #######################################################################################################################
  #
- #  Copyright (c) 2020-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ #  Copyright (c) 2020-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  #
  #  Permission is hereby granted, free of charge, to any person obtaining a copy
  #  of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,10 @@ if(NOT LLPC_IS_STANDALONE)
   find_package(Python3 ${LLVM_MINIMUM_PYTHON_VERSION} REQUIRED
     COMPONENTS Interpreter)
 
-  list(APPEND CMAKE_MODULE_PATH "${XGL_LLVM_BUILD_PATH}/${CMAKE_CFG_INTDIR}/lib/cmake/llvm")
+  list(APPEND CMAKE_MODULE_PATH
+    "${XGL_LLVM_BUILD_PATH}/lib/cmake/llvm"
+    "${XGL_LLVM_BUILD_PATH}/${CMAKE_CFG_INTDIR}/lib/cmake/llvm" # Workaround for VS generator with older LLVM.
+  )
   include(LLVMConfig)
 
   # required by lit.site.cfg.py.in.

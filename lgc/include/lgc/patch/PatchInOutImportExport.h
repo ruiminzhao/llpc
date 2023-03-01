@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -193,9 +193,13 @@ private:
 
   llvm::Value *getSubgroupLocalInvocationId(BuilderBase &builder);
 
-  WorkgroupLayout calculateWorkgroupLayout();
-  llvm::Value *reconfigWorkgroup(llvm::Value *localInvocationId, llvm::Instruction *insertPos);
-  llvm::Value *swizzleLocalInvocationIdIn8x4(llvm::Value *localInvocationId, llvm::Instruction *insertPos);
+  SwizzleWorkgroupLayout calculateWorkgroupLayout();
+
+  llvm::Value *reconfigWorkgroupLayout(llvm::Value *localInvocationId, WorkgroupLayout macroLayout,
+                                       WorkgroupLayout microLayout, unsigned workgroupSizeX, unsigned workgroupSizeY,
+                                       unsigned workgroupSizeZ, bool isHwLocalInvocationId,
+                                       llvm::Instruction *insertPos);
+
   void createSwizzleThreadGroupFunction();
 
   void exportShadingRate(llvm::Value *shadingRate, llvm::Instruction *insertPos);

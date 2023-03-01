@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2017-2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2017-2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -100,8 +100,8 @@ static cl::opt<bool> DisableFetchShader("disable-fetch-shader", cl::desc("Disabl
 static cl::opt<bool> DisableColorExportShader("disable-color-export-shader", cl::desc("Disable color export shaders"),
                                               cl::init(false));
 
-// -subgroup-size: sub-group size exposed via Vulkan API.
-static cl::opt<int> SubgroupSize("subgroup-size", cl::desc("Sub-group size exposed via Vulkan API"), cl::init(64));
+// -subgroup-size: subgroup size exposed via Vulkan API.
+static cl::opt<int> SubgroupSize("subgroup-size", cl::desc("Subgroup size exposed via Vulkan API"), cl::init(64));
 
 // -enable-shadow-desc: enable shadow descriptor table
 static cl::opt<bool> EnableShadowDescriptorTable("enable-shadow-desc", cl::desc("Enable shadow descriptor table"));
@@ -348,8 +348,11 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
       else {
         options.nggFlags = (nggState.enableGsUse ? NggFlagEnableGsUse : 0) |
                            (nggState.forceCullingMode ? NggFlagForceCullingMode : 0) |
-                           (nggState.compactMode == NggCompactDisable ? NggFlagCompactDisable : 0) |
-                           (nggState.enableVertexReuse ? NggFlagEnableVertexReuse : 0) |
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
+                           (nggState.compactMode == NggCompactVertices ? NggFlagCompactVertex : 0) |
+#else
+                           (nggState.compactVertex ? NggFlagCompactVertex : 0) |
+#endif
                            (nggState.enableBackfaceCulling ? NggFlagEnableBackfaceCulling : 0) |
                            (nggState.enableFrustumCulling ? NggFlagEnableFrustumCulling : 0) |
                            (nggState.enableBoxFilterCulling ? NggFlagEnableBoxFilterCulling : 0) |
@@ -708,6 +711,8 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
         destNode.concreteType = ResourceNodeType::DescriptorBufferCompact;
       else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorConstBuffer)
         destNode.concreteType = ResourceNodeType::DescriptorBuffer;
+      else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorMutable)
+        destNode.concreteType = ResourceNodeType::DescriptorMutable;
       else
         destNode.concreteType = static_cast<ResourceNodeType>(node.type);
 
@@ -716,36 +721,44 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
       destNode.abstractType = destNode.concreteType;
       destNode.immutableValue = nullptr;
       destNode.immutableSize = 0;
-      switch (node.type) {
-      case ResourceMappingNodeType::DescriptorImage:
-      case ResourceMappingNodeType::DescriptorResource:
-      case ResourceMappingNodeType::DescriptorFmask:
-        destNode.stride = DescriptorSizeResource / sizeof(uint32_t);
-        break;
-      case ResourceMappingNodeType::DescriptorSampler:
-        destNode.stride = DescriptorSizeSampler / sizeof(uint32_t);
-        break;
-      case ResourceMappingNodeType::DescriptorCombinedTexture:
-        destNode.stride = (DescriptorSizeResource + DescriptorSizeSampler) / sizeof(uint32_t);
-        break;
-      case ResourceMappingNodeType::InlineBuffer:
-      case ResourceMappingNodeType::DescriptorYCbCrSampler:
-        // Current node.sizeInDwords = resourceDescSizeInDwords * M * N (M means plane count, N means array count)
-        // TODO: Desired destNode.stride = resourceDescSizeInDwords * M
-        //
-        // Temporary set stride to be node.sizeInDwords, for that the stride varies from different plane
-        // counts, and we don't know the real plane count currently.
-        // Thus, set stride to sizeInDwords, and just divide array count when it is available in handling immutable
-        // sampler descriptor (For YCbCrSampler, immutable sampler is always accessible)
-        destNode.stride = node.sizeInDwords;
-        break;
-      case ResourceMappingNodeType::DescriptorBufferCompact:
-      case ResourceMappingNodeType::DescriptorConstBufferCompact:
-        destNode.stride = 2;
-        break;
-      default:
-        destNode.stride = DescriptorSizeBuffer / sizeof(uint32_t);
-        break;
+
+      // Normally we know the stride of items in a descriptor array. However in specific circumstances
+      // the type is not known by llpc. This is the case with mutable descriptors where we need the
+      // stride to be explicitly specified.
+      if (node.srdRange.strideInDwords > 0) {
+        destNode.stride = node.srdRange.strideInDwords;
+      } else {
+        switch (node.type) {
+        case ResourceMappingNodeType::DescriptorImage:
+        case ResourceMappingNodeType::DescriptorResource:
+        case ResourceMappingNodeType::DescriptorFmask:
+          destNode.stride = DescriptorSizeResource / sizeof(uint32_t);
+          break;
+        case ResourceMappingNodeType::DescriptorSampler:
+          destNode.stride = DescriptorSizeSampler / sizeof(uint32_t);
+          break;
+        case ResourceMappingNodeType::DescriptorCombinedTexture:
+          destNode.stride = (DescriptorSizeResource + DescriptorSizeSampler) / sizeof(uint32_t);
+          break;
+        case ResourceMappingNodeType::InlineBuffer:
+        case ResourceMappingNodeType::DescriptorYCbCrSampler:
+          // Current node.sizeInDwords = resourceDescSizeInDwords * M * N (M means plane count, N means array count)
+          // TODO: Desired destNode.stride = resourceDescSizeInDwords * M
+          //
+          // Temporary set stride to be node.sizeInDwords, for that the stride varies from different plane
+          // counts, and we don't know the real plane count currently.
+          // Thus, set stride to sizeInDwords, and just divide array count when it is available in handling immutable
+          // sampler descriptor (For YCbCrSampler, immutable sampler is always accessible)
+          destNode.stride = node.sizeInDwords;
+          break;
+        case ResourceMappingNodeType::DescriptorBufferCompact:
+        case ResourceMappingNodeType::DescriptorConstBufferCompact:
+          destNode.stride = 2;
+          break;
+        default:
+          destNode.stride = DescriptorSizeBuffer / sizeof(uint32_t);
+          break;
+        }
       }
 
       // Only check for an immutable value if the resource is or contains a sampler. This specifically excludes
@@ -996,6 +1009,12 @@ void PipelineContext::setColorExportState(Pipeline *pipeline, Util::MetroHash64 
     }
   }
 
+  if (state.alphaToCoverageEnable && formats.empty()) {
+    // NOTE: We must export alpha channel for alpha to coverage, if there is no color export,
+    // we force a dummy color export.
+    formats.push_back({BufDataFormat32, BufNumFormatFloat});
+  }
+
   pipeline->setColorExportState(formats, state);
 }
 
@@ -1070,12 +1089,12 @@ std::pair<BufDataFormat, BufNumFormat> PipelineContext::mapVkFormat(VkFormat for
       BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8_UINT, BufDataFormat8_8, BufNumFormatUint),
       BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8_SINT, BufDataFormat8_8, BufNumFormatSint),
       COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8_SRGB, BufDataFormat8_8, BufNumFormatSrgb),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_UNORM, BufDataFormat8_8_8, BufNumFormatUnorm),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SNORM, BufDataFormat8_8_8, BufNumFormatSnorm),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_USCALED, BufDataFormat8_8_8, BufNumFormatUscaled),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SSCALED, BufDataFormat8_8_8, BufNumFormatSscaled),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_UINT, BufDataFormat8_8_8, BufNumFormatUint),
-      COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SINT, BufDataFormat8_8_8, BufNumFormatSint),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_UNORM, BufDataFormat8_8_8, BufNumFormatUnorm),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SNORM, BufDataFormat8_8_8, BufNumFormatSnorm),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_USCALED, BufDataFormat8_8_8, BufNumFormatUscaled),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SSCALED, BufDataFormat8_8_8, BufNumFormatSscaled),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_UINT, BufDataFormat8_8_8, BufNumFormatUint),
+      BOTH_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SINT, BufDataFormat8_8_8, BufNumFormatSint),
       COLOR_FORMAT_ENTRY(VK_FORMAT_R8G8B8_SRGB, BufDataFormat8_8_8, BufNumFormatSrgb),
       COLOR_FORMAT_ENTRY(VK_FORMAT_B8G8R8_UNORM, BufDataFormat8_8_8_Bgr, BufNumFormatUnorm),
       COLOR_FORMAT_ENTRY(VK_FORMAT_B8G8R8_SNORM, BufDataFormat8_8_8_Bgr, BufNumFormatSnorm),
