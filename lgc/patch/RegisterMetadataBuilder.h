@@ -31,6 +31,7 @@
 #pragma once
 
 #include "ConfigBuilderBase.h"
+#include "lgc/state/PipelineShaders.h"
 #include "llvm/ADT/DenseSet.h"
 
 namespace lgc {
@@ -40,8 +41,8 @@ namespace Gfx9 {
 // Represents the builder to generate register configurations for GFX11 plus chips.
 class RegisterMetadataBuilder : public ConfigBuilderBase {
 public:
-  RegisterMetadataBuilder(llvm::Module *module, PipelineState *PipelineState)
-      : ConfigBuilderBase(module, PipelineState) {}
+  RegisterMetadataBuilder(llvm::Module *module, PipelineState *PipelineState, PipelineShadersResult *pipelineShaders)
+      : ConfigBuilderBase(module, PipelineState), m_pipelineShaders(pipelineShaders) {}
 
   void buildPalMetadata();
 
@@ -53,13 +54,16 @@ private:
   void buildPsRegisters();
   void buildCsRegisters(ShaderStage shaderStage);
 
-  void buildShaderExecutionRegisters(Util::Abi::HardwareStage hwStageId, ShaderStage apiStage1, ShaderStage apiStage2);
+  void buildShaderExecutionRegisters(Util::Abi::HardwareStage hwStage, ShaderStage apiStage1, ShaderStage apiStage2);
   void buildPaSpecificRegisters();
   void setVgtShaderStagesEn(unsigned hwStageMask);
   void setIaMultVgtParam();
   void setVgtTfParam();
 
+  unsigned calcLdsSize(unsigned ldsSizeInDwords);
+
   bool m_isNggMode = false;
+  PipelineShadersResult *m_pipelineShaders; // API shaders in the pipeline
 };
 
 } // namespace Gfx9

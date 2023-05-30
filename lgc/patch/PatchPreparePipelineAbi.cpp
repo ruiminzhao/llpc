@@ -238,7 +238,8 @@ void PatchPreparePipelineAbi::writeTessFactors(PipelineState *pipelineState, Val
   Value *tfBufferOffset = builder.CreateMul(relPatchId, builder.getInt32(calcFactor.tessFactorStride * sizeof(float)));
 
   CoherentFlag coherent = {};
-  coherent.bits.glc = true;
+  if (pipelineState->getTargetInfo().getGfxIpVersion().major <= 11)
+    coherent.bits.glc = true;
 
   const auto numOuterTfs = cast<FixedVectorType>(outerTf->getType())->getNumElements();
   const auto numInnerTfs = innerTf ? cast<FixedVectorType>(innerTf->getType())->getNumElements()
@@ -252,7 +253,7 @@ void PatchPreparePipelineAbi::writeTessFactors(PipelineState *pipelineState, Val
   if (pipelineState->getTargetInfo().getGfxIpVersion().major == 10) {
     bufferFormatX2 = BUF_FORMAT_32_32_FLOAT_GFX10;
     bufferFormatX4 = BUF_FORMAT_32_32_32_32_FLOAT_GFX10;
-  } else if (pipelineState->getTargetInfo().getGfxIpVersion().major == 11) {
+  } else if (pipelineState->getTargetInfo().getGfxIpVersion().major >= 11) {
     bufferFormatX2 = BUF_FORMAT_32_32_FLOAT_GFX11;
     bufferFormatX4 = BUF_FORMAT_32_32_32_32_FLOAT_GFX11;
   }
@@ -424,8 +425,7 @@ void PatchPreparePipelineAbi::mergeShader(Module &module) {
         // If NGG is enabled, ES-GS merged shader should be present even if GS is absent
         auto esEntryPoint = m_pipelineShaders->getEntryPoint(ShaderStageVertex);
         if (esEntryPoint) {
-          if (esEntryPoint)
-            lgc::setShaderStage(esEntryPoint, ShaderStageVertex);
+          lgc::setShaderStage(esEntryPoint, ShaderStageVertex);
           auto primShaderEntryPoint = shaderMerger.buildPrimShader(esEntryPoint, nullptr, nullptr);
           primShaderEntryPoint->setCallingConv(CallingConv::AMDGPU_GS);
           lgc::setShaderStage(primShaderEntryPoint, ShaderStageVertex);
@@ -485,7 +485,7 @@ void PatchPreparePipelineAbi::addAbiMetadata(Module &module) {
     configBuilder.buildPalMetadata();
   } else {
     if (m_pipelineState->useRegisterFieldFormat()) {
-      Gfx9::RegisterMetadataBuilder regMetadataBuilder(&module, m_pipelineState);
+      Gfx9::RegisterMetadataBuilder regMetadataBuilder(&module, m_pipelineState, m_pipelineShaders);
       regMetadataBuilder.buildPalMetadata();
     } else {
       Gfx9::ConfigBuilder configBuilder(&module, m_pipelineState);

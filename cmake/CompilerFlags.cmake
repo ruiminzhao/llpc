@@ -19,7 +19,6 @@ function(set_compiler_options PROJECT_NAME ENABLE_WERROR)
             -Wall
             -Wno-delete-incomplete
             -Wno-delete-non-virtual-dtor
-            -Wno-invalid-offsetof
             -Wno-missing-braces
             -Wno-missing-field-initializers
             -Wno-parentheses

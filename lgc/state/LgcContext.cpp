@@ -104,10 +104,10 @@ static void setOptionDefault(const char *name, StringRef value) {
 }
 
 // =====================================================================================================================
-// Initialize the middle-end. This must be called before the first LgcContext::create, although you are
-// allowed to call it again after that. It must also be called before LLVM command-line processing, so
-// that you can use a pass name in an option such as -print-after. If multiple concurrent compiles are
-// possible, this should be called in a thread-safe way.
+// Initialize the middle-end. This must be called before the first LgcContext::createTargetMachine or
+// LgcContext::create, although you are allowed to call it again after that. It must also be called before
+// LLVM command-line processing, so that you can use a pass name in an option such as -print-after. If multiple
+// concurrent compiles are possible, this should be called in a thread-safe way.
 void LgcContext::initialize() {
 #ifndef NDEBUG
   Initialized = true;
@@ -149,7 +149,12 @@ void LgcContext::initialize() {
   setOptionDefault("simplifycfg-sink-common", "0");
   setOptionDefault("amdgpu-vgpr-index-mode", "1"); // force VGPR indexing on GFX8
   setOptionDefault("amdgpu-atomic-optimizations", "1");
+#if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 458033
+  // Old version of the code
   setOptionDefault("use-gpu-divergence-analysis", "1");
+#else
+// New version of the code (also handles unknown version, which we treat as latest)
+#endif
   setOptionDefault("structurizecfg-skip-uniform-regions", "1");
   setOptionDefault("spec-exec-max-speculation-cost", "10");
 #if !defined(LLVM_HAVE_BRANCH_AMD_GFX)
@@ -197,28 +202,18 @@ bool LgcContext::isGpuNameValid(llvm::StringRef gpuName) {
 }
 
 // =====================================================================================================================
-// Create the LgcContext. Returns nullptr on failure to recognize the AMDGPU target whose name is specified
+// Create TargetMachine. Returns nullptr on failure to recognize the AMDGPU target whose name is specified.
 //
-// @param context : LLVM context to give each Builder
 // @param gpuName : LLVM GPU name (e.g. "gfx900"); empty to use -mcpu option setting
-// @param palAbiVersion : PAL pipeline ABI version to compile for
 // @param optLevel : LLVM optimization level used to initialize target machine
-LgcContext *LgcContext::create(LLVMContext &context, StringRef gpuName, unsigned palAbiVersion,
-                               CodeGenOpt::Level optLevel) {
-  assert(Initialized && "Must call LgcContext::initialize before LgcContext::create");
-
-  LgcContext *builderContext = new LgcContext(context, palAbiVersion);
+std::unique_ptr<TargetMachine> LgcContext::createTargetMachine(StringRef gpuName, CodeGenOpt::Level optLevel) {
+  assert(Initialized && "Must call LgcContext::initialize before LgcContext::createTargetMachine");
 
   std::string mcpuName = codegen::getMCPU(); // -mcpu setting from llvm/CodeGen/CommandFlags.h
   if (gpuName == "")
     gpuName = mcpuName;
-
-  builderContext->m_targetInfo = new TargetInfo;
-  // If we can't set the target info it means the gpuName isn't valid
-  if (!builderContext->m_targetInfo->setTargetInfo(gpuName)) {
-    delete builderContext;
+  if (!isGpuNameValid(gpuName))
     return nullptr;
-  }
 
   // Get the LLVM target and create the target machine. This should not fail, as we determined above
   // that we support the requested target.
@@ -236,19 +231,41 @@ LgcContext *LgcContext::create(LLVMContext &context, StringRef gpuName, unsigned
     targetOpts.MCOptions.AsmVerbose = true;
   }
 
-  // Save optimization level given at initialization.
-  builderContext->m_initialOptLevel = optLevel;
-
   // If the "opt" option is given, set the optimization level to that value.
-  if (OptLevel.getPosition() != 0) {
+  if (OptLevel.getPosition() != 0)
     optLevel = OptLevel;
-  }
 
   LLPC_OUTS("TargetMachine optimization level = " << optLevel << "\n");
 
-  builderContext->m_targetMachine = target->createTargetMachine(triple, gpuName, "", targetOpts, {}, {}, optLevel);
-  assert(builderContext->m_targetMachine);
+  return std::unique_ptr<TargetMachine>(target->createTargetMachine(triple, gpuName, "", targetOpts, {}, {}, optLevel));
+}
+
+// =====================================================================================================================
+// Create the LgcContext.
+//
+// @param targetMachine : LLVM TargetMachine to use. Caller retains ownership and must free it when finished.
+// @param context : LLVM context to give each Builder. Caller retains ownership and must free it when finished.
+// @param palAbiVersion : PAL pipeline ABI version to compile for
+LgcContext *LgcContext::create(TargetMachine *targetMachine, LLVMContext &context, unsigned palAbiVersion) {
+  assert(Initialized && "Must call LgcContext::initialize before LgcContext::create");
+
+  LgcContext *builderContext = new LgcContext(context, palAbiVersion);
+  builderContext->m_targetMachine = targetMachine;
+
+  builderContext->m_targetInfo = new TargetInfo;
+  if (!builderContext->m_targetInfo->setTargetInfo(targetMachine->getTargetCPU())) {
+    delete builderContext;
+    return nullptr;
+  }
+
   return builderContext;
+}
+
+// =====================================================================================================================
+// Get the value of the -emit-lgc option. BuilderRecorder uses this to decide whether to omit the opcode
+// metadata when recording a Builder call.
+bool LgcContext::getEmitLgc() {
+  return EmitLgc;
 }
 
 // =====================================================================================================================
@@ -260,7 +277,6 @@ LgcContext::LgcContext(LLVMContext &context, unsigned palAbiVersion) : m_context
 
 // =====================================================================================================================
 LgcContext::~LgcContext() {
-  delete m_targetMachine;
   delete m_targetInfo;
   delete m_passManagerCache;
 }
@@ -274,11 +290,12 @@ Pipeline *LgcContext::createPipeline() {
 }
 
 // =====================================================================================================================
-// Create a Builder object.
+// Create a Builder object. This is now unnecessary, as you can just create a local variable Builder or "new" it
+// yourself.
 //
-// @param pipeline : Pipeline object for pipeline compile, nullptr for shader compile
+// @param pipeline : Ignored
 Builder *LgcContext::createBuilder(Pipeline *pipeline) {
-  return Builder::createBuilderRecorder(this, pipeline, EmitLgc);
+  return new Builder(getContext());
 }
 
 // =====================================================================================================================

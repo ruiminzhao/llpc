@@ -81,12 +81,18 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
   LLVM_DEBUG(dbgs() << "Run the pass Patch-Copy-Shader\n");
 
   Patch::init(&module);
+
   m_pipelineState = pipelineState;
+  m_pipelineSysValues.initialize(m_pipelineState);
+
   auto gsEntryPoint = pipelineShaders.getEntryPoint(ShaderStageGeometry);
   if (!gsEntryPoint) {
-    // No geometry shader -- copy shader not required.
+    // Skip copy shader generation if GS is absent
     return false;
   }
+
+  // Tell pipeline state there is a copy shader.
+  m_pipelineState->setShaderStageMask(m_pipelineState->getShaderStageMask() | (1U << ShaderStageCopyShader));
 
   // Gather GS generic export details.
   collectGsGenericOutputInfo(gsEntryPoint);
@@ -159,6 +165,9 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
   entryPoint->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
   entryPoint->setCallingConv(CallingConv::AMDGPU_VS);
 
+  // Set the shader stage on the new function.
+  setShaderStage(entryPoint, ShaderStageCopyShader);
+
   auto insertPos = module.getFunctionList().end();
   auto fsEntryPoint = pipelineShaders.getEntryPoint(ShaderStageFragment);
   if (fsEntryPoint)
@@ -217,8 +226,6 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
 
   if (m_pipelineState->isGsOnChip())
     m_lds = Patch::getLdsVariable(m_pipelineState, &module);
-  else
-    m_gsVsRingBufDesc = loadGsVsRingBufferDescriptor(builder);
 
   unsigned outputStreamCount = 0;
   unsigned outputStreamId = InvalidValue;
@@ -307,12 +314,6 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
     builder.CreateBr(endBlock);
   }
 
-  // Set the shader stage on the new function.
-  setShaderStage(entryPoint, ShaderStageCopyShader);
-
-  // Tell pipeline state there is a copy shader.
-  m_pipelineState->setShaderStageMask(m_pipelineState->getShaderStageMask() | (1U << ShaderStageCopyShader));
-
   return true;
 }
 
@@ -339,7 +340,10 @@ void PatchCopyShader::collectGsGenericOutputInfo(Function *gsEntryPoint) {
 
         InOutLocationInfo origLocInfo;
         origLocInfo.setLocation(cast<ConstantInt>(callInst->getOperand(0))->getZExtValue());
-        origLocInfo.setComponent(cast<ConstantInt>(callInst->getOperand(1))->getZExtValue());
+        unsigned component = cast<ConstantInt>(callInst->getOperand(1))->getZExtValue();
+        if (outputTy->getScalarSizeInBits() == 64)
+          component *= 2; // Component in location info is dword-based
+        origLocInfo.setComponent(component);
         origLocInfo.setStreamId(cast<ConstantInt>(callInst->getOperand(2))->getZExtValue());
 
         const auto locInfoMapIt = outputLocInfoMap.find(origLocInfo);
@@ -347,13 +351,8 @@ void PatchCopyShader::collectGsGenericOutputInfo(Function *gsEntryPoint) {
           continue;
         visitedLocInfos.insert(origLocInfo);
 
-        // Each output call is scalarized and exports 4 bytes for packing
-        unsigned byteSize = 4;
-        auto &newLocByteSizesMap = m_newLocByteSizesMapArray[origLocInfo.getStreamId()];
-        const unsigned newLoc = locInfoMapIt->second.getLocation();
-        if (m_pipelineState->canPackOutput(ShaderStageGeometry)) {
-          newLocByteSizesMap[newLoc] += byteSize;
-        } else {
+        unsigned dwordSize = 1; // Each output call is scalarized and exports 1 dword for packing
+        if (!m_pipelineState->canPackOutput(ShaderStageGeometry)) {
           unsigned compCount = 1;
           auto compTy = outputTy;
           auto outputVecTy = dyn_cast<FixedVectorType>(outputTy);
@@ -361,13 +360,24 @@ void PatchCopyShader::collectGsGenericOutputInfo(Function *gsEntryPoint) {
             compCount = outputVecTy->getNumElements();
             compTy = outputVecTy->getElementType();
           }
+
           unsigned bitWidth = compTy->getScalarSizeInBits();
           // NOTE: Currently, to simplify the design of load/store data from GS-VS ring, we always extend
           // byte/word to dword and store dword to GS-VS ring. So for 8-bit/16-bit data type, the actual byte size
           // is based on number of dwords.
           bitWidth = std::max(32u, bitWidth);
-          byteSize = bitWidth / 8 * compCount;
-          newLocByteSizesMap[newLoc] = byteSize;
+          dwordSize = bitWidth / 32 * compCount;
+        }
+
+        const unsigned streamId = origLocInfo.getStreamId();
+        const unsigned newLoc = locInfoMapIt->second.getLocation();
+        const unsigned newComp = locInfoMapIt->second.getComponent();
+        if (dwordSize > 4) {
+          assert(dwordSize <= 8); // <8 x dword> at most
+          m_outputLocCompSizeMap[streamId][newLoc][newComp] = 4;
+          m_outputLocCompSizeMap[streamId][newLoc + 1][newComp] = dwordSize - 4;
+        } else {
+          m_outputLocCompSizeMap[streamId][newLoc][newComp] = dwordSize;
         }
       }
     }
@@ -385,82 +395,40 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
   auto &locInfoXfbOutInfoMap = resUsage->inOutUsage.locInfoXfbOutInfoMap;
   auto &outputLocInfoMap = resUsage->inOutUsage.outputLocInfoMap;
 
-  // Build the map between new location and output value
-  DenseMap<unsigned, Value *> newLocValueMap;
-  // Collect the output value at each mapped location in the given stream
-  const auto &newLocByteSizesMap = m_newLocByteSizesMapArray[streamId];
-  for (const auto &locByteSizePair : newLocByteSizesMap) {
-    const unsigned newLoc = locByteSizePair.first;
-    const unsigned byteSize = locByteSizePair.second;
-    assert(byteSize % 4 == 0 && byteSize <= 32);
-    const unsigned dwordSize = byteSize / 4;
-    Value *outputValue = loadValueFromGsVsRing(dwordSize > 1 ? FixedVectorType::get(builder.getFloatTy(), dwordSize)
-                                                             : builder.getFloatTy(),
-                                               newLoc, streamId, builder);
-    newLocValueMap[newLoc] = outputValue;
+  // The output value at the new mapped <location, component>
+  DenseMap<unsigned, DenseMap<unsigned, Value *>> outputLocCompValue;
+  for (auto &locCompSizeInfo : m_outputLocCompSizeMap[streamId]) {
+    const unsigned newLoc = locCompSizeInfo.first;
+    for (auto &compSizeInfo : locCompSizeInfo.second) {
+      const unsigned newComp = compSizeInfo.first;
+      const unsigned dwordSize = compSizeInfo.second;
+      Value *outputValue = loadValueFromGsVsRing(dwordSize > 1 ? FixedVectorType::get(builder.getFloatTy(), dwordSize)
+                                                               : builder.getFloatTy(),
+                                                 newLoc, newComp, streamId, builder);
+      outputLocCompValue[newLoc][newComp] = outputValue;
+    }
   }
 
   if (m_pipelineState->enableXfb()) {
     // Export XFB output
-    if (m_pipelineState->canPackOutput(ShaderStageGeometry)) {
-      // With packing locations, we should collect the XFB output value at an original location
-      DenseMap<unsigned, std::pair<unsigned, SmallVector<Value *, 4>>> origLocCompElemsMap;
-      for (const auto &locInfoXfbInfoPair : locInfoXfbOutInfoMap) {
-        const InOutLocationInfo &origLocInfo = locInfoXfbInfoPair.first;
-        if (origLocInfo.getStreamId() != streamId || origLocInfo.isBuiltIn())
-          continue;
-        // Get each component from the packed output value
-        assert(outputLocInfoMap.count(origLocInfo));
-        auto &newLocInfo = outputLocInfoMap[origLocInfo];
-        assert(newLocValueMap.count(newLocInfo.getLocation()) > 0);
-        Value *const packedOutValue = newLocValueMap[newLocInfo.getLocation()];
-        Value *elem = packedOutValue->getType()->isVectorTy()
-                          ? builder.CreateExtractElement(packedOutValue, newLocInfo.getComponent())
-                          : packedOutValue;
+    for (const auto &locInfoXfbInfoPair : locInfoXfbOutInfoMap) {
+      const InOutLocationInfo &origLocInfo = locInfoXfbInfoPair.first;
+      if (origLocInfo.getStreamId() != streamId || origLocInfo.isBuiltIn())
+        continue;
 
-        auto &elements = origLocCompElemsMap[origLocInfo.getLocation()].second;
-        elements.push_back(elem);
-        origLocCompElemsMap[origLocInfo.getLocation()].first = origLocInfo.getComponent();
-      }
-      // Construct original XFB output value and export it
-      for (const auto &entry : origLocCompElemsMap) {
-        auto &elements = entry.second.second;
-        const unsigned elemCount = elements.size();
-        Value *xfbOutValue = nullptr;
-        if (elemCount > 1) {
-          xfbOutValue = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), elemCount));
-          for (unsigned idx = 0; idx < elemCount; ++idx)
-            xfbOutValue = builder.CreateInsertElement(xfbOutValue, elements[idx], idx);
-        } else {
-          xfbOutValue = elements[0];
-        }
+      assert(outputLocInfoMap.count(origLocInfo) > 0);
+      auto &newLocInfo = outputLocInfoMap[origLocInfo];
 
-        // Get the XFB out info at the original location info
-        InOutLocationInfo origLocInfo;
-        origLocInfo.setLocation(entry.first);
-        origLocInfo.setComponent(entry.second.first);
-        origLocInfo.setStreamId(streamId);
+      const unsigned newLoc = newLocInfo.getLocation();
+      const unsigned newComp = newLocInfo.getComponent();
+
+      if (outputLocCompValue[newLoc].count(newComp) > 0) {
+        // NOTE: If the XFB output value exists, we export it. Otherwise, the XFB output value is not written by API
+        // shader and we can skip its export.
+        Value *xfbOutputValue = outputLocCompValue[newLoc][newComp];
         assert(locInfoXfbOutInfoMap.count(origLocInfo) > 0);
         auto &xfbInfo = locInfoXfbOutInfoMap[origLocInfo];
-        exportXfbOutput(xfbOutValue, xfbInfo, builder);
-      }
-    } else {
-      // Without packing locations, we could directly export output value and its related XFB out info
-      for (const auto &locInfoXfbInfoPair : locInfoXfbOutInfoMap) {
-        const InOutLocationInfo &origLocInfo = locInfoXfbInfoPair.first;
-        if (origLocInfo.getStreamId() != streamId || origLocInfo.isBuiltIn())
-          continue;
-        const auto &xfbOutInfo = locInfoXfbInfoPair.second;
-        assert(outputLocInfoMap.count(origLocInfo) > 0);
-        auto &newLocInfo = outputLocInfoMap[origLocInfo];
-        const unsigned newLoc = newLocInfo.getLocation();
-        if (newLocValueMap.count(newLoc) == 0) {
-          // In locInfoXfbOutInfoMap, .z/.w component of 64-bit occupied a subsequent location
-          // In newLocValueMap, all components are exported in one location
-          continue;
-        }
-        Value *const xbfOutputValue = newLocValueMap[newLoc];
-        exportXfbOutput(xbfOutputValue, xfbOutInfo, builder);
+        exportXfbOutput(xfbOutputValue, xfbInfo, builder);
       }
     }
   }
@@ -469,8 +437,39 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
   if (resUsage->inOutUsage.gs.rasterStream != streamId)
     return;
 
-  for (const auto &locValuePair : newLocValueMap)
-    exportGenericOutput(locValuePair.second, locValuePair.first, builder);
+  // Reconstruct output value at the new mapped location
+  DenseMap<unsigned, Value *> outputLocValueMap;
+  for (auto &locCompSizeInfo : m_outputLocCompSizeMap[streamId]) {
+    const unsigned newLoc = locCompSizeInfo.first;
+
+    // Count dword size of each component at the same location
+    unsigned locDwordSize = 0;
+    for (auto &compSizeInfo : locCompSizeInfo.second) {
+      const unsigned newComp = compSizeInfo.first;
+      const unsigned dwordSize = compSizeInfo.second;
+      locDwordSize = std::max(locDwordSize, newComp + dwordSize);
+    }
+
+    // Reconstruct the output value from each component
+    Value *outputValue = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), locDwordSize));
+    for (auto &compValueInfo : outputLocCompValue[newLoc]) {
+      const unsigned newComp = compValueInfo.first;
+      auto compValue = compValueInfo.second;
+      if (compValue->getType()->isVectorTy()) {
+        for (unsigned i = 0; i < cast<FixedVectorType>(compValue->getType())->getNumElements(); ++i) {
+          outputValue =
+              builder.CreateInsertElement(outputValue, builder.CreateExtractElement(compValue, i), newComp + i);
+        }
+      } else {
+        outputValue = builder.CreateInsertElement(outputValue, compValue, newComp);
+      }
+    }
+
+    outputLocValueMap[newLoc] = outputValue;
+  }
+
+  for (const auto &locValueInfo : outputLocValueMap)
+    exportGenericOutput(locValueInfo.second, locValueInfo.first, builder);
 
   // Export built-in outputs
   std::vector<std::pair<BuiltInKind, Type *>> builtInPairs;
@@ -513,7 +512,7 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
     assert(resUsage->inOutUsage.builtInOutputLocMap.find(builtInId) != resUsage->inOutUsage.builtInOutputLocMap.end());
 
     unsigned loc = resUsage->inOutUsage.builtInOutputLocMap[builtInId];
-    Value *outputValue = loadValueFromGsVsRing(builtInTy, loc, streamId, builder);
+    Value *outputValue = loadValueFromGsVsRing(builtInTy, loc, 0, streamId, builder);
     exportBuiltInOutput(outputValue, builtInId, streamId, builder);
   }
 }
@@ -554,10 +553,13 @@ Value *PatchCopyShader::calcGsVsRingOffsetForInput(unsigned location, unsigned c
 //
 // @param loadTy : Type of the load value
 // @param location : Output location
+// @param component : Output component
 // @param streamId : Output stream ID
 // @param builder : BuilderBase to use for instruction constructing
-Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, unsigned streamId,
+Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, unsigned component, unsigned streamId,
                                               BuilderBase &builder) {
+  auto entryPoint = builder.GetInsertBlock()->getParent();
+
   unsigned elemCount = 1;
   Type *elemTy = loadTy;
 
@@ -570,40 +572,52 @@ Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, u
   }
   assert(elemTy->isIntegerTy(32) || elemTy->isFloatTy()); // Must be 32-bit type
 
+  // NOTE: From Vulkan spec: If the 'Component' decoration is used on an 'OpVariable' that has a 'OpTypeVector' type
+  // with a 'Component Type' with a 'Width' that is equal to 64, the sum of two times its 'Component Count' and the
+  // 'Component' decoration value must be less than or equal to 4. Also, the 'Component' decorations must not be used
+  // for a 64-bit vector type with more than two components.
+  if (elemCount > 4)
+    assert(component == 0);
+  else
+    assert(elemCount + component <= 4);
+
   if (m_pipelineState->getNggControl()->enableNgg) {
     // NOTE: For NGG, reading GS output from GS-VS ring is represented by a call and the call is replaced with
     // real instructions when when NGG primitive shader is generated.
     std::string callName(lgcName::NggReadGsOutput);
     callName += getTypeName(loadTy);
-    return builder.CreateNamedCall(callName, loadTy, {builder.getInt32(location), builder.getInt32(streamId)},
-                                   {Attribute::Speculatable, Attribute::ReadOnly, Attribute::WillReturn});
+    return builder.CreateNamedCall(
+        callName, loadTy, {builder.getInt32(location), builder.getInt32(component), builder.getInt32(streamId)},
+        {Attribute::Speculatable, Attribute::ReadOnly, Attribute::WillReturn});
   }
 
   if (m_pipelineState->isGsOnChip()) {
     assert(m_lds);
 
-    Value *ringOffset = calcGsVsRingOffsetForInput(location, 0, streamId, builder);
+    Value *ringOffset = calcGsVsRingOffsetForInput(location, component, streamId, builder);
     Value *loadPtr = builder.CreateGEP(m_lds->getValueType(), m_lds, {builder.getInt32(0), ringOffset});
     loadPtr = builder.CreateBitCast(loadPtr, PointerType::get(loadTy, m_lds->getType()->getPointerAddressSpace()));
 
     return builder.CreateAlignedLoad(loadTy, loadPtr, m_lds->getAlign());
   }
-  assert(m_gsVsRingBufDesc);
 
   CoherentFlag coherent = {};
-  coherent.bits.glc = true;
-  coherent.bits.slc = true;
+  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 11) {
+    coherent.bits.glc = true;
+    coherent.bits.slc = true;
+  }
 
   Value *loadValue = UndefValue::get(loadTy);
 
   for (unsigned i = 0; i < elemCount; ++i) {
-    Value *ringOffset = calcGsVsRingOffsetForInput(location + i / 4, i % 4, streamId, builder);
-    auto loadElem = builder.CreateIntrinsic(Intrinsic::amdgcn_raw_buffer_load, elemTy,
-                                            {
-                                                m_gsVsRingBufDesc, ringOffset,
-                                                builder.getInt32(0),              // soffset
-                                                builder.getInt32(coherent.u32All) // glc, slc
-                                            });
+    Value *ringOffset = calcGsVsRingOffsetForInput(location + i / 4, component + i % 4, streamId, builder);
+    auto loadElem =
+        builder.CreateIntrinsic(Intrinsic::amdgcn_raw_buffer_load, elemTy,
+                                {
+                                    m_pipelineSysValues.get(entryPoint)->getGsVsRingBufDesc(streamId), ringOffset,
+                                    builder.getInt32(0),              // soffset
+                                    builder.getInt32(coherent.u32All) // glc, slc
+                                });
 
     if (loadTy->isArrayTy())
       loadValue = builder.CreateInsertValue(loadValue, loadElem, i);
@@ -616,38 +630,6 @@ Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, u
   }
 
   return loadValue;
-}
-
-// =====================================================================================================================
-// Load GS-VS ring buffer descriptor.
-//
-// @param builder : BuilderBase to use for instruction constructing
-Value *PatchCopyShader::loadGsVsRingBufferDescriptor(BuilderBase &builder) {
-  Function *entryPoint = builder.GetInsertBlock()->getParent();
-  Value *internalTablePtrLow = getFunctionArgument(entryPoint, EntryArgIdxInternalTablePtrLow);
-
-  Value *pc = builder.CreateIntrinsic(Intrinsic::amdgcn_s_getpc, {}, {});
-  pc = builder.CreateBitCast(pc, FixedVectorType::get(builder.getInt32Ty(), 2));
-
-  auto internalTablePtrHigh = builder.CreateExtractElement(pc, 1);
-
-  auto undef = UndefValue::get(FixedVectorType::get(builder.getInt32Ty(), 2));
-  Value *internalTablePtr = builder.CreateInsertElement(undef, internalTablePtrLow, uint64_t(0));
-  internalTablePtr = builder.CreateInsertElement(internalTablePtr, internalTablePtrHigh, 1);
-  internalTablePtr = builder.CreateBitCast(internalTablePtr, builder.getInt64Ty());
-
-  auto gsVsRingBufDescPtr = builder.CreateAdd(internalTablePtr, builder.getInt64(SiDrvTableVsRingInOffs << 4));
-
-  auto int32x4Ty = FixedVectorType::get(builder.getInt32Ty(), 4);
-  auto int32x4PtrTy = PointerType::get(int32x4Ty, ADDR_SPACE_CONST);
-  gsVsRingBufDescPtr = builder.CreateIntToPtr(gsVsRingBufDescPtr, int32x4PtrTy);
-  cast<Instruction>(gsVsRingBufDescPtr)
-      ->setMetadata(MetaNameUniform, MDNode::get(gsVsRingBufDescPtr->getContext(), {}));
-
-  auto gsVsRingBufDesc = builder.CreateLoad(int32x4Ty, gsVsRingBufDescPtr);
-  gsVsRingBufDesc->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(gsVsRingBufDesc->getContext(), {}));
-
-  return gsVsRingBufDesc;
 }
 
 // =====================================================================================================================

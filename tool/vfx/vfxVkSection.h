@@ -167,6 +167,9 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, overrideShaderThreadGroupSizeZ, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, nsaThreshold, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, aggressiveInvariantLoads, MemberTypeEnum, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, workaroundStorageImageFormats, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, workaroundInitializeOutputsToZero, MemberTypeBool, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionShaderOption, disableFMA, MemberTypeBool, false);
       return addrTableInitializer;
     }();
     return {addrTable.data(), addrTable.size()};
@@ -368,14 +371,13 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, shadowDescriptorTableUsage, MemberTypeEnum, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, shadowDescriptorTablePtrHigh, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, resourceLayoutScheme, MemberTypeEnum, false);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, optimizationLevel, MemberTypeInt, false);
-#endif
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, threadGroupSwizzleMode, MemberTypeEnum, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, reverseThreadGroup, MemberTypeBool, false);
       INIT_MEMBER_NAME_TO_ADDR(SectionPipelineOption, m_extendedRobustness, MemberTypeExtendedRobustness, true);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, forceNonUniformResourceIndexStageMask, MemberTypeInt,
                                      false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, enableImplicitInvariantExports, MemberTypeBool, false);
       // One internal member
 #if VKI_RAY_TRACING
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionPipelineOption, internalRtShaders, MemberTypeBool, false);
@@ -410,14 +412,7 @@ private:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableNgg, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableGsUse, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, forceCullingMode, MemberTypeBool, false);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, compactMode, MemberTypeEnum, false);
-#else
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, compactVertex, MemberTypeBool, false);
-#endif
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 59
-      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableVertexReuse, MemberTypeBool, false);
-#endif
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableBackfaceCulling, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableFrustumCulling, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionNggState, enableBoxFilterCulling, MemberTypeBool, false);
@@ -491,8 +486,7 @@ private:
   }
 
   template <size_t Offset> static void *GetExportConfigMember(void *pObj) {
-    constexpr size_t ExportConfigOffset = offsetof(SectionIndirectCalleeSavedRegs, m_state);
-    return reinterpret_cast<uint8_t *>(pObj) + ExportConfigOffset + Offset;
+    return reinterpret_cast<uint8_t *>(&reinterpret_cast<SectionIndirectCalleeSavedRegs *>(pObj)->m_state) + Offset;
   }
 
   SubState m_state;
@@ -539,7 +533,6 @@ private:
   SectionIndirectCalleeSavedRegs m_indirectCalleeSavedRegs;
 };
 
-#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
 // =====================================================================================================================
 // Represents the sub section GpurtFuncTable state
 class SectionGpurtFuncTable : public Section {
@@ -570,7 +563,6 @@ private:
   SubState m_state;
   std::string m_pFunc[Vkgc::RT_ENTRY_FUNC_COUNT];
 };
-#endif
 
 // =====================================================================================================================
 // Represents the sub section RtState state
@@ -585,9 +577,7 @@ public:
     for (unsigned i = 0; i < m_bvhResDesc.size(); ++i)
       state.bvhResDesc.descriptorData[i] = m_bvhResDesc[i];
     m_exportConfig.getSubState(state.exportConfig);
-#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
     m_gpurtFuncTable.getSubState(state.gpurtFuncTable);
-#endif
   }
 
   SubState &getSubStateRef() { return m_state; }
@@ -624,13 +614,9 @@ private:
 #endif
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForIndirect, MemberTypeBool, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, enableOptimalLdsStackSizeForUnified, MemberTypeBool, false);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionRtState, maxRayLength, MemberTypeFloat, false);
-#endif
       INIT_MEMBER_NAME_TO_ADDR(SectionRtState, m_exportConfig, MemberTypeRayTracingShaderExportConfig, true);
-#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
       INIT_MEMBER_NAME_TO_ADDR(SectionRtState, m_gpurtFuncTable, MemberTypeGpurtFuncTable, true);
-#endif
       return addrTableInitializer;
     }();
     return {addrTable.data(), addrTable.size()};
@@ -638,9 +624,7 @@ private:
 
   SubState m_state;
   SectionRayTracingShaderExportConfig m_exportConfig;
-#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
   SectionGpurtFuncTable m_gpurtFuncTable;
-#endif
   unsigned m_bvhResDescSize;
   std::vector<unsigned> m_bvhResDesc;
 };
@@ -673,6 +657,7 @@ public:
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, usrClipPlaneMask, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, alphaToCoverageEnable, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, dualSourceBlendEnable, MemberTypeInt, false);
+      INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, dualSourceBlendDynamic, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, switchWinding, MemberTypeInt, false);
       INIT_STATE_MEMBER_NAME_TO_ADDR(SectionGraphicsState, enableMultiView, MemberTypeInt, false);
       INIT_MEMBER_NAME_TO_ADDR(SectionGraphicsState, m_options, MemberTypePipelineOption, true);

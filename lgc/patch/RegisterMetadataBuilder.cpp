@@ -62,8 +62,10 @@ void RegisterMetadataBuilder::buildPalMetadata() {
     DenseMap<unsigned, unsigned> apiHwShaderMap;
     if (m_hasTask || m_hasMesh) {
       assert(m_pipelineState->getTargetInfo().getGfxIpVersion() >= GfxIpVersion({10, 3}));
-      apiHwShaderMap[ShaderStageMesh] = Util::Abi::HwShaderGs;
-      pipelineType = Util::Abi::PipelineType::Mesh;
+      if (m_hasMesh) {
+        apiHwShaderMap[ShaderStageMesh] = Util::Abi::HwShaderGs;
+        pipelineType = Util::Abi::PipelineType::Mesh;
+      }
       if (m_hasTask) {
         apiHwShaderMap[ShaderStageTask] = Util::Abi::HwShaderCs;
         pipelineType = Util::Abi::PipelineType::TaskMesh;
@@ -71,29 +73,36 @@ void RegisterMetadataBuilder::buildPalMetadata() {
     } else {
       if (m_hasGs) {
         auto preGsStage = m_pipelineState->getPrevShaderStage(ShaderStageGeometry);
-        apiHwShaderMap[preGsStage] = Util::Abi::HwShaderGs;
+        if (preGsStage != ShaderStageInvalid)
+          apiHwShaderMap[preGsStage] = Util::Abi::HwShaderGs;
       }
-      if (hasTs) {
-        apiHwShaderMap[ShaderStageVertex] = Util::Abi::HwShaderHs;
+      if (m_hasTcs) {
         apiHwShaderMap[ShaderStageTessControl] = Util::Abi::HwShaderHs;
+        if (m_hasVs)
+          apiHwShaderMap[ShaderStageVertex] = Util::Abi::HwShaderHs;
       }
       auto lastVertexProcessingStage = m_pipelineState->getLastVertexProcessingStage();
-      if (m_isNggMode) {
-        apiHwShaderMap[lastVertexProcessingStage] = Util::Abi::HwShaderGs;
-        pipelineType = hasTs ? Util::Abi::PipelineType::NggTess : Util::Abi::PipelineType::Ngg;
-      } else {
-        apiHwShaderMap[lastVertexProcessingStage] = Util::Abi::HwShaderVs;
-        if (m_hasGs)
-          apiHwShaderMap[lastVertexProcessingStage] |= Util::Abi::HwShaderGs;
+      if (lastVertexProcessingStage != ShaderStageInvalid) {
+        if (lastVertexProcessingStage == ShaderStageCopyShader)
+          lastVertexProcessingStage = ShaderStageGeometry;
+        if (m_isNggMode) {
+          apiHwShaderMap[lastVertexProcessingStage] = Util::Abi::HwShaderGs;
+          pipelineType = hasTs ? Util::Abi::PipelineType::NggTess : Util::Abi::PipelineType::Ngg;
+        } else {
+          apiHwShaderMap[lastVertexProcessingStage] = Util::Abi::HwShaderVs;
+          if (m_hasGs)
+            apiHwShaderMap[lastVertexProcessingStage] |= Util::Abi::HwShaderGs;
 
-        pipelineType = Util::Abi::PipelineType::GsTess;
-        if (hasTs && !m_hasGs)
-          pipelineType = Util::Abi::PipelineType::Tess;
-        else if (!hasTs && m_hasGs)
-          pipelineType = Util::Abi::PipelineType::Gs;
+          pipelineType = Util::Abi::PipelineType::GsTess;
+          if (hasTs && !m_hasGs)
+            pipelineType = Util::Abi::PipelineType::Tess;
+          else if (!hasTs && m_hasGs)
+            pipelineType = Util::Abi::PipelineType::Gs;
+        }
       }
     }
-    apiHwShaderMap[ShaderStageFragment] = Util::Abi::HwShaderPs;
+    if (m_pipelineState->hasShaderStage(ShaderStageFragment))
+      apiHwShaderMap[ShaderStageFragment] = Util::Abi::HwShaderPs;
 
     // Set the mapping between api shader stage and hardware stage
     unsigned hwStageMask = 0;
@@ -110,7 +119,7 @@ void RegisterMetadataBuilder::buildPalMetadata() {
       buildShaderExecutionRegisters(Util::Abi::HardwareStage::Hs, apiStage1, apiStage2);
     }
     if (hwStageMask & Util::Abi::HwShaderGs) {
-      if (m_isNggMode)
+      if (m_isNggMode || m_hasMesh)
         buildPrimShaderRegisters();
       else
         buildEsGsRegisters();
@@ -150,10 +159,16 @@ void RegisterMetadataBuilder::buildPalMetadata() {
       buildShaderExecutionRegisters(Util::Abi::HardwareStage::Cs, ShaderStageTask, ShaderStageInvalid);
     }
 
-    buildPaSpecificRegisters();
-    setVgtShaderStagesEn(hwStageMask);
-    setIaMultVgtParam();
-    setPipelineType(pipelineType);
+    // Set other registers if it is not a single PS or CS
+    if (hwStageMask & (Util::Abi::HwShaderHs | Util::Abi::HwShaderGs | Util::Abi::HwShaderVs)) {
+      setVgtShaderStagesEn(hwStageMask);
+      setIaMultVgtParam();
+      setPipelineType(pipelineType);
+    }
+
+    if (hwStageMask & (Util::Abi::HwShaderGs | Util::Abi::HwShaderVs))
+      buildPaSpecificRegisters();
+
   } else {
     addApiHwShaderMapping(ShaderStageCompute, Util::Abi::HwShaderCs);
     setPipelineType(Util::Abi::PipelineType::Cs);
@@ -177,13 +192,32 @@ void RegisterMetadataBuilder::buildLsHsRegisters() {
   const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
   auto vgtLsHsConfig = getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtLsHsConfig].getMap(true);
   vgtLsHsConfig[Util::Abi::VgtLsHsConfigMetadataKey::NumPatches] = calcFactor.patchCountPerThreadGroup;
-  vgtLsHsConfig[Util::Abi::VgtLsHsConfigMetadataKey::HsNumInputCp] =
-      m_pipelineState->getInputAssemblyState().patchControlPoints;
+  vgtLsHsConfig[Util::Abi::VgtLsHsConfigMetadataKey::HsNumInputCp] = m_pipelineState->getNumPatchControlPoints();
   vgtLsHsConfig[Util::Abi::VgtLsHsConfigMetadataKey::HsNumOutputCp] =
       m_pipelineState->getShaderModes()->getTessellationMode().outputVertices;
 
   // VGT_TF_PARAM
   setVgtTfParam();
+
+  // LS_VGPR_COMP_CNT in SPI_SHADER_PGM_RSRC1_HS
+  const auto &vsBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex)->builtInUsage.vs;
+  unsigned lsVgprCompCnt = 0;
+  if (m_gfxIp.major <= 11) {
+    if (vsBuiltInUsage.instanceIndex)
+      lsVgprCompCnt = 3; // Enable all LS VGPRs (LS VGPR2 - VGPR5)
+    else
+      lsVgprCompCnt = 1; // Must enable relative vertex ID (LS VGPR2 and VGPR3)
+  }
+  getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::LsVgprCompCnt] = lsVgprCompCnt;
+
+  // Set LDS_SIZE of SPI_SHADER_PGM_RSRC2_HS
+  assert(m_pipelineState->isTessOffChip()); // Must be off-chip on GFX9+
+  unsigned ldsSizeInDwords = calcFactor.tessOnChipLdsSize;
+#if VKI_RAY_TRACING
+  ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
+#endif
+  auto hwShaderNode = getHwShaderNode(Util::Abi::HardwareStage::Hs);
+  hwShaderNode[Util::Abi::HardwareStageMetadataKey::LdsSize] = calcLdsSize(ldsSizeInDwords);
 }
 
 // =====================================================================================================================
@@ -197,33 +231,32 @@ void RegisterMetadataBuilder::buildEsGsRegisters() {
   const auto &calcFactor = gsInOutUsage.gs.calcFactor;
   const auto tesResUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval);
   const auto &tesBuiltInUsage = tesResUsage->builtInUsage.tes;
+  const bool hasTs = m_hasTcs || m_hasTes;
 
   // ES_VGPR_COMP_CNT in SPI_SHADER_PGM_RSRC2_GS
   unsigned gsVgprCompCnt = 0;
   if (calcFactor.inputVertices > 4 || gsBuiltInUsage.invocationId)
-    gsVgprCompCnt = 3;
+    gsVgprCompCnt = 3; // Enable vtx4/vtx5 offset (GS VGPR3) or GS instance ID (GS VGPR4)
   else if (gsBuiltInUsage.primitiveIdIn)
-    gsVgprCompCnt = 2;
+    gsVgprCompCnt = 2; // Enable primitive ID (GS VGPR2)
   else if (calcFactor.inputVertices > 2)
-    gsVgprCompCnt = 1;
+    gsVgprCompCnt = 1; // Enable vtx2/vtx3 offset (GS VGPR1)
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::GsVgprCompCnt] = gsVgprCompCnt;
 
   // ES_VGPR_COMP_CNT in SPI_SHADER_PGM_RSRC2_GS
   unsigned esVgprCompCnt = 0;
-  if (m_hasTcs || m_hasTes) {
-    // NOTE: when primitive ID is used, set vgtCompCnt to 3 directly because primitive ID is the last VGPR.
+  if (hasTs) {
     if (tesBuiltInUsage.primitiveId)
-      esVgprCompCnt = 3;
+      esVgprCompCnt = 3; // Enable patch ID (ES VGPR8)
     else
-      esVgprCompCnt = 2;
-
-    if (m_pipelineState->isTessOffChip())
-      getHwShaderNode(Util::Abi::HardwareStage::Gs)[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = true;
+      esVgprCompCnt = 2; // Must enable relative patch ID (ES VGPR7)
   } else {
     if (vsBuiltInUsage.instanceIndex)
-      esVgprCompCnt = 3; // Enable instance ID
+      esVgprCompCnt = 3; // Enable instance ID (ES VGPR8)
   }
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::EsVgprCompCnt] = esVgprCompCnt;
+
+  getHwShaderNode(Util::Abi::HardwareStage::Gs)[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = hasTs;
 
   // VGT_GS_MAX_VERT_OUT
   const auto &geometryMode = m_pipelineState->getShaderModes()->getGeometryShaderMode();
@@ -291,16 +324,19 @@ void RegisterMetadataBuilder::buildEsGsRegisters() {
   else if (geometryMode.outputPrimitive == OutputPrimitives::LineStrip)
     gsOutputPrimitiveType = LINESTRIP;
   auto vgtGsOutPrimType = getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsOutPrimType].getMap(true);
-  vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType] = gsOutputPrimitiveType;
+  StringRef primTyStr =
+      m_pipelineState->getPalMetadata()->serializeEnum(Util::Abi::GsOutPrimType(gsOutputPrimitiveType));
+  vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType] = primTyStr;
+
   // Set multi-stream output primitive type
   if (itemSizeArrayNode[1].getInt() > 0 || itemSizeArrayNode[2].getInt() > 0 || itemSizeArrayNode[3].getInt() > 0) {
-    const static auto GsOutPrimInvalid = 3u;
+    StringRef invalidTyStr = m_pipelineState->getPalMetadata()->serializeEnum(Util::Abi::GsOutPrimType::Last);
     vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType_1] =
-        itemSizeArrayNode[1].getInt() > 0 ? gsOutputPrimitiveType : GsOutPrimInvalid;
+        itemSizeArrayNode[1].getInt() > 0 ? primTyStr : invalidTyStr;
     vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType_2] =
-        itemSizeArrayNode[2].getInt() > 0 ? gsOutputPrimitiveType : GsOutPrimInvalid;
+        itemSizeArrayNode[2].getInt() > 0 ? primTyStr : invalidTyStr;
     vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType_3] =
-        itemSizeArrayNode[3].getInt() > 0 ? gsOutputPrimitiveType : GsOutPrimInvalid;
+        itemSizeArrayNode[3].getInt() > 0 ? primTyStr : invalidTyStr;
   }
 
   // VGT_GSVS_RING_ITEMSIZE
@@ -316,18 +352,13 @@ void RegisterMetadataBuilder::buildEsGsRegisters() {
   else
     getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::MaxVertsPerSubgroup] = maxPrimsPerSubgroup;
 
-  const unsigned ldsSizeDwordGranularityShift =
-      m_pipelineState->getTargetInfo().getGpuProperty().ldsSizeDwordGranularityShift;
-  const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
-
+  // Set LDS_SIZE of SPI_SHADER_PGM_RSRC2_GS
   unsigned ldsSizeInDwords = calcFactor.gsOnChipLdsSize;
 #if VKI_RAY_TRACING
   ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
 #endif
-  ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
-
   auto hwShaderNode = getHwShaderNode(Util::Abi::HardwareStage::Gs);
-  hwShaderNode[Util::Abi::HardwareStageMetadataKey::LdsSize] = ldsSizeInDwords * 4;
+  hwShaderNode[Util::Abi::HardwareStageMetadataKey::LdsSize] = calcLdsSize(ldsSizeInDwords);
   setEsGsLdsSize(calcFactor.esGsLdsSize * 4);
 }
 
@@ -352,36 +383,49 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
   // RSRC1, RSRC2 and RSRC3 are handled by the HardwareStage metadata, with the exception of specifal bits are handled
   // by GraphicsRegisters metadata GS_VGPR_COMP_CNT in SPI_SHADER_PGM_RSRC1_GS
   unsigned gsVgprCompCnt = 0;
-  if (m_hasGs) {
-    if (calcFactor.inputVertices > 4 || gsBuiltInUsage.invocationId)
-      gsVgprCompCnt = 3;
-    else if (gsBuiltInUsage.primitiveIdIn)
-      gsVgprCompCnt = 2;
-    else if (calcFactor.inputVertices > 2)
+  if (m_gfxIp.major <= 11) {
+    if (m_hasGs) {
+      if (calcFactor.inputVertices > 4 || gsBuiltInUsage.invocationId)
+        gsVgprCompCnt = 3; // Enable vtx4/vtx5 offset (GS VGPR3) or GS instance ID (GS VGPR4)
+      else if (gsBuiltInUsage.primitiveIdIn)
+        gsVgprCompCnt = 2; // Enable primitive ID (GS VGPR2)
+      else if (calcFactor.inputVertices > 2)
+        gsVgprCompCnt = 1; // Enable vtx2/vtx3 offset (GS VGPR1)
+    } else if (m_hasVs) {
+      // NOTE: When GS is absent, only those VGPRs are required: vtx0/vtx1 offset, vtx2/vtx3 offset,
+      // primitive ID (only for VS).
       gsVgprCompCnt = 1;
-  } else if (!m_hasMesh) {
-    // NOTE: When GS is absent, only those VGPRs are required: vtx0/vtx1 offset, vtx2/vtx3 offset,
-    // primitive ID (only for VS).
-    gsVgprCompCnt = hasTs ? 1 : (vsBuiltInUsage.primitiveId ? 2 : 1);
+      if (!hasTs && vsBuiltInUsage.primitiveId)
+        gsVgprCompCnt = 2; // Enable primitive ID (GS VGPR2)
+    }
+  } else {
+    llvm_unreachable("Not implemented!");
   }
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::GsVgprCompCnt] = gsVgprCompCnt;
 
   // ES_VGPR_COMP_CNT in SPI_SHADER_PGM_RSRC2_GS
   unsigned esVgprCompCnt = 0;
-  if (hasTs) {
-    // NOTE: when primitive ID is used, set vgtCompCnt to 3 directly because primitive ID is the last VGPR.
-    if (tesBuiltInUsage.primitiveId)
-      esVgprCompCnt = 3;
-    else
-      esVgprCompCnt = 2;
-  } else if (!m_hasMesh) {
-    if (vsBuiltInUsage.instanceIndex)
-      esVgprCompCnt = 3; // Enable instance ID
+  if (m_gfxIp.major <= 11) {
+    if (hasTs) {
+      if (tesBuiltInUsage.primitiveId)
+        esVgprCompCnt = 3; // Enable patch ID (ES VGPR8)
+      else
+        esVgprCompCnt = 2; // Must enable relative patch ID (ES VGPR7)
+    } else if (m_hasVs) {
+      if (vsBuiltInUsage.instanceIndex)
+        esVgprCompCnt = 3; // Enable instance ID (ES VGPR8)
+    }
+  } else {
+    llvm_unreachable("Not implemented!");
   }
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::EsVgprCompCnt] = esVgprCompCnt;
 
+  getHwShaderNode(Util::Abi::HardwareStage::Gs)[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = hasTs;
+
   // VGT_GS_MAX_VERT_OUT
-  unsigned maxVertOut = std::max(1u, static_cast<unsigned>(geometryMode.outputVertices));
+  const unsigned outputVertices = m_hasMesh ? m_pipelineState->getShaderModes()->getMeshShaderMode().outputVertices
+                                            : m_pipelineState->getShaderModes()->getGeometryShaderMode().outputVertices;
+  const unsigned maxVertOut = std::max(1u, outputVertices);
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsMaxVertOut] = maxVertOut;
 
   // VGT_GS_MODE
@@ -418,8 +462,7 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
       gsOutputPrimitiveType = TRISTRIP;
     else
       llvm_unreachable("Should never be called!");
-  }
-  if (m_hasGs) {
+  } else if (m_hasGs) {
     // GS present
     if (gsInOutUsage.outputMapLocCount == 0)
       gsOutputPrimitiveType = POINTLIST;
@@ -466,7 +509,8 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
     }
   }
   auto vgtGsOutPrimType = getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsOutPrimType].getMap(true);
-  vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType] = gsOutputPrimitiveType;
+  vgtGsOutPrimType[Util::Abi::VgtGsOutPrimTypeMetadataKey::OutprimType] =
+      m_pipelineState->getPalMetadata()->serializeEnum(Util::Abi::GsOutPrimType(gsOutputPrimitiveType));
 
   assert(calcFactor.primAmpFactor >= 1);
   unsigned maxVertsPerSubgroup = NggMaxThreadsPerSubgroup;
@@ -506,7 +550,7 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
       const unsigned threadGroupSize = m_pipelineState->enableMeshRowExport()
                                            ? meshMode.workgroupSizeX * meshMode.workgroupSizeY * meshMode.workgroupSizeZ
                                            : calcFactor.primAmpFactor;
-      spiShaderGsMeshletDim[Util::Abi::SpiShaderGsMeshletDimMetadataKey::ThreadgroupSize] = threadGroupSize;
+      spiShaderGsMeshletDim[Util::Abi::SpiShaderGsMeshletDimMetadataKey::ThreadgroupSize] = threadGroupSize - 1;
 
       // SPI_SHADER_GS_MESHLET_EXP_ALLOC
       auto spiShaderGsMeshletExpAlloc =
@@ -519,10 +563,8 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
   } else {
     maxVertsPerSubgroup = std::min(gsInstPrimsInSubgrp * maxVertOut, NggMaxThreadsPerSubgroup);
     // VGT_GS_VERT_ITEMSIZE
-    auto itemSizeArrayNode =
-        getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsVertItemsize].getArray(true);
-    itemSizeArrayNode[0] = 4 * gsInOutUsage.outputMapLocCount;
-    itemSizeArrayNode[1] = itemSizeArrayNode[2] = itemSizeArrayNode[3] = 0;
+    getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsVertItemsize] =
+        4 * gsInOutUsage.outputMapLocCount;
 
     // VGT_GS_INSTANCE_CNT
     if (geometryMode.invocations > 1 || gsBuiltInUsage.invocationId) {
@@ -535,12 +577,14 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
             calcFactor.enableMaxVertOut;
     }
 
-    // VGT_GSVS_RING_ITEMSIZE
-    getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsvsRingItemsize] = calcFactor.gsVsRingItemSize;
+    if (m_gfxIp.major <= 11) {
+      // VGT_GSVS_RING_ITEMSIZE
+      getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtGsvsRingItemsize] = calcFactor.gsVsRingItemSize;
 
-    // VGT_ESGS_RING_ITEMSIZE
-    getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtEsgsRingItemsize] =
-        (m_hasGs ? calcFactor.esGsRingItemSize : 1);
+      // VGT_ESGS_RING_ITEMSIZE
+      getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtEsgsRingItemsize] =
+          (m_hasGs ? calcFactor.esGsRingItemSize : 1);
+    }
 
     const auto nggControl = m_pipelineState->getNggControl();
     assert(nggControl->enableNgg);
@@ -584,18 +628,13 @@ void RegisterMetadataBuilder::buildPrimShaderRegisters() {
     setStreamOutVertexStrides(xfbStridesInDwords); // Set SW stream-out vertex strides
   }
 
-  const unsigned ldsSizeDwordGranularityShift =
-      m_pipelineState->getTargetInfo().getGpuProperty().ldsSizeDwordGranularityShift;
-  const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
-
+  // Set LDS_SIZE of SPI_SHADER_PGM_RSRC2_GS
   unsigned ldsSizeInDwords = calcFactor.gsOnChipLdsSize;
 #if VKI_RAY_TRACING
   ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
 #endif
-  ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
-
   auto hwShaderNode = getHwShaderNode(Util::Abi::HardwareStage::Gs);
-  hwShaderNode[Util::Abi::HardwareStageMetadataKey::LdsSize] = ldsSizeInDwords * 4;
+  hwShaderNode[Util::Abi::HardwareStageMetadataKey::LdsSize] = calcLdsSize(ldsSizeInDwords);
   if (!m_hasMesh)
     setEsGsLdsSize(calcFactor.esGsLdsSize * 4);
 }
@@ -687,7 +726,7 @@ void RegisterMetadataBuilder::buildPsRegisters() {
   }
 
   // PA_SC_MODE_CNTL_1
-  getGraphicsRegNode()[Util::Abi::PaScModeCntl1MetadataKey::PsIterSample] =
+  getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::PsIterSample] =
       m_pipelineState->getShaderResourceUsage(shaderStage)->builtInUsage.fs.runAtSampleRate > 0;
 
   // DB_SHADER_CONTROL
@@ -716,8 +755,9 @@ void RegisterMetadataBuilder::buildPsRegisters() {
   dbShaderControl[Util::Abi::DbShaderControlMetadataKey::KillEnable] = builtInUsage.discard;
   dbShaderControl[Util::Abi::DbShaderControlMetadataKey::ZExportEnable] = builtInUsage.fragDepth;
   dbShaderControl[Util::Abi::DbShaderControlMetadataKey::StencilTestValExportEnable] = builtInUsage.fragStencilRef;
-  dbShaderControl[Util::Abi::DbShaderControlMetadataKey::MaskExportEnable] = builtInUsage.sampleMask;
-  dbShaderControl[Util::Abi::DbShaderControlMetadataKey::AlphaToMaskDisable] = 1; // Set during pipeline finalization.
+  dbShaderControl[Util::Abi::DbShaderControlMetadataKey::MaskExportEnable] = builtInUsage.sampleMask == 1;
+  // Set during pipeline finalization.
+  dbShaderControl[Util::Abi::DbShaderControlMetadataKey::AlphaToMaskDisable] = true;
   dbShaderControl[Util::Abi::DbShaderControlMetadataKey::DepthBeforeShader] = fragmentMode.earlyFragmentTests;
   dbShaderControl[Util::Abi::DbShaderControlMetadataKey::ExecOnNoop] =
       fragmentMode.earlyFragmentTests && resUsage->resourceWrite;
@@ -792,7 +832,7 @@ void RegisterMetadataBuilder::buildPsRegisters() {
         if (hasNoVertexAttrib)
           ++spiPsInputCntlInfo.offset;
       }
-      spiPsInputCntElem[Util::Abi::SpiPsInputCntlMetadataKey::PrimAttr] = true;
+      spiPsInputCntlInfo.primAttr = true;
     }
 
     if (interpInfoElem.custom) {
@@ -818,7 +858,10 @@ void RegisterMetadataBuilder::buildPsRegisters() {
     spiPsInputCntElem[Util::Abi::SpiPsInputCntlMetadataKey::PtSpriteTex] = spiPsInputCntlInfo.ptSpriteTex;
     spiPsInputCntElem[Util::Abi::SpiPsInputCntlMetadataKey::Attr0Valid] = spiPsInputCntlInfo.attr0Valid;
     spiPsInputCntElem[Util::Abi::SpiPsInputCntlMetadataKey::Attr1Valid] = spiPsInputCntlInfo.attr1Valid;
+    spiPsInputCntElem[Util::Abi::SpiPsInputCntlMetadataKey::PrimAttr] = spiPsInputCntlInfo.primAttr;
   }
+  // Set .num_interpolants in amdpal.pipelines
+  getPipelineNode()[Util::Abi::PipelineMetadataKey::NumInterpolants] = unsigned(interpInfo->size());
 
   // SPI_PS_IN_CONTROL
   unsigned numInterp = resUsage->inOutUsage.fs.interpInfo.size() - numPrimInterp;
@@ -832,9 +875,8 @@ void RegisterMetadataBuilder::buildPsRegisters() {
   spiPsInControl[Util::Abi::SpiPsInControlMetadataKey::NumInterps] = numInterp;
   if (m_gfxIp.isGfx(10, 3))
     spiPsInControl[Util::Abi::SpiPsInControlMetadataKey::NumPrimInterp] = numPrimInterp;
-  auto waveFrontSize = m_pipelineState->getShaderWaveSize(shaderStage);
-  if (waveFrontSize == 32)
-    spiPsInControl[Util::Abi::SpiPsInControlMetadataKey::PsW32En] = true;
+  const auto waveSize = m_pipelineState->getShaderWaveSize(shaderStage);
+  spiPsInControl[Util::Abi::SpiPsInControlMetadataKey::PsW32En] = (waveSize == 32);
 
   // SPI_INTERP_CONTROL_0
   if (pointCoordLoc != InvalidValue) {
@@ -860,16 +902,46 @@ void RegisterMetadataBuilder::buildPsRegisters() {
   } else {
     hwShaderNode[Util::Abi::HardwareStageMetadataKey::UsesUavs] = resUsage->resourceWrite;
   }
+
+  // CB_SHADER_MASK
+  unsigned cbShaderMask = resUsage->inOutUsage.fs.cbShaderMask;
+  cbShaderMask = resUsage->inOutUsage.fs.isNullFs ? 0 : cbShaderMask;
+  auto cbShaderMaskNode = getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::CbShaderMask].getMap(true);
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output0Enable] = cbShaderMask & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output1Enable] = (cbShaderMask >> 4) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output2Enable] = (cbShaderMask >> 8) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output3Enable] = (cbShaderMask >> 12) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output4Enable] = (cbShaderMask >> 16) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output5Enable] = (cbShaderMask >> 20) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output6Enable] = (cbShaderMask >> 24) & 0xF;
+  cbShaderMaskNode[Util::Abi::CbShaderMaskMetadataKey::Output7Enable] = (cbShaderMask >> 28) & 0xF;
 }
 
 // =====================================================================================================================
 // Builds register configuration for compute/task shader.
 void RegisterMetadataBuilder::buildCsRegisters(ShaderStage shaderStage) {
   assert(shaderStage == ShaderStageCompute || shaderStage == ShaderStageTask);
+  if (shaderStage == ShaderStageCompute) {
+    Function *attribFunc = nullptr;
+    for (Function &func : *m_module) {
+      // Only entrypoint and amd_gfx functions may have the function attribute for workgroup id.
+      if (isShaderEntryPoint(&func) || (func.getCallingConv() == CallingConv::AMDGPU_Gfx)) {
+        attribFunc = &func;
+        break;
+      }
+    }
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidXEn] =
+        !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-x");
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidYEn] =
+        !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-y");
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidZEn] =
+        !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-z");
 
-  getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidXEn] = true;
-  getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidYEn] = true;
-  getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidZEn] = true;
+  } else {
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidXEn] = true;
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidYEn] = true;
+    getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgidZEn] = true;
+  }
   getComputeRegNode()[Util::Abi::ComputeRegisterMetadataKey::TgSizeEn] = true;
 
   const auto resUsage = m_pipelineState->getShaderResourceUsage(shaderStage);
@@ -908,22 +980,24 @@ void RegisterMetadataBuilder::buildCsRegisters(ShaderStage shaderStage) {
 // =====================================================================================================================
 // Build registers fields related to shader execution.
 //
-// @param hwStageId: The hardware shader stage
+// @param hwStage: The hardware shader stage
 // @param apiStage1: The first api shader stage
 // @param apiStage2: The second api shader stage
-void RegisterMetadataBuilder::buildShaderExecutionRegisters(Util::Abi::HardwareStage hwStageId, ShaderStage apiStage1,
+void RegisterMetadataBuilder::buildShaderExecutionRegisters(Util::Abi::HardwareStage hwStage, ShaderStage apiStage1,
                                                             ShaderStage apiStage2) {
   // Set hardware stage metadata
-  auto hwShaderNode = getHwShaderNode(hwStageId);
+  auto hwShaderNode = getHwShaderNode(hwStage);
   ShaderStage apiStage = apiStage2 != ShaderStageInvalid ? apiStage2 : apiStage1;
 
   if (m_isNggMode || m_gfxIp.major >= 10) {
-    unsigned waveFrontSize = m_pipelineState->getShaderWaveSize(apiStage);
-    hwShaderNode[Util::Abi::HardwareStageMetadataKey::WavefrontSize] = waveFrontSize;
+    const unsigned waveSize = m_pipelineState->getShaderWaveSize(apiStage);
+    hwShaderNode[Util::Abi::HardwareStageMetadataKey::WavefrontSize] = waveSize;
   }
 
   if (m_pipelineState->getTargetInfo().getGpuProperty().supportShaderPowerProfiling) {
-    unsigned checksum = setShaderHash(apiStage1);
+    unsigned checksum = 0;
+    if (apiStage1 != ShaderStageInvalid)
+      checksum = setShaderHash(apiStage1);
     if (apiStage2 != ShaderStageInvalid)
       checksum ^= setShaderHash(apiStage2);
     hwShaderNode[Util::Abi::HardwareStageMetadataKey::ChecksumValue] = checksum;
@@ -938,20 +1012,12 @@ void RegisterMetadataBuilder::buildShaderExecutionRegisters(Util::Abi::HardwareS
     // NOTE: For copy shader, usually we use fixed number of user data registers.
     // But in some cases, we may change user data registers, we use variable to keep user sgpr count here
     userDataCount = lgc::CopyShaderUserSgprCount;
-#if VKI_BUILD_SHADER_DBG
-    if (m_pipelineState->getOptions().shaderTraceMask != 0) {
-      std::vector<unsigned> userDataMap(32, static_cast<unsigned>(UserDataMapping::Invalid));
-      userDataMap[userDataCount] = UserDataMapping::ShaderDbgAddr;
-      m_pipelineState->setUserDataMap(m_shaderStage, userDataMap);
-
-      // 2 SGPRs holding the GPU VA address of the buffer for shader debugging
-      userDataCount += 2;
-    }
-#endif
     sgprLimits = m_pipelineState->getTargetInfo().getGpuProperty().maxSgprsAvailable;
     vgprLimits = m_pipelineState->getTargetInfo().getGpuProperty().maxVgprsAvailable;
   } else {
-    userDataCount = m_pipelineState->getShaderInterfaceData(apiStage1)->userDataCount;
+    userDataCount = 0;
+    if (apiStage1 != ShaderStageInvalid)
+      userDataCount = m_pipelineState->getShaderInterfaceData(apiStage1)->userDataCount;
     if (apiStage2 != ShaderStageInvalid) {
       userDataCount = std::max(userDataCount, m_pipelineState->getShaderInterfaceData(apiStage2)->userDataCount);
     }
@@ -967,31 +1033,38 @@ void RegisterMetadataBuilder::buildShaderExecutionRegisters(Util::Abi::HardwareS
 
   if (m_gfxIp.major >= 10) {
     hwShaderNode[Util::Abi::HardwareStageMetadataKey::MemOrdered] = true;
-    if (hwStageId == Util::Abi::HardwareStage::Hs || hwStageId == Util::Abi::HardwareStage::Gs) {
-      bool wgpMode = m_pipelineState->getShaderWgpMode(apiStage1);
+    if (hwStage == Util::Abi::HardwareStage::Hs || hwStage == Util::Abi::HardwareStage::Gs) {
+      bool wgpMode = false;
+      if (apiStage1 != ShaderStageInvalid)
+        wgpMode = m_pipelineState->getShaderWgpMode(apiStage1);
       if (apiStage2 != ShaderStageInvalid)
         wgpMode = wgpMode || m_pipelineState->getShaderWgpMode(apiStage2);
       hwShaderNode[Util::Abi::HardwareStageMetadataKey::WgpMode] = wgpMode;
     }
   }
 
-  if (apiStage1 == ShaderStageTessEval && m_pipelineState->isTessOffChip())
-    hwShaderNode[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = true;
-
   hwShaderNode[Util::Abi::HardwareStageMetadataKey::SgprLimit] = sgprLimits;
   hwShaderNode[Util::Abi::HardwareStageMetadataKey::VgprLimit] = vgprLimits;
 
-  if (m_gfxIp.major >= 11 && hwStageId != Util::Abi::HardwareStage::Vs) {
-    bool useImageOp = m_pipelineState->getShaderResourceUsage(apiStage1)->useImageOp;
+  if (m_gfxIp.major >= 11 && hwStage != Util::Abi::HardwareStage::Vs) {
+    bool useImageOp = false;
+    if (apiStage1 != ShaderStageInvalid)
+      useImageOp = m_pipelineState->getShaderResourceUsage(apiStage1)->useImageOp;
     if (apiStage2 != ShaderStageInvalid)
       useImageOp |= m_pipelineState->getShaderResourceUsage(apiStage2)->useImageOp;
     hwShaderNode[Util::Abi::HardwareStageMetadataKey::ImageOp] = useImageOp;
   }
 
+  // Fill ".user_data_reg_map" and update ".user_data_limit"
   auto userDataNode = hwShaderNode[Util::Abi::HardwareStageMetadataKey::UserDataRegMap].getArray(true);
   unsigned idx = 0;
-  for (auto value : m_pipelineState->getUserDataMap(apiStage))
+  unsigned userDataLimit = 1;
+  for (auto value : m_pipelineState->getUserDataMap(apiStage)) {
     userDataNode[idx++] = value;
+    if (value < InterfaceData::MaxSpillTableSize && (value + 1) > userDataLimit)
+      userDataLimit = value + 1;
+  }
+  m_pipelineState->getPalMetadata()->setUserDataLimit(userDataLimit);
 }
 
 // =====================================================================================================================
@@ -1172,7 +1245,7 @@ void RegisterMetadataBuilder::buildPaSpecificRegisters() {
       paClVsOutCntl[Util::Abi::PaClVsOutCntlMetadataKey::VsOutCcDist1VecEna] = true;
 
     unsigned clipDistanceMask = (1 << clipDistanceCount) - 1;
-    unsigned cullDistanceMask = (1 << cullDistanceCount) - 1;
+    unsigned cullDistanceMask = ((1 << cullDistanceCount) - 1) << clipDistanceCount;
 
     // Set fields CLIP_DIST_ENA_0 ~ CLIP_DIST_ENA_7 and CULL_DIST_ENA_0 ~ CULL_DIST_ENA_7
     static const unsigned MaxDistCount = 8;
@@ -1180,7 +1253,8 @@ void RegisterMetadataBuilder::buildPaSpecificRegisters() {
     bool cullDistEna[MaxDistCount] = {};
     for (unsigned i = 0; i < MaxDistCount; ++i) {
       clipDistEna[i] = (clipDistanceMask >> i) & 0x1;
-      cullDistEna[i] = (cullDistanceMask >> i) & 0x1;
+      // Note: Point primitives are only affected by the cull mask, so enable culling also based on clip distances
+      cullDistEna[i] = ((clipDistanceMask | cullDistanceMask) >> i) & 0x1;
     }
     paClVsOutCntl[Util::Abi::PaClVsOutCntlMetadataKey::ClipDistEna_0] = clipDistEna[0];
     paClVsOutCntl[Util::Abi::PaClVsOutCntlMetadataKey::ClipDistEna_1] = clipDistEna[1];
@@ -1249,9 +1323,6 @@ void RegisterMetadataBuilder::buildPaSpecificRegisters() {
 //
 // @param hwStageMask : Mask of the hardware shader stage
 void RegisterMetadataBuilder::setVgtShaderStagesEn(unsigned hwStageMask) {
-  if (m_hasTask)
-    return;
-
   auto vgtShaderStagesEn = getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VgtShaderStagesEn].getMap(true);
   vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::MaxPrimgroupInWave] = 2;
 
@@ -1259,69 +1330,74 @@ void RegisterMetadataBuilder::setVgtShaderStagesEn(unsigned hwStageMask) {
 
   if (m_isNggMode || m_hasMesh) {
     vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::PrimgenEn] = true;
-    // NOTE: When GS is present, NGG pass-through mode is always turned off regardless of the pass-through flag of
-    // NGG control settings. In such case, the pass-through flag means whether there is culling (different from
-    // hardware pass-through).
-    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::PrimgenPassthruEn] =
-        m_hasGs ? false : nggControl->passthroughMode;
-    unsigned fastLaunch = 0x1;
+    if (!m_hasMesh) {
+      if (m_gfxIp.major <= 11) {
+        // NOTE: When GS is present, NGG pass-through mode is always turned off regardless of the pass-through flag of
+        // NGG control settings. In such case, the pass-through flag means whether there is culling (different from
+        // hardware pass-through).
+        vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::PrimgenPassthruEn] =
+            m_hasGs ? false : nggControl->passthroughMode;
+      }
 
-    if (m_gfxIp.major >= 11) {
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::NggWaveIdEn] = m_pipelineState->enableSwXfb();
-      if (!m_hasGs)
-        vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::PrimgenPassthruNoMsg] =
-            nggControl->passthroughMode && !m_pipelineState->enableSwXfb();
-      fastLaunch = 0x2;
+      if (m_gfxIp.major >= 11) {
+        vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::NggWaveIdEn] = m_pipelineState->enableSwXfb();
+        if (!m_hasGs)
+          vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::PrimgenPassthruNoMsg] =
+              nggControl->passthroughMode && !m_pipelineState->enableSwXfb();
+      }
+    } else {
+      const unsigned gsFastLaunch = m_gfxIp.major == 11 ? 0x2 : 0x1; // GFX11 defines the new fast launch mode to 0x2
+      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::GsFastLaunch] = gsFastLaunch;
     }
-
-    if (m_hasMesh)
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::GsFastLaunch] = fastLaunch;
   } else if (m_hasTcs || m_hasTes) {
-    //# NOTE: From:  //gfxip/gfx10/doc/blocks/ge/Combined_Geometry_Engine_MAS.docx
     //  In GEN_TWO the only supported mode is fully distributed tessellation. The programming model is expected
     //  to set VGT_SHADER_STAGES_EN.DYNAMIC_HS=1 and VGT_TF_PARAM.NUM_DS_WAVES_PER_SIMD=0
     vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::DynamicHs] = true;
   }
 
   if (hwStageMask & Util::Abi::HwShaderVs) {
+    assert(m_gfxIp.major < 11);
     ShaderStage apiStage = ShaderStageVertex;
-    unsigned vsStageEnVal = VS_STAGE_REAL;
+    unsigned vsStageEn = VS_STAGE_REAL;
     if (m_pipelineState->hasShaderStage(ShaderStageCopyShader)) {
       apiStage = ShaderStageCopyShader;
-      vsStageEnVal = VS_STAGE_COPY_SHADER;
+      vsStageEn = VS_STAGE_COPY_SHADER;
     } else if (m_hasTes) {
       apiStage = ShaderStageTessEval;
-      vsStageEnVal = VS_STAGE_DS;
+      vsStageEn = VS_STAGE_DS;
     }
-    auto waveFrontSize = m_pipelineState->getShaderWaveSize(apiStage);
-    if (waveFrontSize == 32)
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsW32En] = true;
+    const auto waveSize = m_pipelineState->getShaderWaveSize(apiStage);
+    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsW32En] = (waveSize == 32);
 
-    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsStageEn] = vsStageEnVal;
+    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsStageEn] = vsStageEn;
   }
+
   if (hwStageMask & Util::Abi::HwShaderGs) {
-    unsigned esEnVal = ES_STAGE_REAL;
+    unsigned esStageEn = ES_STAGE_REAL;
     ShaderStage apiStage = ShaderStageVertex;
     if (m_hasGs || m_hasMesh) {
       apiStage = m_hasGs ? ShaderStageGeometry : ShaderStageMesh;
       vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::GsStageEn] = GS_STAGE_ON;
     } else if (m_hasTes) {
       apiStage = ShaderStageTessEval;
-      esEnVal = ES_STAGE_DS;
+      esStageEn = ES_STAGE_DS;
     }
-    auto waveFrontSize = m_pipelineState->getShaderWaveSize(apiStage);
-    if (waveFrontSize == 32)
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::GsW32En] = true;
+    const auto waveSize = m_pipelineState->getShaderWaveSize(apiStage);
+    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::GsW32En] = (waveSize == 32);
 
-    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::EsStageEn] = esEnVal;
-    if (m_isNggMode && !m_hasMesh)
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsStageEn] = VS_STAGE_REAL;
+    if (m_gfxIp.major <= 11) {
+      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::EsStageEn] = esStageEn;
+      if (m_isNggMode && !m_hasMesh)
+        vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::VsStageEn] = VS_STAGE_REAL;
+    }
   }
+
   if (hwStageMask & Util::Abi::HwShaderHs) {
-    auto waveFrontSize = m_pipelineState->getShaderWaveSize(ShaderStageTessControl);
-    if (waveFrontSize == 32)
-      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::HsW32En] = true;
-    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::LsStageEn] = LS_STAGE_ON;
+    const auto waveSize = m_pipelineState->getShaderWaveSize(ShaderStageTessControl);
+    vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::HsW32En] = (waveSize == 32);
+
+    if (m_gfxIp.major <= 11)
+      vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::LsStageEn] = LS_STAGE_ON;
     vgtShaderStagesEn[Util::Abi::VgtShaderStagesEnMetadataKey::HsStageEn] = HS_STAGE_ON;
   }
 }
@@ -1433,6 +1509,18 @@ void RegisterMetadataBuilder::setVgtTfParam() {
   vgtTfParam[Util::Abi::VgtTfParamMetadataKey::Topology] = topology;
   if (m_pipelineState->isTessOffChip())
     vgtTfParam[Util::Abi::VgtTfParamMetadataKey::DistributionMode] = TRAPEZOIDS;
+}
+
+// =====================================================================================================================
+// Calculate the LDS size in bytes.
+//
+// @param onChipLdsSize : The value of onChip LDS size
+unsigned RegisterMetadataBuilder::calcLdsSize(unsigned ldsSizeInDwords) {
+  const unsigned ldsSizeDwordGranularityShift =
+      m_pipelineState->getTargetInfo().getGpuProperty().ldsSizeDwordGranularityShift;
+  const unsigned ldsSizeDwordGranularity = 1u << ldsSizeDwordGranularityShift;
+  ldsSizeInDwords = alignTo(ldsSizeInDwords, ldsSizeDwordGranularity);
+  return (ldsSizeInDwords * 4);
 }
 
 } // namespace Gfx9

@@ -84,18 +84,13 @@ public:
   // Get (create if necessary) LgcContext
   lgc::LgcContext *getLgcContext();
 
-  llvm::CodeGenOpt::Level getOptimizationLevel() const;
+  llvm::CodeGenOpt::Level getOptimizationLevel();
+  llvm::CodeGenOpt::Level getLastOptimizationLevel() const;
 
   std::unique_ptr<llvm::Module> loadLibrary(const BinaryData *lib);
 
   // Wrappers of interfaces of pipeline context
-  bool isGraphics() const { return m_pipelineContext->isGraphics(); }
-#if VKI_RAY_TRACING
-  bool isRayTracing() const { return m_pipelineContext->isRayTracing(); }
-#endif
-  const PipelineShaderInfo *getPipelineShaderInfo(ShaderStage shaderStage) const {
-    return m_pipelineContext->getPipelineShaderInfo(shaderStage);
-  }
+  PipelineType getPipelineType() const { return m_pipelineContext->getPipelineType(); }
 
   const ResourceMappingData *getResourceMapping() const { return m_pipelineContext->getResourceMapping(); }
 
@@ -115,8 +110,8 @@ public:
 
   uint64_t get64BitCacheHashCode() const { return m_pipelineContext->get64BitCacheHashCode(); }
 
-  ShaderHash getShaderHashCode(ShaderStage shaderStage) const {
-    return m_pipelineContext->getShaderHashCode(shaderStage);
+  ShaderHash getShaderHashCode(const PipelineShaderInfo &shaderInfo) const {
+    return m_pipelineContext->getShaderHashCode(shaderInfo);
   }
 
   // Sets triple and data layout in specified module from the context's target machine.
@@ -127,13 +122,14 @@ private:
   Context(const Context &) = delete;
   Context &operator=(const Context &) = delete;
 
-  GfxIpVersion m_gfxIp;                              // Graphics IP version info
-  PipelineContext *m_pipelineContext;                // Pipeline-specific context
-  bool m_isInUse = false;                            // Whether this context is in use
-  lgc::Builder *m_builder = nullptr;                 // LLPC builder object
-  std::unique_ptr<lgc::LgcContext> m_builderContext; // Builder context
+  GfxIpVersion m_gfxIp;                                 // Graphics IP version info
+  PipelineContext *m_pipelineContext;                   // Pipeline-specific context
+  bool m_isInUse = false;                               // Whether this context is in use
+  lgc::Builder *m_builder = nullptr;                    // LLPC builder object
+  std::unique_ptr<llvm::TargetMachine> m_targetMachine; // Target machine for LGC context
+  std::unique_ptr<lgc::LgcContext> m_builderContext;    // LGC context
 
-  std::unique_ptr<llvm::TargetMachine> m_targetMachine; // Target machine
+  std::optional<llvm::CodeGenOpt::Level> m_lastOptLevel{}; // What getOptimizationLevel() last returned
   std::unique_ptr<llvm_dialects::DialectContext> m_dialectContext;
 
   unsigned m_useCount = 0; // Number of times this context is used.

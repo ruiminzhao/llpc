@@ -703,10 +703,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
   {
     m_builder.SetInsertPoint(endWriteSpecialValueBlock);
 
-    SyncScope::ID syncScope = entryPoint->getParent()->getContext().getOrInsertSyncScopeID("workgroup");
-    m_builder.CreateFence(AtomicOrdering::Release, syncScope);
-    m_builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-    m_builder.CreateFence(AtomicOrdering::Acquire, syncScope);
+    createFenceAndBarrier();
 
     auto validMeshWave = m_builder.CreateICmpULT(m_waveThreadInfo.waveIdInSubgroup, m_builder.getInt32(numMeshWaves));
     // There could be no extra waves
@@ -734,12 +731,8 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
     // with other instructions.
     endMeshWaveBlock->getTerminator()->eraseFromParent();
 
-    if (m_needBarrierFlag) {
-      SyncScope::ID syncScope = entryPoint->getParent()->getContext().getOrInsertSyncScopeID("workgroup");
-      m_builder.CreateFence(AtomicOrdering::Release, syncScope);
-      m_builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-      m_builder.CreateFence(AtomicOrdering::Acquire, syncScope);
-    }
+    if (m_needBarrierFlag)
+      createFenceAndBarrier();
 
     m_builder.CreateBr(checkMeshOutputCountBlock);
   }
@@ -794,10 +787,7 @@ void MeshTaskShader::processMeshShader(Function *entryPoint) {
   {
     m_builder.SetInsertPoint(checkMeshOutputCountBlock);
 
-    SyncScope::ID syncScope = entryPoint->getParent()->getContext().getOrInsertSyncScopeID("workgroup");
-    m_builder.CreateFence(AtomicOrdering::Release, syncScope);
-    m_builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
-    m_builder.CreateFence(AtomicOrdering::Acquire, syncScope);
+    createFenceAndBarrier();
 
     Value *ldsOffset = m_builder.getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::VertexCount));
     vertexCount = readValueFromLds(m_builder.getInt32Ty(), ldsOffset);
@@ -992,8 +982,10 @@ Value *MeshTaskShader::readTaskPayload(Type *readTy, Value *byteOffset) {
   auto payloadRingEntryOffset = getPayloadRingEntryOffset(entryPoint);
 
   CoherentFlag coherent = {};
-  coherent.bits.glc = true;
-  coherent.bits.dlc = true;
+  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 11) {
+    coherent.bits.glc = true;
+    coherent.bits.dlc = true;
+  }
 
   const unsigned bitWidth = readTy->getScalarSizeInBits();
   const unsigned numElements = readTy->isVectorTy() ? cast<FixedVectorType>(readTy)->getNumElements() : 1;
@@ -1057,7 +1049,9 @@ void MeshTaskShader::writeTaskPayload(Value *writeValue, Value *byteOffset) {
   auto payloadRingEntryOffset = getPayloadRingEntryOffset(entryPoint);
 
   CoherentFlag coherent = {};
-  coherent.bits.glc = true;
+  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 11) {
+    coherent.bits.glc = true;
+  }
 
   const auto writeTy = writeValue->getType();
   const unsigned bitWidth = writeTy->getScalarSizeInBits();
@@ -1315,24 +1309,8 @@ void MeshTaskShader::initWaveThreadInfo(Function *entryPoint) {
     m_waveThreadInfo.primOrVertexIndex =
         m_waveThreadInfo.threadIdInSubgroup; // Primitive or vertex index is initialized to thread ID in subgroup
 
-    if (m_gfxIp.major >= 11) {
-      // The workgroup ID X and Y are reused via the SGPR of off-chip LDS base in NGG new fast launch mode
-      Value *workgroupIdYX =
-          getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::OffChipLdsBase));
-      // workgroupIdY = workgroupIdXY[31:16]
-      m_waveThreadInfo.workgroupIdY =
-          m_builder.CreateAnd(m_builder.CreateLShr(workgroupIdYX, 16), 0xFFFF, "workgroupIdY");
-      // workgroupIdX = workgroupIdXY[15:0]
-      m_waveThreadInfo.workgroupIdX = m_builder.CreateAnd(workgroupIdYX, 0xFFFF, "workgroupIdX");
-      // workgroupIdZ = attribRingBaseAndWorkgroupIdZ[31:16]
-      Value *workgroupIdZAndAttribRingBase =
-          getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::AttribRingBase));
-      m_waveThreadInfo.workgroupIdZ =
-          m_builder.CreateAnd(m_builder.CreateLShr(workgroupIdZAndAttribRingBase, 16), 0xFFFF, "workgroupIdZ");
-
-      m_waveThreadInfo.rowInSubgroup =
-          m_waveThreadInfo.waveIdInSubgroup; // Row number is initialized to wave ID in subgroup
-    }
+    m_waveThreadInfo.rowInSubgroup =
+        m_waveThreadInfo.waveIdInSubgroup; // Row number is initialized to wave ID in subgroup
   }
 }
 
@@ -1351,19 +1329,25 @@ Value *MeshTaskShader::getShaderRingEntryIndex(Function *entryPoint) {
 
       auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTask)->entryArgIdxs.task;
 
-      auto workgroupId = getFunctionArgument(entryPoint, entryArgIdxs.workgroupId);
+      Value *workgroupIds[3] = {};
+      if (m_gfxIp.major <= 11) {
+        auto workgroupId = getFunctionArgument(entryPoint, entryArgIdxs.workgroupId);
+        workgroupIds[0] = m_builder.CreateExtractElement(workgroupId, static_cast<uint64_t>(0));
+        workgroupIds[1] = m_builder.CreateExtractElement(workgroupId, 1);
+        workgroupIds[2] = m_builder.CreateExtractElement(workgroupId, 2);
+      } else {
+        llvm_unreachable("Not implemented!");
+      }
       auto dispatchDims = getFunctionArgument(entryPoint, entryArgIdxs.dispatchDims);
 
       // flatWorkgroupId = workgroupId.z * dispatchDims.x * dispatchDims.y +
       //                   workgroupId.y * dispatchDims.x + workgroupId.x
       //                 = (workgroupId.z * dispatchDims.y + workgroupId.y) * dispatchDims.x + workgroupId.x
-      auto flatWorkgroupId = m_builder.CreateMul(m_builder.CreateExtractElement(workgroupId, 2),
-                                                 m_builder.CreateExtractElement(dispatchDims, 1));
-      flatWorkgroupId = m_builder.CreateAdd(flatWorkgroupId, m_builder.CreateExtractElement(workgroupId, 1));
+      auto flatWorkgroupId = m_builder.CreateMul(workgroupIds[2], m_builder.CreateExtractElement(dispatchDims, 1));
+      flatWorkgroupId = m_builder.CreateAdd(flatWorkgroupId, workgroupIds[1]);
       flatWorkgroupId =
           m_builder.CreateMul(flatWorkgroupId, m_builder.CreateExtractElement(dispatchDims, static_cast<uint64_t>(0)));
-      flatWorkgroupId =
-          m_builder.CreateAdd(flatWorkgroupId, m_builder.CreateExtractElement(workgroupId, static_cast<uint64_t>(0)));
+      flatWorkgroupId = m_builder.CreateAdd(flatWorkgroupId, workgroupIds[0]);
 
       auto baseRingEntryIndex = getFunctionArgument(entryPoint, entryArgIdxs.baseRingEntryIndex);
       m_shaderRingEntryIndex = m_builder.CreateAdd(baseRingEntryIndex, flatWorkgroupId);
@@ -1579,12 +1563,12 @@ Function *MeshTaskShader::mutateMeshShaderEntryPoint(Function *entryPoint) {
   assert(getShaderStage(entryPoint) == ShaderStageMesh); // Must be mesh shader
 
   // GFX10 special SGPR input names
-  static const std::array<std::string, NumSpecialSgprInputs> SpecialSgprInputNamesGfx10 = {
+  static const SmallVector<std::string, NumSpecialSgprInputs> SpecialSgprInputNamesGfx10 = {
       "gsUserDataAddrLow", "gsUserDataAddrHigh",  "mergedGroupInfo", "mergedWaveInfo",
       "offChipLdsBase",    "sharedScratchOffset", "gsShaderAddrLow", "gsShaderAddrHigh",
   };
 
-  // GFX10 special SGPR input names
+  // GFX11+ special SGPR input names
   static const std::array<std::string, NumSpecialSgprInputs> SpecialSgprInputNamesGfx11 = {
       "gsProgramAddrLow", "gsProgramAddrHigh", "mergedGroupInfo",
       "mergedWaveInfo",   "workgroupIdYX",     "workgroupIdZAndAttribRingBase",
@@ -1593,9 +1577,9 @@ Function *MeshTaskShader::mutateMeshShaderEntryPoint(Function *entryPoint) {
 
   ArrayRef<std::string> specialSgprInputNames;
   if (m_gfxIp.major == 10)
-    specialSgprInputNames = ArrayRef(SpecialSgprInputNamesGfx10);
-  else if (m_gfxIp.major == 11)
-    specialSgprInputNames = ArrayRef(SpecialSgprInputNamesGfx11);
+    specialSgprInputNames = ArrayRef<std::string>(SpecialSgprInputNamesGfx10);
+  else
+    specialSgprInputNames = ArrayRef<std::string>(SpecialSgprInputNamesGfx11);
   assert(specialSgprInputNames.size() == NumSpecialSgprInputs);
 
   // Add special SGPR inputs, prior to existing user data SGPRs
@@ -1630,6 +1614,23 @@ Function *MeshTaskShader::mutateMeshShaderEntryPoint(Function *entryPoint) {
     entryPoint->eraseFromParent();
 
     entryArgIdx.flatWorkgroupId = newEntryPoint->arg_size() - 1; // The last argument
+  }
+
+  // NOTE: On GFX11+, the local invocation ID is provided by GE as a packed value (VGPR0), similar to the change of CS
+  // on GFX11. The layout is as follow:
+  //
+  //   +-----------------------+-----------------------+-----------------------+
+  //   | Local Invocation ID Z | Local Invocation ID Y | Local Invocation ID Z |
+  //   | [29:20]               | [19:10]               | [9:0]                 |
+  //   +-----------------------+-----------------------+-----------------------+
+  if (m_gfxIp.major >= 11) {
+    entryPoint = newEntryPoint;
+    newEntryPoint = addFunctionArgs(entryPoint, nullptr, int32Ty, {"localInvocationId"}, 0, true);
+
+    assert(entryPoint->use_empty());
+    entryPoint->eraseFromParent();
+
+    entryArgIdx.localInvocationId = newEntryPoint->arg_size() - 1; // The last argument
   }
 
   return newEntryPoint;
@@ -1825,10 +1826,11 @@ void MeshTaskShader::setMeshOutputs(Value *vertexCount, Value *primitiveCount) {
 void MeshTaskShader::setPrimitiveIndices(Value *primitiveIndex, Value *primitiveIndices) {
   //
   // HW requires the primitive connectivity data has the following bit layout:
-  //   [31]    = Null primitive flag
-  //   [28:20] = Index of vertex2
-  //   [18:10] = Index of vertex1
-  //   [8:0]   = Index of vertex0
+  //
+  //   +----------------+---------------+---------------+---------------+
+  //   | Null Primitive | Vertex Index2 | Vertex Index1 | Vertex Index0 |
+  //   | [31]           | [28:20]       | [18:10]       | [8:0]         |
+  //   +----------------+---------------+---------------+---------------+
   //
   auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
   Value *primitiveData = nullptr;
@@ -1841,18 +1843,26 @@ void MeshTaskShader::setPrimitiveIndices(Value *primitiveIndex, Value *primitive
     Value *vertex0 = m_builder.CreateExtractElement(primitiveIndices, static_cast<uint64_t>(0));
     Value *vertex1 = m_builder.CreateExtractElement(primitiveIndices, 1);
 
-    primitiveData = m_builder.CreateShl(vertex1, 10);
-    primitiveData = m_builder.CreateOr(primitiveData, vertex0);
+    if (m_gfxIp.major <= 11) {
+      primitiveData = m_builder.CreateShl(vertex1, 10);
+      primitiveData = m_builder.CreateOr(primitiveData, vertex0);
+    } else {
+      llvm_unreachable("Not implemented!");
+    }
   } else {
     assert(meshMode.outputPrimitive == OutputPrimitives::Triangles);
     Value *vertex0 = m_builder.CreateExtractElement(primitiveIndices, static_cast<uint64_t>(0));
     Value *vertex1 = m_builder.CreateExtractElement(primitiveIndices, 1);
     Value *vertex2 = m_builder.CreateExtractElement(primitiveIndices, 2);
 
-    primitiveData = m_builder.CreateShl(vertex2, 10);
-    primitiveData = m_builder.CreateOr(primitiveData, vertex1);
-    primitiveData = m_builder.CreateShl(primitiveData, 10);
-    primitiveData = m_builder.CreateOr(primitiveData, vertex0);
+    if (m_gfxIp.major <= 11) {
+      primitiveData = m_builder.CreateShl(vertex2, 10);
+      primitiveData = m_builder.CreateOr(primitiveData, vertex1);
+      primitiveData = m_builder.CreateShl(primitiveData, 10);
+      primitiveData = m_builder.CreateOr(primitiveData, vertex0);
+    } else {
+      llvm_unreachable("Not implemented!");
+    }
   }
 
   Value *ldsStart = m_builder.getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::PrimitiveIndices));
@@ -2483,7 +2493,9 @@ void MeshTaskShader::doExport(ExportKind kind, ArrayRef<ExportInfo> exports) {
         auto locationOffset = m_builder.getInt32(exportIndex * SizeOfVec4);
 
         CoherentFlag coherent = {};
-        coherent.bits.glc = true;
+        if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 11) {
+          coherent.bits.glc = true;
+        }
 
         m_builder.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, valueToStore->getType(),
                                   {valueToStore, m_attribRingBufDesc, m_waveThreadInfo.threadIdInSubgroup,
@@ -2573,17 +2585,12 @@ void MeshTaskShader::prepareAttribRingAccess() {
 Value *MeshTaskShader::getMeshFlatWorkgroupId() {
   assert(getShaderStage(m_builder.GetInsertBlock()->getParent()) == ShaderStageMesh); // Must be mesh shader
 
-  if (!m_meshFlatWorkgroupId) {
-    auto ldsOffset = m_builder.getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::FlatWorkgroupId));
-    auto flatWorkgroupId = readValueFromLds(m_builder.getInt32Ty(), ldsOffset);
-    flatWorkgroupId =
-        m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, flatWorkgroupId); // Promoted to SGPR
-    flatWorkgroupId->setName("flatWorkgroupId");
+  auto ldsOffset = m_builder.getInt32(getMeshShaderLdsRegionStart(MeshLdsRegion::FlatWorkgroupId));
+  auto flatWorkgroupId = readValueFromLds(m_builder.getInt32Ty(), ldsOffset);
+  flatWorkgroupId = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, flatWorkgroupId); // Promoted to SGPR
+  flatWorkgroupId->setName("flatWorkgroupId");
 
-    m_meshFlatWorkgroupId = flatWorkgroupId;
-  }
-
-  return m_meshFlatWorkgroupId;
+  return flatWorkgroupId;
 }
 
 // =====================================================================================================================
@@ -2606,54 +2613,62 @@ Value *MeshTaskShader::getMeshWorkgroupId() {
   auto entryPoint = m_builder.GetInsertBlock()->getParent();
   assert(getShaderStage(entryPoint) == ShaderStageMesh); // Must be mesh shader
 
-  if (!m_meshWorkgroupId) {
-    if (m_gfxIp.major >= 11) {
-      Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder.getInt32Ty(), 3));
-      workgroupId = m_builder.CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdX, static_cast<uint64_t>(0));
-      workgroupId = m_builder.CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdY, 1);
-      workgroupId = m_builder.CreateInsertElement(workgroupId, m_waveThreadInfo.workgroupIdZ, 2);
+  Value *workgroupIdX = nullptr;
+  Value *workgroupIdY = nullptr;
+  Value *workgroupIdZ = nullptr;
 
-      m_meshWorkgroupId = workgroupId;
-    } else {
-      // flatWorkgroupId = workgroupId.z * dispatchDims.x * dispatchDims.y +
-      //                   workgroupId.y * dispatchDims.x + workgroupId.x
-      //
-      // workgroupId.z = flatWorkgroupId / dispatchDims.x * dispatchDims.y
-      // workgroupId.y = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) / dispatchDims.x
-      // workgroupId.x = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) -
-      //                 dispatchDims.x * workgroupId.y
-      auto flatWorkgroupId = getMeshFlatWorkgroupId();
+  if (m_gfxIp.major >= 11) {
+    // The workgroup ID X and Y are reused via the SGPR of off-chip LDS base in NGG new fast launch mode
+    Value *workgroupIdYX =
+        getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::OffChipLdsBase));
+    // workgroupIdY = workgroupIdXY[31:16]
+    workgroupIdY = m_builder.CreateAnd(m_builder.CreateLShr(workgroupIdYX, 16), 0xFFFF, "workgroupIdY");
+    // workgroupIdX = workgroupIdXY[15:0]
+    workgroupIdX = m_builder.CreateAnd(workgroupIdYX, 0xFFFF, "workgroupIdX");
+    // workgroupIdZ = attribRingBaseAndWorkgroupIdZ[31:16]
+    Value *workgroupIdZAndAttribRingBase =
+        getFunctionArgument(entryPoint, ShaderMerger::getSpecialSgprInputIndex(m_gfxIp, EsGs::AttribRingBase));
+    workgroupIdZ = m_builder.CreateAnd(m_builder.CreateLShr(workgroupIdZAndAttribRingBase, 16), 0xFFFF, "workgroupIdZ");
+  } else {
+    // flatWorkgroupId = workgroupId.z * dispatchDims.x * dispatchDims.y +
+    //                   workgroupId.y * dispatchDims.x + workgroupId.x
+    //
+    // workgroupId.z = flatWorkgroupId / dispatchDims.x * dispatchDims.y
+    // workgroupId.y = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) / dispatchDims.x
+    // workgroupId.x = (flatWorkgroupId - dispatchDims.x * dispatchDims.y * workgroupId.z) -
+    //                 dispatchDims.x * workgroupId.y
+    auto flatWorkgroupId = getMeshFlatWorkgroupId();
 
-      auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageMesh)->entryArgIdxs.mesh;
+    auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageMesh)->entryArgIdxs.mesh;
 
-      auto dispatchDims = getFunctionArgument(entryPoint, entryArgIdxs.dispatchDims);
-      auto dispatchDimX = m_builder.CreateExtractElement(dispatchDims, static_cast<uint64_t>(0));
-      auto dispatchDimY = m_builder.CreateExtractElement(dispatchDims, 1);
-      auto dispatchDimXMulY = m_builder.CreateMul(dispatchDimX, dispatchDimY);
+    auto dispatchDims = getFunctionArgument(entryPoint, entryArgIdxs.dispatchDims);
+    auto dispatchDimX = m_builder.CreateExtractElement(dispatchDims, static_cast<uint64_t>(0));
+    auto dispatchDimY = m_builder.CreateExtractElement(dispatchDims, 1);
+    auto dispatchDimXMulY = m_builder.CreateMul(dispatchDimX, dispatchDimY);
 
-      auto workgroupIdZ = m_builder.CreateUDiv(flatWorkgroupId, dispatchDimXMulY);
-      workgroupIdZ = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdZ); // Promoted to SGPR
+    workgroupIdZ = m_builder.CreateUDiv(flatWorkgroupId, dispatchDimXMulY);
+    workgroupIdZ = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdZ, nullptr,
+                                             "workgroupIdZ"); // Promoted to SGPR
 
-      auto diff = m_builder.CreateMul(dispatchDimXMulY, workgroupIdZ);
-      diff = m_builder.CreateSub(flatWorkgroupId, diff);
-      auto workgroupIdY = m_builder.CreateUDiv(diff, dispatchDimX);
-      workgroupIdY = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdY); // Promoted to SGPR
+    auto diff = m_builder.CreateMul(dispatchDimXMulY, workgroupIdZ);
+    diff = m_builder.CreateSub(flatWorkgroupId, diff);
+    workgroupIdY = m_builder.CreateUDiv(diff, dispatchDimX);
+    workgroupIdY = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdY, nullptr,
+                                             "workgroupIdY"); // Promoted to SGPR
 
-      auto workgroupIdX = m_builder.CreateMul(dispatchDimX, workgroupIdY);
-      workgroupIdX = m_builder.CreateSub(diff, workgroupIdX);
-      workgroupIdX = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdX); // Promoted to SGPR
-
-      Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder.getInt32Ty(), 3));
-      workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdX, static_cast<uint64_t>(0));
-      workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdY, 1);
-      workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdZ, 2);
-
-      m_meshWorkgroupId = workgroupId;
-    }
-    m_meshWorkgroupId->setName("workgroupId");
+    workgroupIdX = m_builder.CreateMul(dispatchDimX, workgroupIdY);
+    workgroupIdX = m_builder.CreateSub(diff, workgroupIdX);
+    workgroupIdX = m_builder.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {}, workgroupIdX, nullptr,
+                                             "workgroupIdX"); // Promoted to SGPR
   }
 
-  return m_meshWorkgroupId;
+  Value *workgroupId = UndefValue::get(FixedVectorType::get(m_builder.getInt32Ty(), 3));
+  workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdX, static_cast<uint64_t>(0));
+  workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdY, 1);
+  workgroupId = m_builder.CreateInsertElement(workgroupId, workgroupIdZ, 2);
+  workgroupId->setName("workgroupId");
+
+  return workgroupId;
 }
 
 // =====================================================================================================================
@@ -2661,9 +2676,30 @@ Value *MeshTaskShader::getMeshWorkgroupId() {
 //
 // @returns : Value of the built-in LocalInvocationId
 Value *MeshTaskShader::getMeshLocalInvocationId() {
-  assert(getShaderStage(m_builder.GetInsertBlock()->getParent()) == ShaderStageMesh); // Must be mesh shader
+  auto entryPoint = m_builder.GetInsertBlock()->getParent();
+  assert(getShaderStage(entryPoint) == ShaderStageMesh); // Must be mesh shader
 
-  if (!m_meshLocalInvocationId) {
+  Value *localInvocationIdX = nullptr;
+  Value *localInvocationIdY = nullptr;
+  Value *localInvocationIdZ = nullptr;
+
+  if (m_gfxIp.major >= 11) {
+    // The local invocation ID is packed to VGPR0 on GFX11+ with the following layout:
+    //
+    //   +-----------------------+-----------------------+-----------------------+
+    //   | Local Invocation ID Z | Local Invocation ID Y | Local Invocation ID Z |
+    //   | [29:20]               | [19:10]               | [9:0]                 |
+    //   +-----------------------+-----------------------+-----------------------+
+    auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageMesh)->entryArgIdxs.mesh;
+
+    Value *localInvocationId = getFunctionArgument(entryPoint, entryArgIdxs.localInvocationId);
+    // localInvocationIdZ = localInvocationId[29:20]
+    localInvocationIdZ = m_builder.CreateAnd(m_builder.CreateLShr(localInvocationId, 20), 0x3FF, "localInvocationIdZ");
+    // localInvocationIdY = localInvocationId[19:10]
+    localInvocationIdY = m_builder.CreateAnd(m_builder.CreateLShr(localInvocationId, 10), 0x3FF, "localInvocationIdY");
+    // localInvocationIdX = localInvocationId[9:0]
+    localInvocationIdX = m_builder.CreateAnd(localInvocationId, 0x3FF, "localInvocationIdX");
+  } else {
     // localInvocationIndex = localInvocationId.z * workgroupSize.x * workgroupSize.y +
     //                        localInvocationId.y * workgroupSize.x + localInvocationId.x
     //
@@ -2678,25 +2714,23 @@ Value *MeshTaskShader::getMeshLocalInvocationId() {
     auto workgroupSizeX = m_builder.getInt32(meshMode.workgroupSizeX);
     auto workgroupSizeXMulY = m_builder.getInt32(meshMode.workgroupSizeX * meshMode.workgroupSizeY);
 
-    auto localInvocationIdZ = m_builder.CreateUDiv(localInvocationIndex, workgroupSizeXMulY);
+    localInvocationIdZ = m_builder.CreateUDiv(localInvocationIndex, workgroupSizeXMulY, "localInvocationIdZ");
 
     auto diff = m_builder.CreateMul(workgroupSizeXMulY, localInvocationIdZ);
     diff = m_builder.CreateSub(localInvocationIndex, diff);
-    auto localInvocationIdY = m_builder.CreateUDiv(diff, workgroupSizeX);
+    localInvocationIdY = m_builder.CreateUDiv(diff, workgroupSizeX, "localInvocationIdY");
 
-    auto localInvocationIdX = m_builder.CreateMul(workgroupSizeX, localInvocationIdY);
-    localInvocationIdX = m_builder.CreateSub(diff, localInvocationIdX);
-
-    Value *localInvocationId = UndefValue::get(FixedVectorType::get(m_builder.getInt32Ty(), 3));
-    localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdX, static_cast<uint64_t>(0));
-    localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdY, 1);
-    localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdZ, 2);
-
-    m_meshLocalInvocationId = localInvocationId;
-    m_meshLocalInvocationId->setName("localInvocationId");
+    localInvocationIdX = m_builder.CreateMul(workgroupSizeX, localInvocationIdY);
+    localInvocationIdX = m_builder.CreateSub(diff, localInvocationIdX, "localInvocationIdX");
   }
 
-  return m_meshLocalInvocationId;
+  Value *localInvocationId = UndefValue::get(FixedVectorType::get(m_builder.getInt32Ty(), 3));
+  localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdX, static_cast<uint64_t>(0));
+  localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdY, 1);
+  localInvocationId = m_builder.CreateInsertElement(localInvocationId, localInvocationIdZ, 2);
+  localInvocationId->setName("localInvocationId");
+
+  return localInvocationId;
 }
 
 // =====================================================================================================================
@@ -2715,47 +2749,19 @@ Value *MeshTaskShader::getMeshLocalInvocationIndex() {
 Value *MeshTaskShader::getMeshGlobalInvocationId() {
   assert(getShaderStage(m_builder.GetInsertBlock()->getParent()) == ShaderStageMesh); // Must be mesh shader
 
-  if (!m_meshGlobalInvocationId) {
-    // globalInvocationId = workgroupId * workgroupSize + localInvocationId
-    auto workgourpId = getMeshWorkgroupId();
-    const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
-    auto workgroupSize =
-        ConstantVector::get({m_builder.getInt32(meshMode.workgroupSizeX), m_builder.getInt32(meshMode.workgroupSizeY),
-                             m_builder.getInt32(meshMode.workgroupSizeZ)});
-    auto localInvocationId = getMeshLocalInvocationId();
+  // globalInvocationId = workgroupId * workgroupSize + localInvocationId
+  auto workgourpId = getMeshWorkgroupId();
+  const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
+  auto workgroupSize =
+      ConstantVector::get({m_builder.getInt32(meshMode.workgroupSizeX), m_builder.getInt32(meshMode.workgroupSizeY),
+                           m_builder.getInt32(meshMode.workgroupSizeZ)});
+  auto localInvocationId = getMeshLocalInvocationId();
 
-    auto globalInvocationId = m_builder.CreateMul(workgourpId, workgroupSize);
-    globalInvocationId = m_builder.CreateAdd(globalInvocationId, localInvocationId);
+  auto globalInvocationId = m_builder.CreateMul(workgourpId, workgroupSize);
+  globalInvocationId = m_builder.CreateAdd(globalInvocationId, localInvocationId);
+  globalInvocationId->setName("globalInvocationId");
 
-    m_meshGlobalInvocationId = globalInvocationId;
-    m_meshGlobalInvocationId->setName("globalInvocationId");
-  }
-
-  return m_meshGlobalInvocationId;
-}
-
-// =====================================================================================================================
-// Get the global invocation index (equivalent to flat built-in GlobalInvocationId) of mesh shader.
-//
-// @returns : Value of global invocation index
-Value *MeshTaskShader::getGlobalInvocationIndex() {
-  assert(getShaderStage(m_builder.GetInsertBlock()->getParent()) == ShaderStageMesh); // Must be mesh shader
-
-  if (!m_meshGlobalInvocationIndex) {
-    // globalInvocationIndex = flatWorkgroupId * numMeshThreads + threadIdInSubgroup
-    const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
-    unsigned numMeshThreads = meshMode.workgroupSizeX * meshMode.workgroupSizeY * meshMode.workgroupSizeZ;
-    auto flatWorkgroupId = getMeshFlatWorkgroupId();
-
-    Value *localInvocationIndex = getMeshLocalInvocationIndex();
-    Value *globalInvocationIndex = m_builder.CreateMul(flatWorkgroupId, m_builder.getInt32(numMeshThreads));
-    globalInvocationIndex = m_builder.CreateAdd(globalInvocationIndex, localInvocationIndex);
-
-    m_meshGlobalInvocationIndex = globalInvocationIndex;
-    m_meshGlobalInvocationIndex->setName("globalInvocationIndex");
-  }
-
-  return m_meshGlobalInvocationIndex;
+  return globalInvocationId;
 }
 
 // =====================================================================================================================
@@ -3132,6 +3138,15 @@ void MeshTaskShader::atomicOpWithLds(AtomicRMWInst::BinOp atomicOp, Value *atomi
   Value *atomicPtr = m_builder.CreateGEP(m_lds->getValueType(), m_lds, {m_builder.getInt32(0), ldsOffset});
   m_builder.CreateAtomicRMW(atomicOp, atomicPtr, atomicValue, MaybeAlign(), AtomicOrdering::Monotonic,
                             SyncScope::SingleThread);
+}
+
+// =====================================================================================================================
+// Create LDS fence and barrier to guarantee the synchronization of LDS operations.
+void MeshTaskShader::createFenceAndBarrier() {
+  SyncScope::ID syncScope = m_builder.getContext().getOrInsertSyncScopeID("workgroup");
+  m_builder.CreateFence(AtomicOrdering::Release, syncScope);
+  m_builder.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {}, {});
+  m_builder.CreateFence(AtomicOrdering::Acquire, syncScope);
 }
 
 } // namespace lgc

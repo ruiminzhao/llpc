@@ -59,21 +59,33 @@ ComputeContext::ComputeContext(GfxIpVersion gfxIp, const ComputePipelineBuildInf
 }
 
 // =====================================================================================================================
-// Gets pipeline shader info of the specified shader stage
-//
-// @param shaderStage : Shader stage
-const PipelineShaderInfo *ComputeContext::getPipelineShaderInfo(ShaderStage shaderStage) const {
-  assert(shaderStage == ShaderStageCompute);
-  return &m_pipelineInfo->cs;
-}
-
-// =====================================================================================================================
 // Gets subgroup size usage
 //
 // @returns : Bitmask per stage, in the same order as defined in `Vkgc::ShaderStage`.
 unsigned ComputeContext::getSubgroupSizeUsage() const {
   const ShaderModuleData *moduleData = reinterpret_cast<const ShaderModuleData *>(m_pipelineInfo->cs.pModuleData);
   return moduleData->usage.useSubgroupSize ? ShaderStageComputeBit : 0;
+}
+
+// =====================================================================================================================
+// Set pipeline state in Pipeline object for middle-end and/or calculate the hash for the state to be added.
+// Doing both these things in the same code ensures that we hash and use the same pipeline state in all situations.
+//
+// @param [in/out] pipeline : Middle-end pipeline object; nullptr if only hashing pipeline state
+// @param [in/out] hasher : Hasher object; nullptr if only setting LGC pipeline state
+// @param unlinked : Do not provide some state to LGC, so offsets are generated as relocs, and a fetch shader
+//                   is needed
+void ComputeContext::setPipelineState(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher, bool unlinked) const {
+  PipelineContext::setPipelineState(pipeline, hasher, unlinked);
+
+  if (pipeline)
+    pipeline->setShaderOptions(lgc::ShaderStageCompute, computeShaderOptions(m_pipelineInfo->cs));
+}
+
+// =====================================================================================================================
+// Gets client-defined metadata
+StringRef ComputeContext::getClientMetadata() const {
+  return StringRef(static_cast<const char *>(m_pipelineInfo->pClientMetadata), m_pipelineInfo->clientMetadataSize);
 }
 
 } // namespace Llpc

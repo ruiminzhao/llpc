@@ -48,7 +48,6 @@ Value *YCbCrConverter::wrappedSample(YCbCrWrappedSampleInfo &wrapInfo) {
   Value *chromaWidth = nullptr;
   Value *chromaHeight = nullptr;
 
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 52
   if ((m_metaData.word5.lumaDepth > 1) && (m_metaData.word1.planes > 1)) {
     SqImgRsrcRegHandler proxySqRsrcRegHelper(m_builder, wrapInfo.imageDesc2, m_gfxIp);
     chromaWidth = proxySqRsrcRegHelper.getReg(SqRsrcRegs::Width);
@@ -56,9 +55,7 @@ Value *YCbCrConverter::wrappedSample(YCbCrWrappedSampleInfo &wrapInfo) {
 
     chromaWidth = m_builder->CreateUIToFP(chromaWidth, m_builder->getFloatTy());
     chromaHeight = m_builder->CreateUIToFP(chromaHeight, m_builder->getFloatTy());
-  } else
-#endif
-  {
+  } else {
     chromaWidth = wrapInfo.chromaWidth;
     chromaHeight = wrapInfo.chromaHeight;
 
@@ -305,11 +302,11 @@ Value *YCbCrConverter::createImageSampleInternal(SmallVectorImpl<Value *> &coord
 // =====================================================================================================================
 // YCbCrConverter
 //
-// @param builder : ImageBuilder instance
+// @param builder : BuilderImpl instance
 // @param ycbcrMetaData : YCbCr conversion metadata
 // @param ycbcrSampleInfo : YCbCr sample information
 // @param gfxIp : The GfxIp Version
-YCbCrConverter::YCbCrConverter(ImageBuilder *builder, const SamplerYCbCrConversionMetaData &ycbcrMetaData,
+YCbCrConverter::YCbCrConverter(BuilderImpl *builder, const SamplerYCbCrConversionMetaData &ycbcrMetaData,
                                YCbCrSampleInfo *ycbcrSampleInfo, GfxIpVersion *gfxIp)
     : m_builder(builder), m_metaData(ycbcrMetaData), m_gfxIp(gfxIp) {
   m_imgDescsChroma.resize(3);
@@ -349,14 +346,11 @@ void YCbCrConverter::genImgDescChroma() {
   SqImgRsrcRegHandler proxySqRsrcRegHelper(m_builder, m_imgDescLuma, m_gfxIp);
 
   Value *width = nullptr;
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 52
   if ((m_metaData.word5.lumaDepth > 1) && (m_metaData.word1.planes > 1)) {
     width = ConstantInt::get(m_builder->getInt32Ty(), m_metaData.word4.lumaWidth);
     m_width = ConstantFP::get(m_builder->getFloatTy(), m_metaData.word4.lumaWidth);
     m_height = ConstantFP::get(m_builder->getFloatTy(), m_metaData.word4.lumaHeight);
-  } else
-#endif
-  {
+  } else {
     width = proxySqRsrcRegHelper.getReg(SqRsrcRegs::Width);
     Value *height = proxySqRsrcRegHelper.getReg(SqRsrcRegs::Height);
     m_width = m_builder->CreateUIToFP(width, m_builder->getFloatTy());
@@ -374,34 +368,34 @@ void YCbCrConverter::genImgDescChroma() {
     case 7:
     case 8:
     case 9: {
-      isGbGrFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgDataFormat::IMG_DATA_FORMAT_BG_RG__CORE));
+      isGbGrFmt = m_builder->CreateICmpEQ(imgDataFmt,
+                                          m_builder->getInt32(BuilderImpl::ImgDataFormat::IMG_DATA_FORMAT_BG_RG__CORE));
 
-      isBgRgFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgDataFormat::IMG_DATA_FORMAT_GB_GR__CORE));
+      isBgRgFmt = m_builder->CreateICmpEQ(imgDataFmt,
+                                          m_builder->getInt32(BuilderImpl::ImgDataFormat::IMG_DATA_FORMAT_GB_GR__CORE));
 
       proxySqRsrcRegHelper.setReg(SqRsrcRegs::Format,
-                                  m_builder->getInt32(ImageBuilder::ImgDataFormat::IMG_DATA_FORMAT_8_8_8_8));
+                                  m_builder->getInt32(BuilderImpl::ImgDataFormat::IMG_DATA_FORMAT_8_8_8_8));
       break;
     }
     case 10: {
       isGbGrFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgFmtGfx10::IMG_FMT_BG_RG_UNORM__GFX10CORE));
+          imgDataFmt, m_builder->getInt32(BuilderImpl::ImgFmtGfx10::IMG_FMT_BG_RG_UNORM__GFX10CORE));
       isBgRgFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgFmtGfx10::IMG_FMT_GB_GR_UNORM__GFX10CORE));
+          imgDataFmt, m_builder->getInt32(BuilderImpl::ImgFmtGfx10::IMG_FMT_GB_GR_UNORM__GFX10CORE));
 
       proxySqRsrcRegHelper.setReg(SqRsrcRegs::Format,
-                                  m_builder->getInt32(ImageBuilder::ImgFmtGfx10::IMG_FMT_8_8_8_8_UNORM__GFX10CORE));
+                                  m_builder->getInt32(BuilderImpl::ImgFmtGfx10::IMG_FMT_8_8_8_8_UNORM__GFX10CORE));
       break;
     }
     case 11: {
       isGbGrFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgFmtGfx11::IMG_FMT_BG_RG_UNORM__GFX104PLUS));
+          imgDataFmt, m_builder->getInt32(BuilderImpl::ImgFmtGfx11::IMG_FMT_BG_RG_UNORM__GFX104PLUS));
       isBgRgFmt = m_builder->CreateICmpEQ(
-          imgDataFmt, m_builder->getInt32(ImageBuilder::ImgFmtGfx11::IMG_FMT_GB_GR_UNORM__GFX104PLUS));
+          imgDataFmt, m_builder->getInt32(BuilderImpl::ImgFmtGfx11::IMG_FMT_GB_GR_UNORM__GFX104PLUS));
 
       proxySqRsrcRegHelper.setReg(SqRsrcRegs::Format,
-                                  m_builder->getInt32(ImageBuilder::ImgFmtGfx11::IMG_FMT_8_8_8_8_UNORM__GFX104PLUS));
+                                  m_builder->getInt32(BuilderImpl::ImgFmtGfx11::IMG_FMT_8_8_8_8_UNORM__GFX104PLUS));
       break;
     }
     default:
@@ -585,7 +579,6 @@ void YCbCrConverter::sampleYCbCrData() {
   SmallVector<Value *, 4> coordsLuma;
   SmallVector<Value *, 4> coordsChroma;
 
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 52
   if ((m_metaData.word5.lumaDepth > 1) && (m_metaData.word1.planes > 1)) {
     SqImgRsrcRegHandler proxySqRsrcRegHelper(m_builder, m_imgDescLuma, m_gfxIp);
 
@@ -601,7 +594,6 @@ void YCbCrConverter::sampleYCbCrData() {
     m_coordS = m_builder->CreateFMul(m_coordS, widthScaleFactor);
     m_coordT = m_builder->CreateFMul(m_coordT, heightScaleFactor);
   }
-#endif
 
   // coordI -> coordS
   coordsLuma.push_back(m_coordS);

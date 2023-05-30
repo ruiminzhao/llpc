@@ -68,7 +68,7 @@ set_compiler_options(LLVMlgc ${LLPC_ENABLE_WERROR})
 
 ### TableGen for LGC dialect ###########################################################################################
 
-set(LGC_TABLEGEN_EXE llvm-dialects-tblgen)
+set(LGC_TABLEGEN_EXE ${LLVM_TOOLS_BINARY_DIR}/llvm-dialects-tblgen)
 set(LGC_TABLEGEN_TARGET llvm-dialects-tblgen)
 set(LLVM_TARGET_DEFINITIONS interface/lgc/LgcDialect.td)
 
@@ -190,6 +190,7 @@ target_sources(LLVMlgc PRIVATE
     patch/Gfx6ConfigBuilder.cpp
     patch/Gfx9Chip.cpp
     patch/Gfx9ConfigBuilder.cpp
+    patch/LowerDebugPrintf.cpp
     patch/MeshTaskShader.cpp
     patch/NggPrimShader.cpp
     patch/Patch.cpp
@@ -242,8 +243,11 @@ target_sources(LLVMlgc PRIVATE
     util/GfxRegHandlerBase.cpp
     util/GfxRegHandler.cpp
     util/Internal.cpp
+    util/MbStandardInstrumentations.cpp
+    util/ModuleBunch.cpp
     util/PassManager.cpp
     util/StartStopTimer.cpp
+    util/TypeLowering.cpp
 )
 
 add_subdirectory(disassembler)

@@ -217,13 +217,113 @@ static CompSetting computeCompSetting(BufDataFormat dfmt) {
 } // namespace
 
 // =====================================================================================================================
+// Set the common shader mode for the given shader stage, containing hardware FP round and denorm modes.
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param shaderStage : Shader stage to set modes for
+// @param commonShaderMode : FP round and denorm modes
+void Pipeline::setCommonShaderMode(Module &module, ShaderStage shaderStage, const CommonShaderMode &commonShaderMode) {
+  ShaderModes::setCommonShaderMode(module, shaderStage, commonShaderMode);
+}
+
+// =====================================================================================================================
+// Get the common shader mode for the given shader stage.
+// This reads the mode from IR metadata in the given module.
+//
+// @param module : Module to read from
+// @param shaderStage : Shader stage to get modes for
+CommonShaderMode Pipeline::getCommonShaderMode(Module &module, ShaderStage shaderStage) {
+  return ShaderModes::getCommonShaderMode(module, shaderStage);
+}
+
+// =====================================================================================================================
+// Set the tessellation mode
+// This records the mode into IR metadata in the given module.
+// Both TCS and TES can set tessellation mode, and the two get merged together by the middle end.
+//
+// @param module : Module to record in
+// @param shaderStage : Shader stage to set modes for (TCS or TES)
+// @param tessellationMode : Tessellation mode
+void Pipeline::setTessellationMode(Module &module, ShaderStage shaderStage, const TessellationMode &tessellationMode) {
+  ShaderModes::setTessellationMode(module, shaderStage, tessellationMode);
+}
+
+// =====================================================================================================================
+// Get the tessellation mode for the given shader stage.
+// This reads the mode from IR metadata in the given module.
+TessellationMode Pipeline::getTessellationMode(Module &module, ShaderStage shaderStage) {
+  return ShaderModes::getTessellationMode(module, shaderStage);
+}
+
+// =====================================================================================================================
+// Set the geometry shader mode
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param geometryShaderMode : Geometry shader mode
+void Pipeline::setGeometryShaderMode(Module &module, const GeometryShaderMode &geometryShaderMode) {
+  ShaderModes::setGeometryShaderMode(module, geometryShaderMode);
+}
+
+// =====================================================================================================================
+// Set the mesh shader mode
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param meshShaderMode : Mesh shader mode
+void Pipeline::setMeshShaderMode(Module &module, const MeshShaderMode &meshShaderMode) {
+  ShaderModes::setMeshShaderMode(module, meshShaderMode);
+}
+
+// =====================================================================================================================
+// Set the fragment shader mode
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param fragmentShaderMode : Fragment shader mode
+void Pipeline::setFragmentShaderMode(Module &module, const FragmentShaderMode &fragmentShaderMode) {
+  ShaderModes::setFragmentShaderMode(module, fragmentShaderMode);
+}
+
+// =====================================================================================================================
+// Set the compute shader mode (workgroup size)
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param computeShaderMode : Compute shader mode
+void Pipeline::setComputeShaderMode(Module &module, const ComputeShaderMode &computeShaderMode) {
+  ShaderModes::setComputeShaderMode(module, computeShaderMode);
+}
+
+// =====================================================================================================================
+// Set subgroup size usage.
+// This records the mode into IR metadata in the given module.
+//
+// @param module : Module to record in
+// @param stage : Shader stage
+// @param usage : Subgroup size usage
+void Pipeline::setSubgroupSizeUsage(Module &module, ShaderStage stage, bool usage) {
+  ShaderModes::setSubgroupSizeUsage(module, stage, usage);
+}
+
+// =====================================================================================================================
+// Get the compute shader mode (workgroup size)
+// This reads the mode from IR metadata in the given module.
+//
+// @param module : Module to read from
+ComputeShaderMode Pipeline::getComputeShaderMode(Module &module) {
+  return ShaderModes::getComputeShaderMode(module);
+}
+
+// =====================================================================================================================
 // Constructor
 //
 // @param builderContext : LGC builder context
 // @param emitLgc : Whether the option -emit-lgc is on
 PipelineState::PipelineState(LgcContext *builderContext, bool emitLgc)
-    : Pipeline(builderContext), m_emitLgc(emitLgc), m_meshRowExport(EnableRowExport),
-      m_registerFieldFormat(UseRegisterFieldFormat) {
+    : Pipeline(builderContext), m_emitLgc(emitLgc), m_meshRowExport(EnableRowExport) {
+  m_registerFieldFormat = getTargetInfo().getGfxIpVersion().major >= 11 && UseRegisterFieldFormat;
 }
 
 // =====================================================================================================================
@@ -254,7 +354,7 @@ unsigned PipelineState::getPalAbiVersion() const {
 // Get PalMetadata object, creating an empty one if necessary
 PalMetadata *PipelineState::getPalMetadata() {
   if (!m_palMetadata)
-    m_palMetadata = new PalMetadata(this);
+    m_palMetadata = new PalMetadata(this, m_registerFieldFormat);
   return m_palMetadata;
 }
 
@@ -272,7 +372,7 @@ void PipelineState::clearPalMetadata() {
 // @param isGlueCode : True if the blob was generated for glue code.
 void PipelineState::mergePalMetadataFromBlob(StringRef blob, bool isGlueCode) {
   if (!m_palMetadata)
-    m_palMetadata = new PalMetadata(this, blob);
+    m_palMetadata = new PalMetadata(this, blob, m_registerFieldFormat);
   else
     m_palMetadata->mergeFromBlob(blob, isGlueCode);
 }
@@ -292,6 +392,14 @@ void PipelineState::setOtherPartPipeline(Pipeline &otherPartPipeline, Module *li
   // Record the updated PAL metadata.
   if (linkedModule && m_palMetadata)
     m_palMetadata->record(linkedModule);
+}
+
+// =====================================================================================================================
+// Copy client-defined metadata blob to be stored inside ELF.
+//
+// @param clientMetadata : StringRef representing the client metadata blob
+void PipelineState::setClientMetadata(StringRef clientMetadata) {
+  getPalMetadata()->setClientMetadata(clientMetadata);
 }
 
 // =====================================================================================================================
@@ -317,7 +425,6 @@ void PipelineState::clear(Module *module) {
 //
 // @param [in/out] module : Module to record the IR metadata in
 void PipelineState::record(Module *module) {
-  getShaderModes()->record(module);
   recordOptions(module);
   recordUserDataNodes(module);
   recordDeviceIndex(module);
@@ -326,12 +433,6 @@ void PipelineState::record(Module *module) {
   recordGraphicsState(module);
   if (m_palMetadata)
     m_palMetadata->record(module);
-
-  if (UseRegisterFieldFormat) {
-    const bool isFieldSupported =
-        getTargetInfo().getGfxIpVersion().major >= 11 && (m_pipelineLink == PipelineLink::WholePipeline);
-    UseRegisterFieldFormat.setValue(isFieldSupported);
-  }
 }
 
 // =====================================================================================================================
@@ -348,7 +449,7 @@ void PipelineState::readState(Module *module) {
   readColorExportState(module);
   readGraphicsState(module);
   if (!m_palMetadata)
-    m_palMetadata = new PalMetadata(this, module);
+    m_palMetadata = new PalMetadata(this, module, m_registerFieldFormat);
   setXfbStateMetadata(module);
 }
 
@@ -903,8 +1004,7 @@ PipelineState::findResourceNode(ResourceNodeType nodeType, unsigned descSet, uns
       return {&node, &node};
   }
 
-  if (nodeType == ResourceNodeType::DescriptorFmask &&
-      getOptions().shadowDescriptorTable != ShadowDescriptorTableDisable) {
+  if (nodeType == ResourceNodeType::DescriptorFmask && getOptions().enableFmask) {
 #if defined(__GNUC__) && !defined(__clang__)
     // FIXME Newer gcc versions optimize out this if statement. The reason is either undefined behavior in lgc or a bug
     // in gcc. The following inline assembly prevents the gcc optimization.
@@ -912,8 +1012,7 @@ PipelineState::findResourceNode(ResourceNodeType nodeType, unsigned descSet, uns
     asm volatile("" : "+m,r"(nodeType) : : "memory");
 #endif
 
-    // For fmask with -enable-shadow-descriptor-table, if no fmask descriptor is found, look for a resource
-    // (image) one instead.
+    // If use fmask and no fmask descriptor is found, look for a resource (image) one instead.
     return findResourceNode(ResourceNodeType::DescriptorResource, descSet, binding);
   }
   return {nullptr, nullptr};
@@ -1158,6 +1257,16 @@ void PipelineState::recordGraphicsState(Module *module) {
 void PipelineState::readGraphicsState(Module *module) {
   readNamedMetadataArrayOfInt32(module, IaStateMetadataName, m_inputAssemblyState);
   readNamedMetadataArrayOfInt32(module, RsStateMetadataName, m_rasterizerState);
+
+  auto nameMeta = module->getNamedMetadata(SampleShadingMetaName);
+  if (nameMeta)
+    m_rasterizerState.perSampleShading |= 1;
+}
+
+// =====================================================================================================================
+// Get number of patch control points. The front-end supplies this as TessellationMode::inputVertices.
+unsigned PipelineState::getNumPatchControlPoints() const {
+  return getShaderModes()->getTessellationMode().inputVertices;
 }
 
 // =====================================================================================================================
@@ -1445,7 +1554,6 @@ InterfaceData *PipelineState::getShaderInterfaceData(ShaderStage shaderStage) {
 // @param location : Location
 unsigned PipelineState::computeExportFormat(Type *outputTy, unsigned location) {
   const ColorExportFormat *colorExportFormat = &getColorExportFormat(location);
-  GfxIpVersion gfxIp = getTargetInfo().getGfxIpVersion();
   auto gpuWorkarounds = &getTargetInfo().getGpuWorkarounds();
   unsigned outputMask = outputTy->isVectorTy() ? (1 << cast<FixedVectorType>(outputTy)->getNumElements()) - 1 : 1;
   const auto cbState = &getColorExportState();
@@ -1477,14 +1585,12 @@ unsigned PipelineState::computeExportFormat(Type *outputTy, unsigned location) {
   // Start by assuming EXP_FORMAT_ZERO (no exports)
   ExportFormat expFmt = EXP_FORMAT_ZERO;
 
-  bool gfx8RbPlusEnable = false;
-  if (gfxIp.major == 8 && gfxIp.minor == 1)
-    gfx8RbPlusEnable = true;
+  bool supportRbPlus = getTargetInfo().getGpuProperty().supportsRbPlus;
 
   if (colorExportFormat->dfmt == BufDataFormatInvalid)
     expFmt = EXP_FORMAT_ZERO;
   else if (compSetting == CompSetting::OneCompRed && !alphaExport && !isSrgbFormat &&
-           (!gfx8RbPlusEnable || maxCompBitCount == 32)) {
+           (!supportRbPlus || maxCompBitCount == 32)) {
     // NOTE: When Rb+ is enabled, "R8 UNORM" and "R16 UNORM" shouldn't use "EXP_FORMAT_32_R", instead
     // "EXP_FORMAT_FP16_ABGR" and "EXP_FORMAT_UNORM16_ABGR" should be used for 2X exporting performance.
     expFmt = EXP_FORMAT_32_R;

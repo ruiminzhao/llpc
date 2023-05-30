@@ -68,8 +68,6 @@ Context::Context(GfxIpVersion gfxIp) : LLVMContext(), m_gfxIp(gfxIp) {
   m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(*this);
 
   reset();
-  // TODO: Remove this once work complete on transition to opaque pointers.
-  setOpaquePointers(true);
 }
 
 // =====================================================================================================================
@@ -87,28 +85,35 @@ void Context::reset() {
 // Get (create if necessary) LgcContext
 LgcContext *Context::getLgcContext() {
   // Create the LgcContext on first execution or optimization level change.
-  if (!m_builderContext || m_builderContext->getInitialOptimizationLevel() != getOptimizationLevel()) {
+  if (!m_builderContext || getLastOptimizationLevel() != getOptimizationLevel()) {
     std::string gpuName = LgcContext::getGpuNameString(m_gfxIp.major, m_gfxIp.minor, m_gfxIp.stepping);
-    m_builderContext.reset(
-        LgcContext::create(*this, gpuName, PAL_CLIENT_INTERFACE_MAJOR_VERSION, getOptimizationLevel()));
-    if (!m_builderContext)
+    m_targetMachine = LgcContext::createTargetMachine(gpuName, getOptimizationLevel());
+    if (!m_targetMachine)
       report_fatal_error(Twine("Unknown target '") + Twine(gpuName) + Twine("'"));
+    m_builderContext.reset(LgcContext::create(&*m_targetMachine, *this, PAL_CLIENT_INTERFACE_MAJOR_VERSION));
   }
   return &*m_builderContext;
 }
 
 // =====================================================================================================================
+// Get optimization level. Also resets what getLastOptimizationLevel() returns.
+//
 // @returns: the optimization level for the context.
-CodeGenOpt::Level Context::getOptimizationLevel() const {
+CodeGenOpt::Level Context::getOptimizationLevel() {
   uint32_t optLevel = CodeGenOpt::Level::Default;
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   optLevel = getPipelineContext()->getPipelineOptions()->optimizationLevel;
   if (optLevel > 3)
     optLevel = 3;
   else if (optLevel == 0) // Workaround for noopt bugs in the AMDGPU backend in LLVM.
     optLevel = 1;
-#endif
-  return static_cast<CodeGenOpt::Level>(optLevel);
+  m_lastOptLevel = CodeGenOpt::Level(optLevel);
+  return *m_lastOptLevel;
+}
+
+// =====================================================================================================================
+// Get the optimization level returned by the last getOptimizationLevel().
+CodeGenOpt::Level Context::getLastOptimizationLevel() const {
+  return *m_lastOptLevel;
 }
 
 // =====================================================================================================================

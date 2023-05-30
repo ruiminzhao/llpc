@@ -82,6 +82,13 @@ ShaderModuleUsage ShaderModuleHelper::getShaderModuleUsageInfo(const BinaryData 
       capabilities.insert(capability);
       break;
     }
+    case OpExtInst: {
+      auto extInst = static_cast<GLSLstd450>(codePos[4]);
+      if (extInst == GLSLstd450InterpolateAtSample) {
+        shaderModuleUsage.useSampleInfo = true;
+      }
+      break;
+    }
     case OpExtension: {
       StringRef extName = reinterpret_cast<const char *>(&codePos[1]);
       if (extName == "SPV_AMD_shader_ballot") {
@@ -98,8 +105,23 @@ ShaderModuleUsage ShaderModuleHelper::getShaderModuleUsageInfo(const BinaryData 
       }
       if (decoration == DecorationBuiltIn) {
         auto builtIn = (opCode == OpDecorate) ? static_cast<BuiltIn>(codePos[3]) : static_cast<BuiltIn>(codePos[4]);
-        if (builtIn == BuiltInPointSize) {
+        switch (builtIn) {
+        case BuiltInPointSize: {
           shaderModuleUsage.usePointSize = true;
+          break;
+        }
+        case BuiltInPrimitiveShadingRateKHR:
+        case BuiltInShadingRateKHR: {
+          shaderModuleUsage.useShadingRate = true;
+          break;
+        }
+        case BuiltInSamplePosition: {
+          shaderModuleUsage.useSampleInfo = true;
+          break;
+        }
+        default: {
+          break;
+        }
         }
       }
       break;
@@ -190,7 +212,6 @@ unsigned ShaderModuleHelper::trimSpirvDebugInfo(const BinaryData *spvBin, llvm::
     unsigned opCode = (codePos[0] & OpCodeMask);
     unsigned wordCount = (codePos[0] >> WordCountShift);
     switch (opCode) {
-    case OpString:
     case OpSource:
     case OpSourceContinued:
     case OpSourceExtension:
@@ -406,12 +427,7 @@ Result ShaderModuleHelper::getModuleData(const ShaderModuleBuildInfo *shaderInfo
     moduleData.usage = ShaderModuleHelper::getShaderModuleUsageInfo(&shaderBinary);
     moduleData.binCode = getShaderCode(shaderInfo, codeBuffer);
 #if VKI_RAY_TRACING
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 55
-    moduleData.usage.isInternalRtShader =
-        shaderInfo->options.isInternalRtShader || shaderInfo->options.pipelineOptions.internalRtShaders;
-#else
     moduleData.usage.isInternalRtShader = shaderInfo->options.pipelineOptions.internalRtShaders;
-#endif
 #endif
     // Calculate SPIR-V cache hash
     Hash cacheHash = {};
@@ -440,12 +456,7 @@ BinaryData ShaderModuleHelper::getShaderCode(const ShaderModuleBuildInfo *shader
   const BinaryData &shaderBinary = shaderInfo->shaderBin;
   bool trimDebugInfo = cl::TrimDebugInfo;
 #if VKI_RAY_TRACING
-  trimDebugInfo = trimDebugInfo &&
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 55
-                  !(shaderInfo->options.pipelineOptions.internalRtShaders || shaderInfo->options.isInternalRtShader);
-#else
-                  !(shaderInfo->options.pipelineOptions.internalRtShaders);
-#endif
+  trimDebugInfo = trimDebugInfo && !(shaderInfo->options.pipelineOptions.internalRtShaders);
 #endif
   if (trimDebugInfo) {
     code.codeSize = trimSpirvDebugInfo(&shaderBinary, codeBuffer);
@@ -465,12 +476,7 @@ unsigned ShaderModuleHelper::getCodeSize(const ShaderModuleBuildInfo *shaderInfo
   const BinaryData &shaderBinary = shaderInfo->shaderBin;
   bool trimDebugInfo = cl::TrimDebugInfo;
 #if VKI_RAY_TRACING
-  trimDebugInfo = trimDebugInfo &&
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 55
-                  !(shaderInfo->options.pipelineOptions.internalRtShaders || shaderInfo->options.isInternalRtShader);
-#else
-                  !(shaderInfo->options.pipelineOptions.internalRtShaders);
-#endif
+  trimDebugInfo = trimDebugInfo && !(shaderInfo->options.pipelineOptions.internalRtShaders);
 #endif
   if (!trimDebugInfo)
     return shaderBinary.codeSize;

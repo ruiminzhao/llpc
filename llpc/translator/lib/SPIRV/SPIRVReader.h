@@ -66,6 +66,11 @@ namespace SPIRV {
 class SPIRVLoopMerge;
 class SPIRVToLLVMDbgTran;
 
+enum class LayoutMode : uint8_t {
+  Native = 0,   ///< Using native LLVM layout rule
+  Explicit = 1, ///< Using layout decorations(like offset) from SPIRV
+};
+
 class SPIRVToLLVM {
 public:
   SPIRVToLLVM(Module *llvmModule, SPIRVModule *theSpirvModule, const SPIRVSpecConstMap &theSpecConstMap,
@@ -77,10 +82,10 @@ public:
   void updateDebugLoc(SPIRVValue *bv, Function *f);
 
   Type *transType(SPIRVType *bt, unsigned matrixStride = 0, bool columnMajor = true, bool parentIsPointer = false,
-                  bool explicitlyLaidOut = false);
+                  LayoutMode layout = LayoutMode::Native);
   template <spv::Op>
   Type *transTypeWithOpcode(SPIRVType *bt, unsigned matrixStride, bool columnMajor, bool parentIsPointer,
-                            bool explicitlyLaidOut);
+                            LayoutMode layout);
   std::vector<Type *> transTypeVector(const std::vector<SPIRVType *> &);
   bool translate(ExecutionModel entryExecModel, const char *entryName);
   bool transAddressingModel();
@@ -118,6 +123,8 @@ public:
   Instruction *transBuiltinFromInst(const std::string &funcName, SPIRVInstruction *bi, BasicBlock *bb);
   Instruction *transSPIRVBuiltinFromInst(SPIRVInstruction *bi, BasicBlock *bb);
   Instruction *transBarrierFence(SPIRVInstruction *bi, BasicBlock *bb);
+  Value *transString(const SPIRVString *spvValue);
+  Value *transDebugPrintf(SPIRVInstruction *bi, const ArrayRef<SPIRVValue *> spvValues, Function *func, BasicBlock *bb);
 
   // Struct used to pass information in and out of getImageDesc.
   struct ExtractedImageInfo {
@@ -134,6 +141,10 @@ public:
   // Load image and/or sampler descriptors, and get information from the image
   // type.
   void getImageDesc(SPIRVValue *bImageInst, ExtractedImageInfo *info);
+
+  // Get number of channels based on the image format.
+  // Returns 0 if number of channels is unknown.
+  unsigned getImageNumChannels(const SPIRVTypeImageDescriptor *descriptor);
 
   // Set up address operand array for image sample/gather builder call.
   void setupImageAddressOperands(SPIRVInstruction *bi, unsigned maskIdx, bool hasProj, MutableArrayRef<Value *> addr,
@@ -187,6 +198,7 @@ public:
 
   // Post-process translated LLVM module to undo row major matrices.
   bool postProcessRowMajorMatrix();
+  Value *getTranslatedValue(SPIRVValue *bv);
 
 private:
   class SPIRVTypeContext {
@@ -195,12 +207,11 @@ private:
     uint8_t m_predicates;
 
   public:
-    SPIRVTypeContext(SPIRVType *type, uint32_t matrixStride, bool columnMajor, bool isParentPointer,
-                     bool isExplicitlyLaidOut)
+    SPIRVTypeContext(SPIRVType *type, uint32_t matrixStride, bool columnMajor, bool isParentPointer, LayoutMode layout)
         : m_typeId(type->getId()), m_matrixStride(matrixStride), m_predicates(0) {
       m_predicates |= uint8_t(columnMajor);
       m_predicates |= uint8_t(isParentPointer << 1);
-      m_predicates |= uint8_t(isExplicitlyLaidOut << 2);
+      m_predicates |= uint8_t((uint8_t)layout << 2);
     }
 
     // Tuple representation to make it easily hashable.
@@ -216,15 +227,12 @@ private:
   typedef DenseMap<GlobalVariable *, SPIRVBuiltinVariableKind> BuiltinVarMap;
   typedef DenseMap<SPIRVType *, SmallVector<unsigned, 8>> RemappedTypeElementsMap;
   typedef DenseMap<SPIRVValue *, Type *> SPIRVAccessChainValueToLLVMRetTypeMap;
+  typedef DenseMap<const SPIRVEntry *, Value *> SPIRVToLLVMEntryMap;
 
   // A SPIRV value may be translated to a load instruction of a placeholder
   // global variable. This map records load instruction of these placeholders
   // which are supposed to be replaced by the real values later.
   typedef std::map<SPIRVValue *, LoadInst *> SPIRVToLLVMPlaceholderMap;
-
-  // TODO: Workaround to handle opaque pointers for OpTypeForwardPointer.
-  // This will be removed after opaque pointer transition is complete.
-  typedef DenseMap<SPIRVType *, Type *> SPIRVOpForwardPointerWorkaround;
 
   Module *m_m;
   BuiltinVarMap m_builtinGvMap;
@@ -239,6 +247,7 @@ private:
   SPIRVToLLVMTypeMap m_typeMap;
   SPIRVToLLVMFullTypeMap m_fullTypeMap;
   SPIRVToLLVMValueMap m_valueMap;
+  SPIRVToLLVMEntryMap m_entryMap;
   SPIRVToLLVMFunctionMap m_funcMap;
   SPIRVBlockToLLVMStructMap m_blockMap;
   SPIRVToLLVMPlaceholderMap m_placeholderMap;
@@ -254,14 +263,13 @@ private:
   DenseMap<std::pair<SPIRVType *, unsigned>, Type *> m_overlappingStructTypeWorkaroundMap;
   DenseMap<std::pair<BasicBlock *, BasicBlock *>, unsigned> m_blockPredecessorToCount;
   const Vkgc::ShaderModuleUsage *m_moduleUsage;
+  GlobalVariable *m_debugOutputBuffer;
+
   const Vkgc::PipelineShaderOptions *m_shaderOptions;
+  bool m_workaroundStorageImageFormats;
   unsigned m_spirvOpMetaKindId;
   unsigned m_execModule;
   bool m_scratchBoundsChecksEnabled;
-
-  // TODO: Workaround to handle opaque pointers for OpTypeForwardPointer.
-  // This will be removed after opaque pointer transition is complete.
-  SPIRVOpForwardPointerWorkaround m_forwardPointerWorkaroundMap;
 
   enum class LlvmMemOpType : uint8_t { IS_LOAD, IS_STORE };
   struct ScratchBoundsCheckData {
@@ -280,8 +288,7 @@ private:
   lgc::Builder *getBuilder() const { return m_builder; }
 
   // Perform type translation for uncached types. Used in `transType`. Returns the new LLVM type.
-  Type *transTypeImpl(SPIRVType *bt, unsigned matrixStride, bool columnMajor, bool parentIsPointer,
-                      bool explicitlyLaidOut);
+  Type *transTypeImpl(SPIRVType *bt, unsigned matrixStride, bool columnMajor, bool parentIsPointer, LayoutMode layout);
 
   Type *mapType(SPIRVType *bt, Type *t) {
     m_typeMap[bt] = t;
@@ -332,6 +339,8 @@ private:
   // which must be a load instruction of a global variable whose name starts
   // with kPlaceholderPrefix.
   Value *mapValue(SPIRVValue *bv, Value *v);
+  // Keep track of the spirvEntry
+  Value *mapEntry(const SPIRVEntry *be, Value *v);
 
   // Used to keep track of the number of incoming edges to a block from each
   // of the predecessor.
@@ -353,8 +362,6 @@ private:
     m_funcMap[bf] = f;
     return f;
   }
-
-  Value *getTranslatedValue(SPIRVValue *bv);
 
   SPIRVErrorLog &getErrorLog() { return m_bm->getErrorLog(); }
 

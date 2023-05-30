@@ -54,7 +54,7 @@ using namespace llvm;
 // @param descIndex : Descriptor index
 // @param flags : BufferFlag* bit settings
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Value *descIndex, unsigned flags,
+Value *BuilderImpl::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Value *descIndex, unsigned flags,
                                          const Twine &instName) {
   Value *desc = nullptr;
   bool return64Address = false;
@@ -93,7 +93,7 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
           m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, descSet, binding);
       if (!node) {
         // We did not find the resource node. Return an poison value.
-        return PoisonValue::get(getBufferDescTy(pointeeTy));
+        return PoisonValue::get(getBufferDescTy());
       }
     }
     assert(node && "missing resource node");
@@ -215,7 +215,7 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+Value *BuilderImpl::CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
                                         unsigned binding, const Twine &instName) {
   // Find the descriptor node. If doing a shader compilation with no user data layout provided, don't bother to
   // look; we will use relocs instead.
@@ -250,7 +250,7 @@ Value *DescBuilder::CreateGetDescStride(ResourceNodeType concreteType, ResourceN
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+Value *BuilderImpl::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
                                      unsigned binding, const Twine &instName) {
   // Find the descriptor node. If doing a shader compilation with no user data layout provided, don't bother to
   // look; we will use relocs instead.
@@ -315,7 +315,7 @@ Value *DescBuilder::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNode
 //
 // @param returnTy : Return type of the load
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &instName) {
+Value *BuilderImpl::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &instName) {
   const bool isIndirect = getPipelineState()->getOptions().resourceLayoutScheme == ResourceLayoutScheme::Indirect;
   if (isIndirect) {
     // Push const is the sub node of DescriptorTableVaPtr.
@@ -356,7 +356,7 @@ Value *DescBuilder::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &inst
 // @param binding : Descriptor binding
 // @param node : The descriptor node (nullptr for shader compilation)
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::getStride(ResourceNodeType descType, unsigned descSet, unsigned binding, const ResourceNode *node) {
+Value *BuilderImpl::getStride(ResourceNodeType descType, unsigned descSet, unsigned binding, const ResourceNode *node) {
   if (node && node->immutableSize != 0 && descType == ResourceNodeType::DescriptorSampler) {
     // This is an immutable sampler. Because we put the immutable value into a static variable, the stride is
     // always the size of the descriptor.
@@ -404,7 +404,7 @@ static StringRef GetRelocTypeSuffix(ResourceNodeType type) {
 // @param binding : Binding
 // @param topNode : Node in top-level descriptor table (nullptr for shader compilation)
 // @param node : The descriptor node itself (nullptr for shader compilation)
-Value *DescBuilder::getDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+Value *BuilderImpl::getDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
                                unsigned binding, const ResourceNode *topNode, const ResourceNode *node) {
   Value *descPtr = nullptr;
 
@@ -424,10 +424,10 @@ Value *DescBuilder::getDescPtr(ResourceNodeType concreteType, ResourceNodeType a
     // - descriptor binding number
     // - value for high 32 bits of the pointer; HighAddrPc to use PC
     if (node || topNode || concreteType != ResourceNodeType::DescriptorFmask) {
-      unsigned shadowDescriptorTable = m_pipelineState->getOptions().shadowDescriptorTable;
-      bool shadow =
-          concreteType == ResourceNodeType::DescriptorFmask && shadowDescriptorTable != ShadowDescriptorTableDisable;
-      Value *highHalf = getInt32(shadow ? shadowDescriptorTable : HighAddrPc);
+      unsigned highAddrOfFmask = m_pipelineState->getOptions().highAddrOfFmask;
+      bool isFmask = concreteType == ResourceNodeType::DescriptorFmask;
+      assert(!(isFmask && highAddrOfFmask == ShadowDescriptorTableDisable) && "not implemented");
+      Value *highHalf = getInt32(isFmask ? highAddrOfFmask : HighAddrPc);
       return CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
                              {getInt32(unsigned(concreteType)), getInt32(unsigned(abstractType)), getInt32(descSet),
                               getInt32(binding), highHalf},
@@ -529,7 +529,7 @@ Value *DescBuilder::getDescPtr(ResourceNodeType concreteType, ResourceNodeType a
 //
 // @param value : 32-bit integer value to scalarize
 // @param isNonUniform : Whether value is marked as non-uniform
-Value *DescBuilder::scalarizeIfUniform(Value *value, bool isNonUniform) {
+Value *BuilderImpl::scalarizeIfUniform(Value *value, bool isNonUniform) {
   assert(value->getType()->isIntegerTy(32));
   if (!isNonUniform && !isa<Constant>(value)) {
     // NOTE: GFX6 encounters GPU hang with this optimization enabled. So we should skip it.
@@ -543,7 +543,7 @@ Value *DescBuilder::scalarizeIfUniform(Value *value, bool isNonUniform) {
 // Calculate a buffer descriptor for an inline buffer
 //
 // @param descPtr : Pointer to inline buffer
-Value *DescBuilder::buildInlineBufferDesc(Value *descPtr) {
+Value *BuilderImpl::buildInlineBufferDesc(Value *descPtr) {
   // Bitcast the pointer to v2i32
   descPtr = CreatePtrToInt(descPtr, getInt64Ty());
   descPtr = CreateBitCast(descPtr, FixedVectorType::get(getInt32Ty(), 2));
@@ -555,7 +555,7 @@ Value *DescBuilder::buildInlineBufferDesc(Value *descPtr) {
 // Build buffer compact descriptor
 //
 // @param desc : The buffer descriptor base to build for the buffer compact descriptor
-Value *DescBuilder::buildBufferCompactDesc(Value *desc) {
+Value *BuilderImpl::buildBufferCompactDesc(Value *desc) {
   const GfxIpVersion gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
 
   // Extract compact buffer descriptor
@@ -593,7 +593,7 @@ Value *DescBuilder::buildBufferCompactDesc(Value *desc) {
     sqBufRsrcWord3.gfx10.resourceLevel = 1;
     sqBufRsrcWord3.gfx10.oobSelect = 2;
     assert(sqBufRsrcWord3.u32All == 0x21014FAC);
-  } else if (gfxIp.major == 11) {
+  } else if (gfxIp.major >= 11) {
     sqBufRsrcWord3.gfx11.format = BUF_FORMAT_32_UINT;
     sqBufRsrcWord3.gfx11.oobSelect = 2;
     assert(sqBufRsrcWord3.u32All == 0x20014FAC);

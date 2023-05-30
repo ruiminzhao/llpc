@@ -62,9 +62,6 @@ std::ostream &operator<<(std::ostream &out, VkRayTracingShaderGroupTypeKHR type)
 #endif
 std::ostream &operator<<(std::ostream &out, ResourceMappingNodeType type);
 std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-std::ostream &operator<<(std::ostream &out, NggCompactMode compactMode);
-#endif
 std::ostream &operator<<(std::ostream &out, DenormalMode denormalMode);
 std::ostream &operator<<(std::ostream &out, WaveBreakSize waveBreakSize);
 std::ostream &operator<<(std::ostream &out, ShadowDescriptorTableUsage shadowDescriptorTableUsage);
@@ -187,6 +184,22 @@ void VKAPI_CALL IPipelineDumper::DumpPipelineExtraInfo(void *dumpFile, const cha
 uint64_t VKAPI_CALL IPipelineDumper::GetShaderHash(const void *moduleData) {
   const ShaderModuleData *shaderModuleData = reinterpret_cast<const ShaderModuleData *>(moduleData);
   return MetroHash::compact64(reinterpret_cast<const MetroHash::Hash *>(&shaderModuleData->hash));
+}
+
+// =====================================================================================================================
+// Calculates graphics shader binary hash code.
+//
+// @param pipelineInfo : Info to build this partial graphics pipeline
+// @param stage : The shader stage for which the code is calculated
+uint64_t VKAPI_CALL IPipelineDumper::GetGraphicsShaderBinaryHash(const GraphicsPipelineBuildInfo *pipelineInfo,
+                                                                 ShaderStage stage) {
+  UnlinkedShaderStage unlinkedStage;
+  if (stage < ShaderStageFragment)
+    unlinkedStage = UnlinkedStageVertexProcess;
+  else
+    unlinkedStage = UnlinkedStageFragment;
+  auto hash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false, false, unlinkedStage);
+  return MetroHash::compact64(&hash);
 }
 
 // =====================================================================================================================
@@ -512,13 +525,18 @@ void PipelineDumper::dumpResourceMappingNode(const ResourceMappingNode *userData
   case ResourceMappingNodeType::DescriptorConstBuffer:
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
-  case ResourceMappingNodeType::DescriptorConstTexelBuffer: {
+  case ResourceMappingNodeType::DescriptorConstTexelBuffer:
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 61
   case ResourceMappingNodeType::DescriptorMutable:
+#endif
+  {
     char setHexvalue[64] = {};
     snprintf(setHexvalue, 64, "0x%08" PRIX32, userDataNode->srdRange.set);
     dumpFile << prefix << ".set = " << setHexvalue << "\n";
     dumpFile << prefix << ".binding = " << userDataNode->srdRange.binding << "\n";
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 61
     dumpFile << prefix << ".strideInDwords = " << userDataNode->srdRange.strideInDwords << "\n";
+#endif
     break;
   }
   case ResourceMappingNodeType::DescriptorTableVaPtr: {
@@ -586,6 +604,7 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   }
 
   // Output pipeline shader options
+  // clang-format off
   dumpFile << "options.trapPresent = " << shaderInfo->options.trapPresent << "\n";
   dumpFile << "options.debugMode = " << shaderInfo->options.debugMode << "\n";
   dumpFile << "options.enablePerformanceData = " << shaderInfo->options.enablePerformanceData << "\n";
@@ -623,7 +642,11 @@ void PipelineDumper::dumpPipelineShaderInfo(const PipelineShaderInfo *shaderInfo
   dumpFile << "options.overrideShaderThreadGroupSizeZ = " << shaderInfo->options.overrideShaderThreadGroupSizeZ << "\n";
   dumpFile << "options.nsaThreshold = " << shaderInfo->options.nsaThreshold << "\n";
   dumpFile << "options.aggressiveInvariantLoads = " << shaderInfo->options.aggressiveInvariantLoads << "\n";
+  dumpFile << "options.workaroundStorageImageFormats = " << shaderInfo->options.workaroundStorageImageFormats << "\n";
+  dumpFile << "options.workaroundInitializeOutputsToZero = " << shaderInfo->options.workaroundInitializeOutputsToZero << "\n";
+  dumpFile << "options.disableFMA = " << shaderInfo->options.disableFMA << "\n";
   dumpFile << "\n";
+  // clang-format on
 }
 
 // =====================================================================================================================
@@ -802,11 +825,10 @@ void PipelineDumper::dumpPipelineOptions(const PipelineOptions *options, std::os
   dumpFile << "options.optimizeTessFactor = " << options->optimizeTessFactor << "\n";
 #endif
 
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   dumpFile << "options.optimizationLevel = " << options->optimizationLevel << "\n";
-#endif
   dumpFile << "options.threadGroupSwizzleMode = " << options->threadGroupSwizzleMode << "\n";
   dumpFile << "options.reverseThreadGroup = " << options->reverseThreadGroup << "\n";
+  dumpFile << "options.enableImplicitInvariantExports = " << options->enableImplicitInvariantExports << "\n";
 
 #if VKI_RAY_TRACING
   dumpFile << "options.internalRtShaders = " << options->internalRtShaders << "\n";
@@ -864,6 +886,7 @@ void PipelineDumper::dumpGraphicsStateInfo(const GraphicsPipelineBuildInfo *pipe
   dumpFile << "usrClipPlaneMask = " << static_cast<unsigned>(pipelineInfo->rsState.usrClipPlaneMask) << "\n";
   dumpFile << "alphaToCoverageEnable = " << pipelineInfo->cbState.alphaToCoverageEnable << "\n";
   dumpFile << "dualSourceBlendEnable = " << pipelineInfo->cbState.dualSourceBlendEnable << "\n";
+  dumpFile << "dualSourceBlendDynamic = " << pipelineInfo->cbState.dualSourceBlendDynamic << "\n";
 
   for (unsigned i = 0; i < MaxColorTargets; ++i) {
     if (pipelineInfo->cbState.target[i].format != VK_FORMAT_UNDEFINED) {
@@ -879,14 +902,7 @@ void PipelineDumper::dumpGraphicsStateInfo(const GraphicsPipelineBuildInfo *pipe
   dumpFile << "nggState.enableNgg = " << pipelineInfo->nggState.enableNgg << "\n";
   dumpFile << "nggState.enableGsUse = " << pipelineInfo->nggState.enableGsUse << "\n";
   dumpFile << "nggState.forceCullingMode = " << pipelineInfo->nggState.forceCullingMode << "\n";
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-  dumpFile << "nggState.compactMode = " << pipelineInfo->nggState.compactMode << "\n";
-#else
   dumpFile << "nggState.compactVertex = " << pipelineInfo->nggState.compactVertex << "\n";
-#endif
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 59
-  dumpFile << "nggState.enableVertexReuse = " << pipelineInfo->nggState.enableVertexReuse << "\n";
-#endif
   dumpFile << "nggState.enableBackfaceCulling = " << pipelineInfo->nggState.enableBackfaceCulling << "\n";
   dumpFile << "nggState.enableFrustumCulling = " << pipelineInfo->nggState.enableFrustumCulling << "\n";
   dumpFile << "nggState.enableBoxFilterCulling = " << pipelineInfo->nggState.enableBoxFilterCulling << "\n";
@@ -1109,9 +1125,7 @@ void PipelineDumper::dumpRayTracingRtState(const RtState *rtState, std::ostream 
              << "\n";
   dumpStream << "rtState.enableOptimalLdsStackSizeForUnified = " << rtState->enableOptimalLdsStackSizeForUnified
              << "\n";
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
   dumpStream << "rtState.maxRayLength = " << rtState->maxRayLength << "\n";
-#endif
 
   for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
     dumpStream << "rtState.gpurtFuncTable.pFunc[" << i << "] = " << rtState->gpurtFuncTable.pFunc[i] << "\n";
@@ -1185,9 +1199,7 @@ void PipelineDumper::updateHashForRtState(const RtState *rtState, MetroHash64 *h
 #endif
   hasher->Update(rtState->enableOptimalLdsStackSizeForIndirect);
   hasher->Update(rtState->enableOptimalLdsStackSizeForUnified);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
   hasher->Update(rtState->maxRayLength);
-#endif
 
   for (unsigned i = 0; i < RT_ENTRY_FUNC_COUNT; ++i) {
     size_t funcNameLen = 0;
@@ -1446,14 +1458,7 @@ void PipelineDumper::updateHashForNonFragmentState(const GraphicsPipelineBuildIn
     if (nggState->enableNgg) {
       hasher->Update(nggState->enableGsUse);
       hasher->Update(nggState->forceCullingMode);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-      hasher->Update(nggState->compactMode);
-#else
       hasher->Update(nggState->compactVertex);
-#endif
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 59
-      hasher->Update(nggState->enableVertexReuse);
-#endif
       hasher->Update(nggState->enableBackfaceCulling);
       hasher->Update(nggState->enableFrustumCulling);
       hasher->Update(nggState->enableBoxFilterCulling);
@@ -1495,13 +1500,12 @@ void PipelineDumper::updateHashForFragmentState(const GraphicsPipelineBuildInfo 
     auto cbState = &pipeline->cbState;
     hasher->Update(cbState->alphaToCoverageEnable);
     hasher->Update(cbState->dualSourceBlendEnable);
+    hasher->Update(cbState->dualSourceBlendDynamic);
     for (unsigned i = 0; i < MaxColorTargets; ++i) {
-      if (cbState->target[i].format != VK_FORMAT_UNDEFINED) {
-        hasher->Update(cbState->target[i].channelWriteMask);
-        hasher->Update(cbState->target[i].blendEnable);
-        hasher->Update(cbState->target[i].blendSrcAlphaToColor);
-        hasher->Update(cbState->target[i].format);
-      }
+      hasher->Update(cbState->target[i].channelWriteMask);
+      hasher->Update(cbState->target[i].blendEnable);
+      hasher->Update(cbState->target[i].blendSrcAlphaToColor);
+      hasher->Update(cbState->target[i].format);
     }
   }
 }
@@ -1533,6 +1537,7 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
   hasher->Update(options->enableRelocatableShaderElf);
   hasher->Update(options->disableImageResourceCheck);
   hasher->Update(options->enableScratchAccessBoundsChecks);
+  hasher->Update(options->enableImplicitInvariantExports);
   hasher->Update(options->resourceLayoutScheme);
 
   if (!isRelocatableShader) {
@@ -1554,9 +1559,7 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
   }
 
   hasher->Update(options->pageMigrationEnabled);
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   hasher->Update(options->optimizationLevel);
-#endif
   hasher->Update(options->threadGroupSwizzleMode);
   hasher->Update(options->reverseThreadGroup);
 
@@ -1645,6 +1648,9 @@ void PipelineDumper::updateHashForPipelineShaderInfo(ShaderStage stage, const Pi
       hasher->Update(options.overrideShaderThreadGroupSizeZ);
       hasher->Update(options.nsaThreshold);
       hasher->Update(options.aggressiveInvariantLoads);
+      hasher->Update(options.workaroundStorageImageFormats);
+      hasher->Update(options.workaroundInitializeOutputsToZero);
+      hasher->Update(options.disableFMA);
     }
   }
 }
@@ -1729,7 +1735,10 @@ void PipelineDumper::updateHashForResourceMappingNode(const ResourceMappingNode 
   case ResourceMappingNodeType::DescriptorConstBufferCompact:
   case ResourceMappingNodeType::DescriptorImage:
   case ResourceMappingNodeType::DescriptorConstTexelBuffer:
-  case ResourceMappingNodeType::DescriptorMutable: {
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 61
+  case ResourceMappingNodeType::DescriptorMutable:
+#endif
+  {
     hasher->Update(userDataNode->srdRange);
     break;
   }
@@ -2158,27 +2167,6 @@ std::ostream &operator<<(std::ostream &out, NggSubgroupSizingType subgroupSizing
 
   return out << string;
 }
-
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-// =====================================================================================================================
-// Translates enum "NggCompactMode" to string and output to ostream.
-//
-// @param [out] out : Output stream
-// @param compactMode : NGG compaction mode
-std::ostream &operator<<(std::ostream &out, NggCompactMode compactMode) {
-  const char *string = nullptr;
-  switch (compactMode) {
-    CASE_ENUM_TO_STRING(NggCompactDisable)
-    CASE_ENUM_TO_STRING(NggCompactVertices)
-    break;
-  default:
-    llvm_unreachable("Should never be called!");
-    break;
-  }
-
-  return out << string;
-}
-#endif
 
 // =====================================================================================================================
 // Translates enum "DenormalMode" to string and output to ostream.

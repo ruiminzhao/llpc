@@ -63,6 +63,7 @@ class SPIRVTypeFunction;
 class SPIRVTypeInt;
 class SPIRVTypePointer;
 class SPIRVTypeImage;
+class SPIRVTypeRuntimeArray;
 class SPIRVTypeSampler;
 class SPIRVTypeSampledImage;
 class SPIRVTypeStruct;
@@ -76,6 +77,7 @@ class SPIRVGroupDecorate;
 class SPIRVGroupMemberDecorate;
 class SPIRVGroupDecorateGeneric;
 class SPIRVInstTemplateBase;
+class SPIRVString;
 
 typedef SPIRVBasicBlock SPIRVLabel;
 struct SPIRVTypeImageDescriptor;
@@ -160,12 +162,12 @@ public:
   }
   virtual SPIRVEntry *addEntry(SPIRVEntry *) = 0;
   virtual SPIRVBasicBlock *addBasicBlock(SPIRVFunction *, SPIRVId Id = SPIRVID_INVALID) = 0;
+  virtual const std::vector<SPIRVString *> &getStringVec() const = 0;
   virtual SPIRVString *getString(const std::string &Str) = 0;
   virtual SPIRVMemberName *addMemberName(SPIRVTypeStruct *ST, SPIRVWord MemberNumber, const std::string &Name) = 0;
   virtual void addUnknownStructField(SPIRVTypeStruct *, unsigned Idx, SPIRVId Id) = 0;
-  virtual void addLine(SPIRVEntry *E, SPIRVId FileNameId, SPIRVWord Line, SPIRVWord Column) = 0;
-  virtual const std::shared_ptr<const SPIRVLine> &getCurrentLine() const = 0;
-  virtual void setCurrentLine(const std::shared_ptr<const SPIRVLine> &) = 0;
+  virtual const SPIRVLine *getCurrentLine() const = 0;
+  virtual void setCurrentLine(const SPIRVLine *) = 0;
   virtual const SPIRVDecorateGeneric *addDecorate(const SPIRVDecorateGeneric *) = 0;
   virtual SPIRVDecorationGroup *addDecorationGroup() = 0;
   virtual SPIRVDecorationGroup *addDecorationGroup(SPIRVDecorationGroup *Group) = 0;
@@ -184,6 +186,8 @@ public:
 
   // Type creation functions
   virtual SPIRVTypeArray *addArrayType(SPIRVType *, SPIRVConstant *) = 0;
+  virtual SPIRVTypeRuntimeArray *addRuntimeArray(SPIRVType *) = 0;
+  virtual SPIRVTypeStruct *addStructType(const std::vector<SPIRVType *> &vecTypes) = 0;
   virtual SPIRVTypeBool *addBoolType() = 0;
   virtual SPIRVTypeFloat *addFloatType(unsigned) = 0;
   virtual SPIRVTypeFunction *addFunctionType(SPIRVType *, const std::vector<SPIRVType *> &) = 0;

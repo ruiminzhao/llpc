@@ -1174,7 +1174,9 @@ bool parseEnumName(char *enumName, unsigned lineNum, IUFValue *output, std::stri
   result = getEnumValue(enumName, value);
 
   if (!result) {
-    PARSE_ERROR(*errorMsg, lineNum, "unknown enum");
+    char unknownEnumMsg[256];
+    vfxSnprintf(unknownEnumMsg, 256, "Unknown enum value: %s", enumName);
+    PARSE_ERROR(*errorMsg, lineNum, "%s", unknownEnumMsg);
   } else
     output->iVec4[0] = value;
 
@@ -1365,8 +1367,9 @@ bool Document::macroSubstituteLine(char *line, unsigned lineNum, const MacroDefi
         break;
       }
 
-      sprintf(namePos, "%s%s", value, lineRest);
-      lineRest = namePos + nameLen + valueLen;
+      memmove(namePos + valueLen, lineRest, restLen);
+      memcpy(namePos, value, valueLen);
+      lineRest = namePos + valueLen;
       MacroDefinition macros2;
       macros2[iter->first] = iter->second;
       result =

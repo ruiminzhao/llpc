@@ -28,9 +28,9 @@
  * @brief LLPC source file: implementation of lgc::Builder
  ***********************************************************************************************************************
  */
+#include "BuilderRecorder.h"
 #include "lgc/LgcContext.h"
 #include "lgc/builder/BuilderImpl.h"
-#include "lgc/builder/BuilderRecorder.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/ShaderModes.h"
 #include "lgc/state/TargetInfo.h"
@@ -49,134 +49,8 @@ const unsigned DescriptorSizeBufferCompact = 2 * sizeof(unsigned);
 } // anonymous namespace
 
 // =====================================================================================================================
-// Static method to create a BuilderImpl
-//
-// @param context : LGC context
-// @param pipeline : Pipeline object
-Builder *Builder::createBuilderImpl(LgcContext *context, Pipeline *pipeline) {
-  return new BuilderImpl(context, pipeline);
-}
-
-// =====================================================================================================================
-// Static method to create a BuilderRecorder
-//
-// @param context : LGC context
-// @param pipeline : Pipeline object, can be nullptr
-// @param omitOpcodes : Don't add opcode metadata to lgc.create.* function declarations
-Builder *Builder::createBuilderRecorder(LgcContext *context, Pipeline *pipeline, bool omitOpcodes) {
-  return new BuilderRecorder(context, pipeline, omitOpcodes);
-}
-
-// =====================================================================================================================
-//
-// @param builderContext : Builder context
-Builder::Builder(LgcContext *builderContext)
-    : BuilderCommon(builderContext->getContext()), m_builderContext(builderContext) {
-}
-
-// =====================================================================================================================
-// Set the common shader mode for the given shader stage, containing hardware FP round and denorm modes.
-//
-// @param shaderStage : Shader stage to set modes for
-// @param commonShaderMode : FP round and denorm modes
-void Builder::setCommonShaderMode(ShaderStage shaderStage, const CommonShaderMode &commonShaderMode) {
-  getShaderModes()->setCommonShaderMode(shaderStage, commonShaderMode);
-}
-
-// =====================================================================================================================
-// Get the common shader mode for the given shader stage.
-// @param shaderStage : Shader stage to get modes for
-const CommonShaderMode &Builder::getCommonShaderMode(ShaderStage shaderStage) {
-  return getShaderModes()->getCommonShaderMode(shaderStage);
-}
-
-// =====================================================================================================================
-// Set the tessellation mode
-//
-// @param tessellationMode : Tessellation mode
-void Builder::setTessellationMode(const TessellationMode &tessellationMode) {
-  getShaderModes()->setTessellationMode(tessellationMode);
-}
-
-// =====================================================================================================================
-// Set the geometry shader mode
-//
-// @param geometryShaderMode : Geometry shader mode
-void Builder::setGeometryShaderMode(const GeometryShaderMode &geometryShaderMode) {
-  getShaderModes()->setGeometryShaderMode(geometryShaderMode);
-}
-
-// =====================================================================================================================
-// Set the mesh shader mode
-//
-// @param meshShaderMode : Mesh shader mode
-void Builder::setMeshShaderMode(const MeshShaderMode &meshShaderMode) {
-  getShaderModes()->setMeshShaderMode(meshShaderMode);
-}
-
-// =====================================================================================================================
-// Set the fragment shader mode
-//
-// @param fragmentShaderMode : Fragment shader mode
-void Builder::setFragmentShaderMode(const FragmentShaderMode &fragmentShaderMode) {
-  getShaderModes()->setFragmentShaderMode(fragmentShaderMode);
-}
-
-// =====================================================================================================================
-// Set the compute shader mode (workgroup size)
-//
-// @param computeShaderMode : Compute shader mode
-void Builder::setComputeShaderMode(const ComputeShaderMode &computeShaderMode) {
-  getShaderModes()->setComputeShaderMode(computeShaderMode);
-}
-
-// =====================================================================================================================
-// Set subgroup size usage
-//
-// @param stage : Shader stage
-// @param usage : Subgroup size usage
-void Builder::setSubgroupSizeUsage(ShaderStage stage, bool usage) {
-  getShaderModes()->setSubgroupSizeUsage(stage, usage);
-}
-
-// =====================================================================================================================
-// Get the compute shader mode (workgroup size)
-const ComputeShaderMode &Builder::getComputeShaderMode() {
-  return getShaderModes()->getComputeShaderMode();
-}
-
-// =====================================================================================================================
-// Get the type elementTy, turned into a vector of the same vector width as maybeVecTy if the latter
-// is a vector type.
-//
-// @param elementTy : Element type
-// @param maybeVecTy : Possible vector type to get number of elements from
-Type *Builder::getConditionallyVectorizedTy(Type *elementTy, Type *maybeVecTy) {
-  if (auto vecTy = dyn_cast<FixedVectorType>(maybeVecTy))
-    return FixedVectorType::get(elementTy, vecTy->getNumElements());
-  return elementTy;
-}
-
-// =====================================================================================================================
-// Gets new matrix type after doing matrix transposing.
-//
-// @param matrixType : The matrix type to get the transposed type from.
-Type *Builder::getTransposedMatrixTy(Type *const matrixType) const {
-  assert(matrixType->isArrayTy());
-
-  Type *const columnVectorType = matrixType->getArrayElementType();
-  assert(columnVectorType->isVectorTy());
-
-  const unsigned columnCount = matrixType->getArrayNumElements();
-  const unsigned rowCount = cast<FixedVectorType>(columnVectorType)->getNumElements();
-
-  return ArrayType::get(FixedVectorType::get(cast<VectorType>(columnVectorType)->getElementType(), columnCount),
-                        rowCount);
-}
-
-// =====================================================================================================================
 // Get the type of pointer returned by CreateLoadBufferDesc.
-PointerType *Builder::getBufferDescTy() {
+PointerType *BuilderCommon::getBufferDescTy() {
   return PointerType::get(getContext(), ADDR_SPACE_BUFFER_FAT_POINTER);
 }
 
@@ -184,7 +58,7 @@ PointerType *Builder::getBufferDescTy() {
 // Get the type of a descriptor
 //
 // @param descType : Descriptor type, one of the ResourceNodeType values
-VectorType *Builder::getDescTy(ResourceNodeType descType) {
+VectorType *BuilderCommon::getDescTy(ResourceNodeType descType) {
   unsigned byteSize = 0;
   switch (descType) {
   case ResourceNodeType::DescriptorBuffer:
@@ -214,7 +88,7 @@ VectorType *Builder::getDescTy(ResourceNodeType descType) {
 // Get the type of pointer to descriptor.
 //
 // @param descType : Descriptor type, one of the ResourceNodeType values
-Type *Builder::getDescPtrTy(ResourceNodeType descType) {
+Type *BuilderCommon::getDescPtrTy(ResourceNodeType descType) {
   return getDescTy(descType)->getPointerTo(ADDR_SPACE_CONST);
 }
 
@@ -224,6 +98,12 @@ unsigned Builder::getAddrSpaceConst() {
   return ADDR_SPACE_CONST;
 }
 
+// ====================================================================================================================
+// Get address space of local (thread-global) memory.
+unsigned Builder::getAddrSpaceLocal() {
+  return ADDR_SPACE_LOCAL;
+}
+
 // =====================================================================================================================
 // Get the type of a built-in. Where the built-in has a shader-defined array size (ClipDistance,
 // CullDistance, SampleMask), inOutInfo.GetArraySize() is used as the array size.
@@ -231,7 +111,7 @@ unsigned Builder::getAddrSpaceConst() {
 // @param builtIn : Built-in kind
 // @param inOutInfo : Extra input/output info (shader-defined array size)
 // @param context : LLVMContext
-Type *Builder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo, LLVMContext &context) {
+Type *BuilderDefs::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo, LLVMContext &context) {
   enum TypeCode : unsigned {
     a2f32,
     a4f32,
@@ -314,7 +194,7 @@ Type *Builder::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo, LLVMContex
 //
 // @param ty : FP scalar or vector type
 // @param value : APFloat value
-Constant *Builder::getFpConstant(Type *ty, APFloat value) {
+Constant *BuilderCommon::getFpConstant(Type *ty, APFloat value) {
   const fltSemantics *semantics = &APFloat::IEEEdouble();
   Type *scalarTy = ty->getScalarType();
   if (scalarTy->isHalfTy())
@@ -436,22 +316,20 @@ CallInst *Builder::CreateIntrinsic(Intrinsic::ID id, ArrayRef<Type *> types, Arr
   return result;
 }
 
-#if VKI_RAY_TRACING
 // =====================================================================================================================
-// Create a ray intersect result with specified node in BVH buffer.
-// nodePtr is the combination of BVH node offset type.
+// Create a call to the specified intrinsic with the specified return type and operands, mangled based on the operand
+// types. This is an override of the same method in IRBuilder<>; the difference is that this one sets fast math
+// flags from the Builder if none are specified by fmfSource.
 //
-// @param nodePtr : BVH node pointer
-// @param extent : The valid range on which intersections can occur
-// @param origin : Intersect ray origin
-// @param direction : Intersect ray direction
-// @param invDirection : The inverse of direction
-// @param imageDesc : Image descriptor
-// @param instName : Name to give instruction(s)
-Value *Builder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, Value *origin, Value *direction,
-                                           Value *invDirection, Value *imageDesc, const Twine &instName) {
-  return static_cast<BuilderRecorder *>(this)->CreateImageBvhIntersectRay(nodePtr, extent, origin, direction,
-                                                                          invDirection, imageDesc, instName);
+// @param retTy : Return type
+// @param id : Intrinsic ID
+// @param args : Input values
+// @param fmfSource : Instruction to copy fast math flags from; nullptr to get from Builder
+// @param name : Name to give instruction
+CallInst *Builder::CreateIntrinsic(Type *retTy, Intrinsic::ID id, ArrayRef<Value *> args, Instruction *fmfSource,
+                                   const Twine &name) {
+  CallInst *result = IRBuilder<>::CreateIntrinsic(retTy, id, args, fmfSource, name);
+  if (!fmfSource && isa<FPMathOperator>(result))
+    result->setFastMathFlags(getFastMathFlags());
+  return result;
 }
-
-#endif

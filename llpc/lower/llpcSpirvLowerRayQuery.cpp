@@ -51,12 +51,17 @@ namespace RtName {
 const char *LdsUsage = "LdsUsage";
 const char *PrevRayQueryObj = "PrevRayQueryObj";
 const char *RayQueryObjGen = "RayQueryObjGen";
+const char *StaticId = "StaticId";
 static const char *LibraryEntryFuncName = "libraryEntry";
 static const char *LdsStack = "LdsStack";
 extern const char *LoadDwordAtAddr;
 extern const char *LoadDwordAtAddrx2;
 extern const char *LoadDwordAtAddrx4;
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION < 33
 static const char *IntersectBvh = "AmdExtD3DShaderIntrinsics_IntersectBvhNode";
+#else
+static const char *IntersectBvh = "AmdExtD3DShaderIntrinsics_IntersectInternal";
+#endif
 extern const char *ConvertF32toF16NegInf;
 extern const char *ConvertF32toF16PosInf;
 static const char *GetStackSize = "AmdTraceRayGetStackSize";
@@ -69,10 +74,12 @@ static const char *GetTriangleCompressionMode = "AmdTraceRayGetTriangleCompressi
 static const char *SetHitTokenData = "AmdTraceRaySetHitTokenData";
 static const char *GetBoxSortHeuristicMode = "AmdTraceRayGetBoxSortHeuristicMode";
 static const char *SampleGpuTimer = "AmdTraceRaySampleGpuTimer";
+static const char *GetStaticId = "AmdTraceRayGetStaticId";
 #if VKI_BUILD_GFX11
 static const char *LdsStackInit = "AmdTraceRayLdsStackInit";
 static const char *LdsStackStore = "AmdTraceRayLdsStackStore";
 #endif
+static const char *FetchTrianglePositionFromRayQuery = "FetchTrianglePositionFromRayQuery";
 } // namespace RtName
 
 // Enum for the RayDesc
@@ -302,7 +309,7 @@ SpirvLowerRayQuery::SpirvLowerRayQuery() : SpirvLowerRayQuery(false) {
 // =====================================================================================================================
 SpirvLowerRayQuery::SpirvLowerRayQuery(bool rayQueryLibrary)
     : m_rayQueryLibrary(rayQueryLibrary), m_spirvOpMetaKindId(0), m_ldsStack(nullptr), m_prevRayQueryObj(nullptr),
-      m_rayQueryObjGen(nullptr) {
+      m_rayQueryObjGen(nullptr), m_nextTraceRayId(0) {
 }
 
 // =====================================================================================================================
@@ -324,6 +331,7 @@ bool SpirvLowerRayQuery::runImpl(Module &module) {
   SpirvLower::init(&module);
   createGlobalRayQueryObj();
   createGlobalLdsUsage();
+  createGlobalTraceRayStaticId();
   if (m_rayQueryLibrary) {
     createGlobalStack();
     for (auto funcIt = module.begin(), funcEnd = module.end(); funcIt != funcEnd;) {
@@ -350,18 +358,18 @@ bool SpirvLowerRayQuery::runImpl(Module &module) {
 void SpirvLowerRayQuery::processLibraryFunction(Function *&func) {
   const auto *rtState = m_context->getPipelineContext()->getRayTracingState();
   auto mangledName = func->getName();
-  const char *rayQueryInitialize =
+  const StringRef rayQueryInitialize =
       m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_TRACE_RAY_INLINE);
-  const char *rayQueryProceed =
+  const StringRef rayQueryProceed =
       m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_RAY_QUERY_PROCEED);
   if (mangledName.startswith(RtName::LibraryEntryFuncName)) {
     func->dropAllReferences();
     func->eraseFromParent();
     func = nullptr;
-  } else if (mangledName.startswith(rayQueryInitialize)) {
+  } else if (!rayQueryInitialize.empty() && mangledName.startswith(rayQueryInitialize)) {
     func->setName(rayQueryInitialize);
     func->setLinkage(GlobalValue::ExternalLinkage);
-  } else if (mangledName.startswith(rayQueryProceed)) {
+  } else if (!rayQueryProceed.empty() && mangledName.startswith(rayQueryProceed)) {
     func->setName(rayQueryProceed);
     func->setLinkage(GlobalValue::ExternalLinkage);
   } else if (mangledName.startswith(RtName::LoadDwordAtAddrx4)) {
@@ -427,6 +435,12 @@ void SpirvLowerRayQuery::processLibraryFunction(Function *&func) {
     m_builder->SetInsertPoint(entryBlock);
     m_builder->CreateRet(m_builder->getInt32(rtState->boxSortHeuristicMode));
     func->setName(RtName::GetBoxSortHeuristicMode);
+  } else if (mangledName.startswith(RtName::GetStaticId)) {
+    eraseFunctionBlocks(func);
+    BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
+    m_builder->SetInsertPoint(entryBlock);
+    m_builder->CreateRet(m_builder->CreateLoad(m_builder->getInt32Ty(), m_traceRayStaticId));
+    func->setName(RtName::GetStaticId);
   }
 #if VKI_BUILD_GFX11
   else if (mangledName.startswith(RtName::LdsStackInit)) {
@@ -435,7 +449,10 @@ void SpirvLowerRayQuery::processLibraryFunction(Function *&func) {
     createLdsStackStore(func);
   }
 #endif
-  else {
+  else if (mangledName.startswith(RtName::FetchTrianglePositionFromRayQuery)) {
+    func->setName(RtName::FetchTrianglePositionFromRayQuery);
+    func->setLinkage(GlobalValue::ExternalLinkage);
+  } else {
     // Nothing to do
   }
 }
@@ -550,7 +567,11 @@ template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryInitializeKHR>
   m_builder->CreateStore(rayDesc, traceRaysArgs[6]);
   // 7, Dispatch Id
   m_builder->CreateStore(getDispatchId(), traceRaysArgs[7]);
-  const char *rayQueryInitialize =
+
+  if (m_context->getPipelineContext()->getRayTracingState()->enableRayTracingCounters)
+    generateTraceRayStaticId();
+
+  StringRef rayQueryInitialize =
       m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_TRACE_RAY_INLINE);
   m_builder->CreateNamedCall(rayQueryInitialize, m_builder->getVoidTy(), traceRaysArgs,
                              {Attribute::NoUnwind, Attribute::AlwaysInline});
@@ -1179,6 +1200,36 @@ template <> void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryGetIntersectio
 }
 
 // =====================================================================================================================
+// Process RayQuery OpRayQueryGetIntersectionTriangleVertexPositionsKHR
+//
+// @param func : The function to create
+template <>
+void SpirvLowerRayQuery::createRayQueryFunc<OpRayQueryGetIntersectionTriangleVertexPositionsKHR>(Function *func) {
+  func->addFnAttr(Attribute::AlwaysInline);
+  BasicBlock *entryBlock = BasicBlock::Create(*m_context, ".entry", func);
+  m_builder->SetInsertPoint(entryBlock);
+  Value *rayQuery = func->arg_begin();
+  Value *intersectVal = func->arg_begin() + 1;
+  Value *intersectPtr = m_builder->CreateAlloca(m_builder->getInt32Ty());
+  m_builder->CreateStore(intersectVal, intersectPtr);
+
+  // Call {vec3, vec3, vec3} FetchTrianglePositionFromRayQuery(rayquery* rayquery, int* intersect)
+  // return 3 triangle vertices
+  auto floatx3Ty = FixedVectorType::get(m_builder->getFloatTy(), 3);
+  auto triangleDataTy = StructType::get(*m_context, {floatx3Ty, floatx3Ty, floatx3Ty});
+  auto triangleData =
+      m_builder->CreateNamedCall(RtName::FetchTrianglePositionFromRayQuery, triangleDataTy, {rayQuery, intersectPtr},
+                                 {Attribute::NoUnwind, Attribute::AlwaysInline});
+
+  // Return type of OpRayQueryGetIntersectionTriangleVertexPositionsKHR is array of vec3 (vec3[3]).
+  auto retType = ArrayType::get(floatx3Ty, 3);
+  Value *ret = PoisonValue::get(retType);
+  for (unsigned i = 0; i < 3; i++)
+    ret = m_builder->CreateInsertValue(ret, m_builder->CreateExtractValue(triangleData, {i}), {i});
+  m_builder->CreateRet(ret);
+}
+
+// =====================================================================================================================
 // Process compute/graphics/raytracing shader RayQueryOp functions
 //
 // @param func : The function to create
@@ -1230,6 +1281,8 @@ void SpirvLowerRayQuery::processShaderFunction(Function *func, unsigned opcode) 
     return createRayQueryFunc<OpRayQueryGetIntersectionObjectToWorldKHR>(func);
   case OpRayQueryGetIntersectionWorldToObjectKHR:
     return createRayQueryFunc<OpRayQueryGetIntersectionWorldToObjectKHR>(func);
+  case OpRayQueryGetIntersectionTriangleVertexPositionsKHR:
+    return createRayQueryFunc<OpRayQueryGetIntersectionTriangleVertexPositionsKHR>(func);
   default:
     return;
   }
@@ -1336,6 +1389,16 @@ void SpirvLowerRayQuery::createGlobalLdsUsage() {
 }
 
 // =====================================================================================================================
+// Create global variable for static ID
+void SpirvLowerRayQuery::createGlobalTraceRayStaticId() {
+  m_traceRayStaticId =
+      new GlobalVariable(*m_module, Type::getInt32Ty(m_module->getContext()), true, GlobalValue::ExternalLinkage,
+                         nullptr, RtName::StaticId, nullptr, GlobalValue::NotThreadLocal, SPIRAS_Private);
+
+  m_traceRayStaticId->setAlignment(MaybeAlign(4));
+}
+
+// =====================================================================================================================
 // Create global variable for the prevRayQueryObj
 void SpirvLowerRayQuery::createGlobalRayQueryObj() {
   m_prevRayQueryObj =
@@ -1437,14 +1500,13 @@ Value *SpirvLowerRayQuery::createTransformMatrix(unsigned builtInId, Value *acce
 // Get raytracing workgroup size for LDS stack size calculation
 unsigned SpirvLowerRayQuery::getWorkgroupSize() const {
   unsigned workgroupSize = 0;
-  if (m_context->isRayTracing()) {
+  if (m_context->getPipelineType() == PipelineType::RayTracing) {
     const auto *rtState = m_context->getPipelineContext()->getRayTracingState();
     workgroupSize = rtState->threadGroupSizeX * rtState->threadGroupSizeY * rtState->threadGroupSizeZ;
-  } else if (m_context->isGraphics()) {
+  } else if (m_context->getPipelineType() == PipelineType::Graphics) {
     workgroupSize = m_context->getPipelineContext()->getRayTracingWaveSize();
   } else {
-    const lgc::ComputeShaderMode &computeMode = m_builder->getComputeShaderMode();
-    workgroupSize = computeMode.workgroupSizeX * computeMode.workgroupSizeY * computeMode.workgroupSizeZ;
+    workgroupSize = m_context->getPipelineContext()->getWorkgroupSize();
   }
   assert(workgroupSize != 0);
 #if VKI_BUILD_GFX11
@@ -1459,7 +1521,8 @@ unsigned SpirvLowerRayQuery::getWorkgroupSize() const {
 // =====================================================================================================================
 // Get flat thread id in work group/wave
 Value *SpirvLowerRayQuery::getThreadIdInGroup() const {
-  unsigned builtIn = m_context->isGraphics() ? BuiltInSubgroupLocalInvocationId : BuiltInLocalInvocationIndex;
+  unsigned builtIn = m_context->getPipelineType() == PipelineType::Graphics ? BuiltInSubgroupLocalInvocationId
+                                                                            : BuiltInLocalInvocationIndex;
   lgc::InOutInfo inputInfo = {};
   return m_builder->CreateReadBuiltInInput(static_cast<lgc::BuiltInKind>(builtIn), inputInfo, nullptr, nullptr, "");
 }
@@ -1477,8 +1540,13 @@ void SpirvLowerRayQuery::createIntersectBvh(Function *func) {
   m_builder->SetInsertPoint(entryBlock);
   func->setName(RtName::IntersectBvh);
 
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION < 33
   // Ray tracing utility function: AmdExtD3DShaderIntrinsics_IntersectBvhNode
   // uint4 AmdExtD3DShaderIntrinsics_IntersectBvhNode(
+#else
+  // Ray tracing utility function: AmdExtD3DShaderIntrinsics_IntersectInternal
+  // uint4 AmdExtD3DShaderIntrinsics_IntersectInternal(
+#endif
   //     in uint2  address,
   //     in float  ray_extent,
   //     in float3 ray_origin,
@@ -1552,6 +1620,20 @@ void SpirvLowerRayQuery::initGlobalVariable() {
   m_builder->CreateStore(m_builder->getInt32(InvalidValue), m_prevRayQueryObj);
   m_builder->CreateStore(m_builder->getInt32(0), m_rayQueryObjGen);
   m_builder->CreateStore(m_builder->getInt32(1), m_ldsUsage);
+}
+
+// =====================================================================================================================
+// Generate a static ID for current Trace Ray call
+//
+void SpirvLowerRayQuery::generateTraceRayStaticId() {
+  Util::MetroHash64 hasher;
+  hasher.Update(m_nextTraceRayId++);
+  hasher.Update(m_module->getName());
+
+  MetroHash::Hash hash = {};
+  hasher.Finalize(hash.bytes);
+
+  m_builder->CreateStore(m_builder->getInt32(MetroHash::compact32(&hash)), m_traceRayStaticId);
 }
 
 // =====================================================================================================================

@@ -44,10 +44,10 @@ public:
                   MetroHash::Hash *cacheHash);
   virtual ~GraphicsContext();
 
-  virtual bool isGraphics() const override { return true; }
+  virtual PipelineType getPipelineType() const override { return PipelineType::Graphics; }
 
   // Gets pipeline shader info of the specified shader stage
-  virtual const PipelineShaderInfo *getPipelineShaderInfo(ShaderStage shaderStage) const override;
+  const PipelineShaderInfo *getPipelineShaderInfo(unsigned shaderId) const;
 
   // Gets pipeline build info
   virtual const void *getPipelineBuildInfo() const override { return m_pipelineInfo; }
@@ -57,6 +57,12 @@ public:
 
   // Sets the mask of active shader stages bound to this pipeline
   virtual void setShaderStageMask(unsigned mask) override { m_stageMask = mask; }
+
+  // Sets whether dual source blend is used in fragment shader
+  virtual void setUseDualSourceBlend(bool useDualSourceBlend) override { m_useDualSourceBlend = useDualSourceBlend; }
+
+  // Gets whether dual source blend is used in fragment shader
+  virtual bool getUseDualSourceBlend() const override { return m_useDualSourceBlend; }
 
   // Sets whether pre-rasterization part has a geometry shader
   virtual void setPreRasterHasGs(bool preRasterHasGs) override { m_preRasterHasGs = preRasterHasGs; }
@@ -73,9 +79,27 @@ public:
   // Gets subgroup size usage
   virtual unsigned getSubgroupSizeUsage() const override;
 
-#if VKI_RAY_TRACING
-  virtual bool hasRayQuery() const override { return (m_pipelineInfo->shaderLibrary.codeSize > 0); }
-#endif
+  // Set pipeline state in lgc::Pipeline object for middle-end, and (optionally) hash the state.
+  virtual void setPipelineState(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher, bool unlinked) const override;
+
+  // For TCS, set inputVertices from patchControlPoints in the pipeline state.
+  virtual void setTcsInputVertices(llvm::Module *tcsModule) override;
+
+  // Gets client-defined metadata
+  virtual llvm::StringRef getClientMetadata() const override;
+
+protected:
+  // Give the pipeline options to the middle-end, and/or hash them.
+  virtual lgc::Options computePipelineOptions() const override;
+
+  // Give the color export state to the middle-end, and/or hash it.
+  void setColorExportState(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher) const;
+
+  // Set vertex input descriptions in middle-end Pipeline, and/or hash them.
+  void setVertexInputDescriptions(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher) const;
+
+  // Give the graphics pipeline state to the middle-end, and/or hash it.
+  void setGraphicsStateInPipeline(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher, unsigned stageMask) const;
 
 private:
   GraphicsContext() = delete;
@@ -86,6 +110,7 @@ private:
 
   unsigned m_stageMask;        // Mask of active shader stages bound to this graphics pipeline
   bool m_preRasterHasGs;       // Whether pre-rasterization part has a geometry shader
+  bool m_useDualSourceBlend;   // Whether dual source blend is used in fragment shader
   unsigned m_activeStageCount; // Count of active shader stages
 };
 

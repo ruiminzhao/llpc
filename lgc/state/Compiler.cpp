@@ -160,6 +160,13 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
 }
 
 // =====================================================================================================================
+// Version of generate() that takes ownership of the Module and deletes it.
+bool PipelineState::generate(std::unique_ptr<Module> pipelineModule, raw_pwrite_stream &outStream,
+                             Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, ArrayRef<Timer *> timers) {
+  return generate(&*pipelineModule, outStream, checkShaderCacheFunc, timers);
+}
+
+// =====================================================================================================================
 // Generate pipeline module by running patch, middle-end optimization and backend codegen passes.
 // The output is normally ELF, but IR assembly if an option is used to stop compilation early,
 // or ISA assembly if -filetype=asm is specified.
@@ -179,7 +186,7 @@ Module *PipelineState::irLink(ArrayRef<Module *> modules, PipelineLink pipelineL
 //           module cannot be compiled that way.  The client typically then does a whole-pipeline compilation
 //           instead. The client can call getLastError() to get a textual representation of the error, for
 //           use in logging or in error reporting in a command-line utility.
-bool PipelineState::generate(std::unique_ptr<Module> pipelineModule, raw_pwrite_stream &outStream,
+bool PipelineState::generate(Module *pipelineModule, raw_pwrite_stream &outStream,
                              Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, ArrayRef<Timer *> timers) {
   m_lastError.clear();
 
@@ -220,15 +227,18 @@ bool PipelineState::generate(std::unique_ptr<Module> pipelineModule, raw_pwrite_
     // Add pass to clear pipeline state from IR
     passMgr->addPass(PipelineStateClearer());
 
-    // Code generation.
-    std::unique_ptr<LegacyPassManager> codegenPassMgr(LegacyPassManager::Create());
-    unsigned passIndex = 2000;
-    codegenPassMgr->setPassIndex(&passIndex);
-    getLgcContext()->addTargetPasses(*codegenPassMgr, codeGenTimer, outStream);
     // Run the pipeline passes until codegen.
     passMgr->run(*pipelineModule);
-    // Run the codegen passes
-    codegenPassMgr->run(*pipelineModule);
+    if (passMgr->stopped()) {
+      outStream << *pipelineModule;
+    } else {
+      // Code generation.
+      std::unique_ptr<LegacyPassManager> codegenPassMgr(LegacyPassManager::Create());
+      unsigned passIndex = 2000;
+      codegenPassMgr->setPassIndex(&passIndex);
+      getLgcContext()->addTargetPasses(*codegenPassMgr, codeGenTimer, outStream);
+      codegenPassMgr->run(*pipelineModule);
+    }
   }
 
   // See if there was a recoverable error.

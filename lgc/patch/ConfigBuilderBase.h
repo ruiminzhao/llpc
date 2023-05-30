@@ -65,6 +65,7 @@ public:
   void writePalMetadata();
   llvm::msgpack::MapDocNode &getGraphicsRegNode() { return m_graphicsRegistersNode; }
   llvm::msgpack::MapDocNode &getComputeRegNode() { return m_computeRegistersNode; }
+  llvm::msgpack::MapDocNode &getPipelineNode() { return m_pipelineNode; }
   // Get the MsgPack map node for the specified HW shader in the ".hardware_stages" map
   llvm::msgpack::MapDocNode getHwShaderNode(Util::Abi::HardwareStage hwStage);
 
@@ -94,6 +95,7 @@ protected:
   void appendConfig(unsigned key, unsigned value);
 
   bool usesViewportArrayIndex();
+  void setupPrintfStrings();
 
   template <typename T> void appendConfig(const T &config) {
     static_assert(T::ContainsPalAbiMetadataOnly, "may only be used with structs that are fully metadata notes");

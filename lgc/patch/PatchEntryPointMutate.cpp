@@ -857,11 +857,34 @@ void PatchEntryPointMutate::setFuncAttrs(Function *entryPoint) {
     bool hasDepthExport = builtInUsage.sampleMask || builtInUsage.fragStencilRef || builtInUsage.fragDepth;
     builder.addAttribute("amdgpu-depth-export", hasDepthExport ? "1" : "0");
 
-    // mmSPI_SHADER_COL_FORMAT is used for fully compiled shaders
-    unsigned colFormat = m_pipelineState->getPalMetadata()->getRegister(mmSPI_SHADER_COL_FORMAT);
-    // getColorExportCount() is used for partially compiled shaders
-    unsigned colorExportCount = m_pipelineState->getPalMetadata()->getColorExportCount();
-    bool hasColorExport = (colFormat != EXP_FORMAT_ZERO) || (colorExportCount > (hasDepthExport ? 1 : 0));
+    bool hasColorExport = false;
+    // SpiShaderColFormat / mmSPI_SHADER_COL_FORMAT is used for fully compiled shaders
+    unsigned colFormat = EXP_FORMAT_ZERO;
+    if (m_pipelineState->useRegisterFieldFormat()) {
+      auto &colFormatNode = m_pipelineState->getPalMetadata()
+                                ->getPipelineNode()
+                                .getMap(true)[Util::Abi::PipelineMetadataKey::GraphicsRegisters]
+                                .getMap(true)[Util::Abi::GraphicsRegisterMetadataKey::SpiShaderColFormat]
+                                .getMap(true);
+      for (auto iter = colFormatNode.begin(); iter != colFormatNode.end(); ++iter) {
+        if (iter->second.getUInt() != EXP_FORMAT_ZERO) {
+          colFormat = iter->second.getUInt();
+          break;
+        }
+      }
+    } else {
+      colFormat = m_pipelineState->getPalMetadata()->getRegister(mmSPI_SHADER_COL_FORMAT);
+    }
+    if (colFormat != EXP_FORMAT_ZERO)
+      hasColorExport = true;
+
+    if (!hasColorExport) {
+      // getColorExportCount() is used for partially compiled shaders
+      const unsigned colorExportCount = m_pipelineState->getPalMetadata()->getColorExportCount();
+      if (colorExportCount > static_cast<unsigned>(hasDepthExport))
+        hasColorExport = true;
+    }
+
     builder.addAttribute("amdgpu-color-export", hasColorExport ? "1" : "0");
   }
 
@@ -1054,11 +1077,6 @@ uint64_t PatchEntryPointMutate::generateEntryPointArgTys(ShaderInputs *shaderInp
 
   if (m_pipelineState->useRegisterFieldFormat()) {
     constexpr unsigned NumUserSgprs = 32;
-    unsigned numUserDataSgprs = 16;
-    if (m_pipelineState->getTargetInfo().getGfxIpVersion().major >= 9 && m_shaderStage != ShaderStageCompute &&
-        m_shaderStage != ShaderStageTask)
-      numUserDataSgprs = 32;
-
     constexpr unsigned InvalidMapVal = static_cast<unsigned>(UserDataMapping::Invalid);
     SmallVector<unsigned, NumUserSgprs> userDataMap;
     userDataMap.resize(NumUserSgprs, InvalidMapVal);
@@ -1378,8 +1396,9 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
   // We do have user data layout.
   // Add entries from the root user data layout (not vertex buffer or streamout, and not unused ones).
 
-  for (unsigned userDataNodeIdx = 0; userDataNodeIdx != m_pipelineState->getUserDataNodes().size(); ++userDataNodeIdx) {
-    const ResourceNode &node = m_pipelineState->getUserDataNodes()[userDataNodeIdx];
+  llvm::ArrayRef<ResourceNode> userDataNodes = m_pipelineState->getUserDataNodes();
+  for (unsigned userDataNodeIdx = 0; userDataNodeIdx != userDataNodes.size(); ++userDataNodeIdx) {
+    const ResourceNode &node = userDataNodes[userDataNodeIdx];
     switch (node.concreteType) {
 
     case ResourceNodeType::IndirectUserDataVaPtr:

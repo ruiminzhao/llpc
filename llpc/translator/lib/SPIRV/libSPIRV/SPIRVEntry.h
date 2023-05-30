@@ -203,13 +203,14 @@ public:
     assert(hasId());
     return Id;
   }
-  std::shared_ptr<const SPIRVLine> getLine() const { return Line; }
+  const SPIRVLine *getLine() const { return Line; }
   SPIRVLinkageTypeKind getLinkageType() const;
   Op getOpCode() const { return OpCode; }
   SPIRVModule *getModule() const { return Module; }
   virtual SPIRVCapVec getRequiredCapability() const { return SPIRVCapVec(); }
   const std::string &getName() const { return Name; }
   bool hasDecorate(Decoration Kind, size_t Index = 0, SPIRVWord *Result = 0) const;
+  SPIRVEntry *getDecorateId(Decoration Kind, size_t Index) const;
   const char *getDecorateString(Decoration kind) const;
   bool hasMemberDecorate(SPIRVWord MemberIndex, Decoration Kind, size_t Index = 0, SPIRVWord *Result = 0) const;
   std::set<SPIRVWord> getDecorate(Decoration Kind, size_t Index = 0) const;
@@ -246,7 +247,7 @@ public:
   void eraseMemberDecorate(SPIRVWord MemberNumber, Decoration Kind);
   void setHasNoId() { Attrib |= SPIRVEA_NOID; }
   void setId(SPIRVId TheId) { Id = TheId; }
-  void setLine(const std::shared_ptr<const SPIRVLine> &L);
+  void setLine(const SPIRVLine *L);
   void setLinkageType(SPIRVLinkageTypeKind);
   void setModule(SPIRVModule *TheModule);
   void setName(const std::string &TheName);
@@ -320,7 +321,7 @@ protected:
 
   DecorateMapType Decorates;
   MemberDecorateMapType MemberDecorates;
-  std::shared_ptr<const SPIRVLine> Line;
+  const SPIRVLine *Line;
 };
 
 class SPIRVEntryNoIdGeneric : public SPIRVEntry {
@@ -670,7 +671,6 @@ template <spv::Op OC> bool isa(SPIRVEntry *E) {
 // This is also an indication of how much work is left.
 #define _SPIRV_OP(x, ...) typedef SPIRVEntryOpCodeOnly<Op##x> SPIRV##x;
 _SPIRV_OP(SizeOf)
-_SPIRV_OP(DecorateId)
 // NOTE: These 4 OpCodes are reserved by SPIR-V spec, they are invalid unless
 // some extensions expose them.
 _SPIRV_OP(ImageSparseSampleProjImplicitLod)

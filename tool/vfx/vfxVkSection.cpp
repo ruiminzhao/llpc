@@ -60,18 +60,15 @@ public:
     ADD_CLASS_ENUM_MAP(ResourceMappingNodeType, DescriptorImage)
     ADD_CLASS_ENUM_MAP(ResourceMappingNodeType, DescriptorConstTexelBuffer)
     ADD_CLASS_ENUM_MAP(ResourceMappingNodeType, InlineBuffer)
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 61
     ADD_CLASS_ENUM_MAP(ResourceMappingNodeType, DescriptorMutable)
+#endif
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, Auto)
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, MaximumSize)
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, HalfSize)
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, OptimizeForVerts)
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, OptimizeForPrims)
     ADD_CLASS_ENUM_MAP(NggSubgroupSizingType, Explicit)
-
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
-    ADD_ENUM_MAP(NggCompactMode, NggCompactDisable)
-    ADD_ENUM_MAP(NggCompactMode, NggCompactVertices)
-#endif
 
     ADD_CLASS_ENUM_MAP(WaveBreakSize, None)
     ADD_CLASS_ENUM_MAP(WaveBreakSize, _8x8)

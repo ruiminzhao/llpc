@@ -228,7 +228,7 @@ void SPIRVEntry::takeDecorates(SPIRVEntry *E) {
   Decorates = std::move(E->Decorates);
 }
 
-void SPIRVEntry::setLine(const std::shared_ptr<const SPIRVLine> &L) {
+void SPIRVEntry::setLine(const SPIRVLine *L) {
   Line = L;
 }
 
@@ -274,6 +274,15 @@ bool SPIRVEntry::hasDecorate(Decoration Kind, size_t Index, SPIRVWord *Result) c
   if (Result)
     *Result = Loc->second->getLiteral(Index);
   return true;
+}
+
+// Check if an entry has Kind of decorationId
+SPIRVEntry *SPIRVEntry::getDecorateId(Decoration Kind, size_t Index) const {
+  DecorateMapType::const_iterator Loc = Decorates.find(Kind);
+  if (Loc == Decorates.end())
+    return nullptr;
+
+  return Loc->second->getEntry(Index);
 }
 
 const char *SPIRVEntry::getDecorateString(Decoration kind) const {
@@ -434,14 +443,12 @@ _SPIRV_IMP_DECODE3(SPIRVMemberName, Target, MemberNumber, Str)
 
 void SPIRVLine::decode(std::istream &I) {
   getDecoder(I) >> FileName >> Line >> Column;
-  std::shared_ptr<const SPIRVLine> L(this);
-  Module->setCurrentLine(L);
+  Module->setCurrentLine(this);
 }
 
 void SPIRVLine::validate() const {
   assert(OpCode == OpLine);
   assert(WordCount == 4);
-  assert(get<SPIRVEntry>(FileName)->getOpCode() == OpString);
   assert(Line != SPIRVWORD_MAX);
   assert(Column != SPIRVWORD_MAX);
   assert(!hasId());

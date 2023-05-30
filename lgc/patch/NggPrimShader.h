@@ -153,9 +153,10 @@ struct XfbOutputExport {
   unsigned numElements; // Number of output elements, valid range is [1,4]
   bool is16bit;         // Whether the output is 16-bit
   struct {
-    unsigned streamId; // Output stream ID
-    unsigned loc;      // Output location
-  } locInfo;           // Output location info in GS-VS ring (just for GS)
+    unsigned streamId;  // Output stream ID
+    unsigned location;  // Output location
+    unsigned component; // Output component within a location
+  } locInfo;            // Output location info in GS-VS ring (just for GS)
 };
 
 // Enumerates the LDS regions used by primitive shader
@@ -184,6 +185,12 @@ struct PrimShaderLdsUsageInfo {
 // Map: LDS region -> <region Offset, region Size>
 typedef std::unordered_map<PrimShaderLdsRegion, std::pair<unsigned, unsigned>> PrimShaderLdsLayout;
 
+// Represents a collection of constant buffer offsets (in dwords) within stream-out control buffer.
+// NOTE: The layout structure is defined by @ref Util::Abi::StreamOutControlCb.
+struct StreamOutControlCbOffsets {
+  unsigned bufOffsets[MaxTransformFeedbackBuffers];
+};
+
 // =====================================================================================================================
 // Represents the manager of NGG primitive shader.
 class NggPrimShader {
@@ -207,6 +214,7 @@ private:
   llvm::FunctionType *getPrimShaderType(uint64_t &inRegMask);
 
   void buildPrimShaderCbLayoutLookupTable();
+  void calcStreamOutControlCbOffsets();
 
   void buildPassthroughPrimShader(llvm::Function *entryPoint);
   void buildPrimShader(llvm::Function *entryPoint);
@@ -237,9 +245,10 @@ private:
   void appendUserData(llvm::SmallVectorImpl<llvm::Value *> &args, llvm::Function *target, llvm::Value *userData,
                       unsigned userDataCount);
 
-  void writeGsOutput(llvm::Value *output, unsigned location, unsigned compIdx, unsigned streamId,
+  void writeGsOutput(llvm::Value *output, unsigned location, unsigned component, unsigned streamId,
                      llvm::Value *primitiveIndex, llvm::Value *emitVerts);
-  llvm::Value *readGsOutput(llvm::Type *outputTy, unsigned location, unsigned streamId, llvm::Value *vertexOffset);
+  llvm::Value *readGsOutput(llvm::Type *outputTy, unsigned location, unsigned component, unsigned streamId,
+                            llvm::Value *vertexOffset);
 
   void processGsEmit(unsigned streamId, llvm::Value *primitiveIndex, llvm::Value *emitVertsPtr,
                      llvm::Value *outVertsPtr);
@@ -315,6 +324,7 @@ private:
   llvm::Value *readValueFromLds(llvm::Type *readTy, llvm::Value *ldsOffset, bool useDs128 = false);
   void writeValueToLds(llvm::Value *writeValue, llvm::Value *ldsOffset, bool useDs128 = false);
   void atomicAdd(llvm::Value *valueToAdd, llvm::Value *ldsOffset);
+  llvm::Value *readValueFromCb(llvm::Type *readyTy, llvm::Value *bufPtr, llvm::Value *offset, bool isVolatile = false);
 
   static const unsigned NullPrim = (1u << 31); // Null primitive data (invalid)
 
@@ -383,6 +393,7 @@ private:
   bool m_hasTes = false; // Whether the pipeline has tessellation evaluation shader
   bool m_hasGs = false;  // Whether the pipeline has geometry shader
 
+  llvm::Value *m_streamOutControlBufPtr;                           // Stream-out control buffer pointer
   llvm::Value *m_streamOutBufDescs[MaxTransformFeedbackBuffers];   // Stream-out buffer descriptors
   llvm::Value *m_streamOutBufOffsets[MaxTransformFeedbackBuffers]; // Stream-out buffer offsets
 
@@ -391,8 +402,9 @@ private:
   // Base offsets (in dwords) of GS output vertex streams in GS-VS ring
   unsigned m_gsStreamBases[MaxGsStreams] = {};
 
-  PrimShaderCbLayoutLookupTable m_cbLayoutTable; // Layout lookup table of primitive shader constant buffer
-  VertexCullInfoOffsets m_vertCullInfoOffsets;   // A collection of offsets within an item of vertex cull info
+  PrimShaderCbLayoutLookupTable m_cbLayoutTable;         // Layout lookup table of primitive shader constant buffer
+  VertexCullInfoOffsets m_vertCullInfoOffsets;           // A collection of offsets within an item of vertex cull info
+  StreamOutControlCbOffsets m_streamOutControlCbOffsets; // A collection of offsets within stream-out control buffer
 
   llvm::IRBuilder<> m_builder; // LLVM IR builder
 

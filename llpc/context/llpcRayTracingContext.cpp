@@ -44,22 +44,17 @@ namespace Llpc {
 // @param pipelineHash : Pipeline hash code
 // @param cacheHash : Cache hash code
 RayTracingContext::RayTracingContext(GfxIpVersion gfxIP, const RayTracingPipelineBuildInfo *pipelineInfo,
-                                     const PipelineShaderInfo *traceRayShaderInfo, MetroHash::Hash *pipelineHash,
+                                     const PipelineShaderInfo *representativeShaderInfo, MetroHash::Hash *pipelineHash,
                                      MetroHash::Hash *cacheHash, unsigned indirectStageMask)
     : PipelineContext(gfxIP, pipelineHash, cacheHash, &pipelineInfo->rtState), m_pipelineInfo(pipelineInfo),
-      m_traceRayShaderInfo(traceRayShaderInfo), m_linked(false), m_indirectStageMask(indirectStageMask),
-      m_entryName(""), m_payloadMaxSize(pipelineInfo->payloadSizeMaxInLib), m_callableDataMaxSize(0),
+      m_representativeShaderInfo(), m_linked(false), m_indirectStageMask(indirectStageMask), m_entryName(""),
+      m_payloadMaxSize(pipelineInfo->payloadSizeMaxInLib), m_callableDataMaxSize(0),
       m_attributeDataMaxSize(pipelineInfo->attributeSizeMaxInLib) {
   m_resourceMapping = pipelineInfo->resourceMapping;
   m_pipelineLayoutApiHash = pipelineInfo->pipelineLayoutApiHash;
-}
 
-// =====================================================================================================================
-// Gets pipeline shader info of the specified shader stage
-//
-// @param shaderStage : Shader stage
-const PipelineShaderInfo *RayTracingContext::getPipelineShaderInfo(ShaderStage shaderStage) const {
-  return m_traceRayShaderInfo;
+  if (representativeShaderInfo)
+    m_representativeShaderInfo.options = representativeShaderInfo->options;
 }
 
 // =====================================================================================================================
@@ -169,6 +164,7 @@ bool RayTracingContext::isRayTracingBuiltIn(unsigned builtIn) {
   case BuiltInObjectRayOriginKHR:
   case BuiltInObjectRayDirectionKHR:
   case BuiltInCullMaskKHR:
+  case BuiltInHitTriangleVertexPositionsKHR:
     return true;
   default:
     return false;
@@ -220,6 +216,54 @@ unsigned RayTracingContext::getSubgroupSizeUsage() const {
     return unsigned(-1);
   }
   return 0;
+}
+
+// =====================================================================================================================
+// Set pipeline state in Pipeline object for middle-end and/or calculate the hash for the state to be added.
+// Doing both these things in the same code ensures that we hash and use the same pipeline state in all situations.
+// For graphics, we use the shader stage mask to decide which parts of graphics state to use, omitting
+// pre-rasterization state if there are no pre-rasterization shaders, and omitting fragment state if there is
+// no FS.
+//
+// @param [in/out] pipeline : Middle-end pipeline object; nullptr if only hashing pipeline state
+// @param [in/out] hasher : Hasher object; nullptr if only setting LGC pipeline state
+// @param unlinked : Do not provide some state to LGC, so offsets are generated as relocs, and a fetch shader
+//                   is needed
+void RayTracingContext::setPipelineState(lgc::Pipeline *pipeline, Util::MetroHash64 *hasher, bool unlinked) const {
+  PipelineContext::setPipelineState(pipeline, hasher, unlinked);
+  const unsigned stageMask = getShaderStageMask();
+
+  if (pipeline) {
+    // Give the shader options (including the hash) to the middle-end.
+    const auto allStages = maskToShaderStages(stageMask);
+    lgc::ShaderOptions options = computeShaderOptions(m_representativeShaderInfo);
+    for (ShaderStage stage : make_filter_range(allStages, isNativeStage)) {
+      pipeline->setShaderOptions(getLgcShaderStage(static_cast<ShaderStage>(stage)), options);
+    }
+  }
+
+  if (!hasRayTracingShaderStage(stageMask)) {
+    unsigned deviceIndex = static_cast<const ComputePipelineBuildInfo *>(getPipelineBuildInfo())->deviceIndex;
+    if (pipeline)
+      pipeline->setDeviceIndex(deviceIndex);
+    if (hasher)
+      hasher->Update(deviceIndex);
+  }
+}
+
+// =====================================================================================================================
+// Give the pipeline options to the middle-end, and/or hash them.
+lgc::Options RayTracingContext::computePipelineOptions() const {
+  lgc::Options options = PipelineContext::computePipelineOptions();
+  // NOTE: raytracing waveSize and subgroupSize can be different.
+  options.fullSubgroups = false;
+  return options;
+}
+
+// =====================================================================================================================
+// Gets client-defined metadata
+StringRef RayTracingContext::getClientMetadata() const {
+  return StringRef(static_cast<const char *>(m_pipelineInfo->pClientMetadata), m_pipelineInfo->clientMetadataSize);
 }
 
 } // namespace Llpc

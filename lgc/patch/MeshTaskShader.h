@@ -131,7 +131,6 @@ private:
   llvm::Value *getMeshLocalInvocationId();
   llvm::Value *getMeshLocalInvocationIndex();
   llvm::Value *getMeshGlobalInvocationId();
-  llvm::Value *getGlobalInvocationIndex();
 
   llvm::Value *readMeshBuiltInFromLds(BuiltInKind builtIn);
   llvm::Value *convertToHwShadingRate(llvm::Value *primitiveShadingRate);
@@ -146,6 +145,7 @@ private:
   llvm::Value *readValueFromLds(llvm::Type *readTy, llvm::Value *ldsOffset);
   void writeValueToLds(llvm::Value *writeValue, llvm::Value *ldsOffset);
   void atomicOpWithLds(llvm::AtomicRMWInst::BinOp atomicOp, llvm::Value *atomicValue, llvm::Value *ldsOffset);
+  void createFenceAndBarrier();
 
   static constexpr unsigned PayloadRingEntrySize = 16 * 1024;    // 16K bytes per group
   static constexpr unsigned DrawDataRingEntrySize = 16;          // 16 bytes per group
@@ -166,10 +166,6 @@ private:
     llvm::Value *threadIdInWave;
     llvm::Value *threadIdInSubgroup;
     llvm::Value *primOrVertexIndex;
-    // Following info is for GFX11+
-    llvm::Value *workgroupIdX;
-    llvm::Value *workgroupIdY;
-    llvm::Value *workgroupIdZ;
     llvm::Value *rowInSubgroup;
   } m_waveThreadInfo = {};
 
@@ -180,12 +176,6 @@ private:
   bool m_hasNoVertexAttrib = false;              // Whether mesh shader has vertex attribute export or not
   llvm::Value *m_attribRingBufDesc = nullptr;    // Attribute ring buffer descriptor
   llvm::Value *m_attribRingBaseOffset = nullptr; // Subgroup's attribute ring base offset (in bytes)
-
-  llvm::Value *m_meshFlatWorkgroupId = nullptr;       // Flat workgroupId of mesh shader
-  llvm::Value *m_meshWorkgroupId = nullptr;           // Built-in WorkgroupId of mesh shader
-  llvm::Value *m_meshLocalInvocationId = nullptr;     // Built-in LocalInvocationId of mesh shader
-  llvm::Value *m_meshGlobalInvocationId = nullptr;    // Built-in GlobalInvocationId of mesh shader
-  llvm::Value *m_meshGlobalInvocationIndex = nullptr; // Global invocation index of mesh shader
 
   llvm::Value *m_barrierToggle = nullptr;            // Toggle used by calculation of barrier completion flag
   bool m_needBarrierFlag = false;                    // Whether barrier completion flag is needed

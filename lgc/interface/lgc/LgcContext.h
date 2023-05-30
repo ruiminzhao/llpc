@@ -79,14 +79,23 @@ public:
   // possible, this should be called in a thread-safe way.
   static void initialize();
 
-  // Create the LgcContext. Returns nullptr on failure to recognize the AMDGPU target whose name is specified
+  // Create TargetMachine. Returns nullptr on failure to recognize the AMDGPU target whose name is specified.
   //
-  // @param context : LLVM context to use on all compiles
   // @param gpuName : LLVM GPU name (e.g. "gfx900"); empty to use -mcpu option setting
+  // @param optLevel : LLVM optimization level used to initialize target machine
+  static std::unique_ptr<llvm::TargetMachine> createTargetMachine(llvm::StringRef gpuName,
+                                                                  llvm::CodeGenOpt::Level optLevel);
+
+  // Create the LgcContext.
+  //
+  // @param targetMachine : LLVM TargetMachine to use. Caller retains ownership and must free it when finished.
+  // @param context : LLVM context to give each Builder. Caller retains ownership and must free it when finished.
   // @param palAbiVersion : PAL pipeline ABI version to compile for
-  // @param optLevel : The optimization level to use.
-  static LgcContext *create(llvm::LLVMContext &context, llvm::StringRef gpuName, unsigned int palAbiVersion,
-                            llvm::CodeGenOpt::Level optLevel);
+  static LgcContext *create(llvm::TargetMachine *targetMachine, llvm::LLVMContext &context, unsigned palAbiVersion);
+
+  // Get the value of the -emit-lgc option. BuilderRecorder uses this to decide whether to omit the opcode
+  // metadata when recording a Builder call.
+  static bool getEmitLgc();
 
   ~LgcContext();
 
@@ -111,9 +120,10 @@ public:
   // Create a Pipeline object for a pipeline compile
   Pipeline *createPipeline();
 
-  // Create a Builder object
+  // Create a Builder object. This is now unnecessary, as you can just create a local variable Builder or "new" it
+  // yourself.
   //
-  // @param pipeline : Pipeline object for pipeline compile, nullptr for shader compile
+  // @param pipeline : Ignored
   Builder *createBuilder(Pipeline *pipeline);
 
   // Prepare a pass manager. This manually adds a target-aware TLI pass, so middle-end optimizations do not

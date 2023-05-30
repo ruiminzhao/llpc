@@ -124,9 +124,12 @@ enum class CoverageToShaderSel : unsigned {
 namespace PalCodeObjectMetadataKey {
 static constexpr char Version[] = "amdpal.version";
 static constexpr char Pipelines[] = "amdpal.pipelines";
+static constexpr char PrintfStrings[] = "amdpal.format_strings";
 }; // namespace PalCodeObjectMetadataKey
 
 namespace PipelineMetadataKey {
+static constexpr char Index[] = ".index";
+static constexpr char String[] = ".string";
 static constexpr char Name[] = ".name";
 static constexpr char Type[] = ".type";
 static constexpr char InternalPipelineHash[] = ".internal_pipeline_hash";
@@ -297,10 +300,6 @@ static constexpr char ZScaleEna[] = ".z_scale_ena";
 static constexpr char ZOffsetEna[] = ".z_offset_ena";
 static constexpr char VtxW0Fmt[] = ".vtx_w0_fmt";
 }; // namespace PaClVteCntlMetadataKey
-
-namespace PaScModeCntl1MetadataKey {
-static constexpr char PsIterSample[] = ".per_iter_sample";
-}; // namespace PaScModeCntl1MetadataKey
 
 namespace VgtShaderStagesEnMetadataKey {
 static constexpr char LsStageEn[] = ".ls_stage_en";
@@ -513,6 +512,17 @@ namespace SpiShaderGsMeshletExpAllocMetadataKey {
 static constexpr char MaxExpVerts[] = ".max_exp_verts";
 static constexpr char MaxExpPrims[] = ".max_exp_prims";
 }; // namespace SpiShaderGsMeshletExpAllocMetadataKey
+
+namespace CbShaderMaskMetadataKey {
+static constexpr char Output0Enable[] = ".output0_enable";
+static constexpr char Output1Enable[] = ".output1_enable";
+static constexpr char Output2Enable[] = ".output2_enable";
+static constexpr char Output3Enable[] = ".output3_enable";
+static constexpr char Output4Enable[] = ".output4_enable";
+static constexpr char Output5Enable[] = ".output5_enable";
+static constexpr char Output6Enable[] = ".output6_enable";
+static constexpr char Output7Enable[] = ".output7_enable";
+}; // namespace CbShaderMaskMetadataKey
 
 } // namespace Abi
 

@@ -34,6 +34,7 @@
 #include "lgc/PassManager.h"
 #include "lgc/builder/BuilderReplayer.h"
 #include "lgc/patch/FragColorExport.h"
+#include "lgc/patch/LowerDebugPrintf.h"
 #include "lgc/patch/PatchBufferOp.h"
 #include "lgc/patch/PatchCheckShaderCache.h"
 #include "lgc/patch/PatchCopyShader.h"
@@ -72,7 +73,6 @@
 #include "llvm/Transforms/IPO/ConstantMerge.h"
 #include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
@@ -122,7 +122,7 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, T
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
 
   // We're using BuilderRecorder; replay the Builder calls now
-  passMgr.addPass(BuilderReplayer(pipelineState));
+  passMgr.addPass(BuilderReplayer());
 
   if (raw_ostream *outs = getLgcOuts()) {
     passMgr.addPass(PrintModulePass(*outs,
@@ -131,6 +131,7 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, T
   }
 
   passMgr.addPass(IPSCCPPass());
+  passMgr.addPass(LowerDebugPrintf());
 
   passMgr.addPass(PatchNullFragShader());
   passMgr.addPass(PatchResourceCollect()); // also removes inactive/unused resources
@@ -282,6 +283,7 @@ void Patch::registerPasses(PassBuilder &passBuilder) {
       return false;
     return true;
   };
+  (void)checkNameWithParams;
 
 #define HANDLE_PASS_WITH_PARSER(NAME, CLASS)                                                                           \
   if (innerPipeline.empty() && checkNameWithParams(name, NAME, params))                                                \
@@ -290,6 +292,7 @@ void Patch::registerPasses(PassBuilder &passBuilder) {
   passBuilder.registerPipelineParsingCallback(
       [=](StringRef name, ModulePassManager &passMgr, ArrayRef<PassBuilder::PipelineElement> innerPipeline) {
         StringRef params;
+        (void)params;
 #define LLPC_PASS(NAME, CLASS) /* */
 #define LLPC_MODULE_PASS HANDLE_PASS
 #define LLPC_MODULE_PASS_WITH_PARSER HANDLE_PASS_WITH_PARSER
@@ -392,7 +395,7 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
                                   .needCanonicalLoops(true)
                                   .sinkCommonInsts(true)));
   fpm.addPass(LoopUnrollPass(LoopUnrollOptions(optLevel)));
-  // uses DivergenceAnalysis
+  // uses UniformityAnalysis
   fpm.addPass(PatchReadFirstLane());
   fpm.addPass(InstCombinePass(instCombineOpt));
   passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));

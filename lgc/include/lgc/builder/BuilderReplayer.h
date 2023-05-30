@@ -30,32 +30,31 @@
  */
 #pragma once
 
-#include "lgc/builder/BuilderRecorder.h"
+#include "lgc/CommonDefs.h"
 #include "llvm/IR/PassManager.h"
 #include <map>
 
 namespace lgc {
 
+class BuilderImpl;
+class PipelineState;
+
 // =====================================================================================================================
 // Pass to replay Builder calls recorded by BuilderRecorder
-class BuilderReplayer final : public BuilderRecorderMetadataKinds, public llvm::PassInfoMixin<BuilderReplayer> {
+class BuilderReplayer final : public llvm::PassInfoMixin<BuilderReplayer> {
 public:
-  BuilderReplayer(Pipeline *pipeline);
-
   llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
 
   bool runImpl(llvm::Module &module, PipelineState *pipelineState);
 
   static llvm::StringRef name() { return "Replay LLPC builder calls"; }
 
-  static bool parsePass(llvm::StringRef params, llvm::ModulePassManager &passMgr);
-
 private:
   void replayCall(unsigned opcode, llvm::CallInst *call);
 
   llvm::Value *processCall(unsigned opcode, llvm::CallInst *call);
 
-  std::unique_ptr<Builder> m_builder;                       // The LLPC builder that the builder
+  BuilderImpl *m_builder = nullptr;                         // The LLPC builder that the builder
                                                             //  calls are being replayed on.
   std::map<llvm::Function *, ShaderStage> m_shaderStageMap; // Map function -> shader stage
   llvm::Function *m_enclosingFunc = nullptr;                // Last function written with current

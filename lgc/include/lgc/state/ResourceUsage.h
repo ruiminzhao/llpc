@@ -110,7 +110,10 @@ public:
   void setHighHalf(bool isHighHalf) { m_data.bits.isHighHalf = isHighHalf; }
 
   unsigned getComponent() const { return m_data.bits.component; }
-  void setComponent(unsigned compIdx) { m_data.bits.component = static_cast<uint16_t>(compIdx); }
+  void setComponent(unsigned compIdx) {
+    assert(compIdx < 4); // Valid component offsets are 0~3
+    m_data.bits.component = static_cast<uint16_t>(compIdx);
+  }
 
   unsigned getLocation() const { return m_data.bits.location; }
   void setLocation(unsigned loc) { m_data.bits.location = static_cast<uint16_t>(loc); }
@@ -536,7 +539,7 @@ struct InterfaceData {
         unsigned dispatchDims;       // Dispatch dimensions
         unsigned baseRingEntryIndex; // Base entry index (first workgroup) of mesh/task shader ring for current dispatch
         unsigned pipeStatsBuf;       // Pipeline statistics buffer
-        unsigned workgroupId;        // Workgroup ID
+        unsigned workgroupId;        // Workgroup ID (GFX11 and below)
         unsigned multiDispatchInfo;  // Multiple dispatch info
         unsigned localInvocationId;  // Local invocation ID
       } task;
@@ -595,6 +598,7 @@ struct InterfaceData {
         unsigned baseRingEntryIndex; // Base entry index (first workgroup) of mesh/task shader ring for current dispatch
         unsigned pipeStatsBuf;       // Pipeline statistics buffer
         unsigned flatWorkgroupId;    // Flat workgroup ID (emulated by HW vertex ID)
+        unsigned localInvocationId;  // Local invocation ID (GFX11+, packed)
       } mesh;
 
       // Fragment shader

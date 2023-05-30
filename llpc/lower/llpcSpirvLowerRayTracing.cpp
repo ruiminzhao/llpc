@@ -31,7 +31,7 @@
 
 #include "llpcSpirvLowerRayTracing.h"
 #include "SPIRVInternal.h"
-#include "gpurt.h"
+#include "gpurt-compiler.h"
 #include "llpcContext.h"
 #include "llpcRayTracingContext.h"
 #include "llpcSpirvLowerUtil.h"
@@ -75,7 +75,12 @@ static const char *CallTriangleAnyHitShader = "AmdTraceRayCallTriangleAnyHitShad
 static const char *CallIntersectionShader = "AmdTraceRayCallIntersectionShader";
 static const char *CallAnyHitShader = "AmdTraceRayCallAnyHitShader";
 static const char *SetTriangleIntersectionAttributes = "AmdTraceRaySetTriangleIntersectionAttributes";
+static const char *SetHitTriangleNodePointer = "AmdTraceRaySetHitTriangleNodePointer";
+static const char *FetchTrianglePositionFromNodePointer = "FetchTrianglePositionFromNodePointer";
 static const char *RemapCapturedVaToReplayVa = "AmdTraceRayRemapCapturedVaToReplayVa";
+static const char *GetParentId = "AmdTraceRayGetParentId";
+static const char *SetParentId = "AmdTraceRaySetParentId";
+static const char *DispatchRayIndex = "AmdTraceRayDispatchRaysIndex";
 } // namespace RtName
 
 namespace Llpc {
@@ -97,6 +102,8 @@ static unsigned TraceParamsTySize[] = {
     1, // 13, duplicateAnyH
     1, // 14, geometryIndex
     8, // 15, hit attribute
+    1, // 16, parentId
+    9, // 16, HitTriangleVertexPositions
 };
 
 // ====================================================================================================================
@@ -132,11 +139,6 @@ template <> void SpirvLowerRayTracing::createRayTracingFunc<OpTraceRayKHR>(Funct
     auto payloadArg = func->getArg(TraceRayParam::Payload);
     auto payloadTypeArg = func->arg_end() - 1;
     unsigned payloadArgSize = alignTo(m_module->getDataLayout().getTypeAllocSize(payloadTypeArg->getType()), 4);
-    // TODO: Remove this when LLPC will switch fully to opaque pointers.
-    assert(payloadArg->getType()->isOpaquePointerTy() ||
-           (payloadArgSize == (alignTo(m_module->getDataLayout().getTypeAllocSize(
-                                           payloadArg->getType()->getNonOpaquePointerElementType()),
-                                       4))));
     const Align align = Align(4);
     // type conversion
     m_builder->CreateMemCpy(payload, align, payloadArg, align, payloadArgSize);
@@ -147,6 +149,19 @@ template <> void SpirvLowerRayTracing::createRayTracingFunc<OpTraceRayKHR>(Funct
     // Exclude payload variable parameter
     for (unsigned i = TraceRayParam::AccelStruct; i < TraceRayParam::Payload; ++i)
       args.push_back(func->getArg(i));
+
+    Value *currentParentRayId = nullptr;
+    if (rayTracingContext->getRayTracingState()->enableRayTracingCounters) {
+      generateTraceRayStaticId();
+
+      // RayGen shaders are non-recursive, initialize parent ray ID to -1 here.
+      if (m_shaderStage == ShaderStageRayTracingRayGen)
+        m_builder->CreateStore(m_builder->getInt32(InvalidValue), m_traceParams[TraceParam::ParentRayId]);
+
+      currentParentRayId = m_builder->CreateLoad(m_builder->getInt32Ty(), m_traceParams[TraceParam::ParentRayId]);
+      args.push_back(currentParentRayId);
+      args.push_back(m_builder->CreateLoad(m_builder->getInt32Ty(), m_traceRayStaticId));
+    }
 
     CallInst *result = nullptr;
     auto funcTy = getTraceRayFuncTy();
@@ -161,6 +176,11 @@ template <> void SpirvLowerRayTracing::createRayTracingFunc<OpTraceRayKHR>(Funct
     } else {
       result =
           m_builder->CreateNamedCall(RtName::TraceRayKHR, funcTy->getReturnType(), args, {Attribute::AlwaysInline});
+    }
+
+    if (rayTracingContext->getRayTracingState()->enableRayTracingCounters) {
+      // Restore parent ray ID after call
+      m_builder->CreateStore(currentParentRayId, m_traceParams[TraceParam::ParentRayId]);
     }
 
     // Save the return value to the input payloads for memcpy of type conversion
@@ -200,11 +220,6 @@ template <> void SpirvLowerRayTracing::createRayTracingFunc<OpExecuteCallableKHR
   Value *callableData = func->arg_end() - 2;
   Value *callableTypeArg = func->arg_end() - 1;
   unsigned callableDataSize = alignTo(m_module->getDataLayout().getTypeAllocSize(callableTypeArg->getType()), 4);
-  // TODO: Remove this when LLPC will switch fully to opaque pointers.
-  assert(callableData->getType()->isOpaquePointerTy() ||
-         (callableDataSize == (alignTo(m_module->getDataLayout().getTypeAllocSize(
-                                           callableData->getType()->getNonOpaquePointerElementType()),
-                                       4))));
   const Align align = Align(4);
   m_builder->CreateMemCpy(inputResult, align, callableData, align, callableDataSize);
   SmallVector<Value *, 8> args;
@@ -457,6 +472,7 @@ bool SpirvLowerRayTracing::runImpl(Module &module) {
   initGlobalCallableData();
   createGlobalLdsUsage();
   createGlobalRayQueryObj();
+  createGlobalTraceRayStaticId();
   createGlobalTraceParams();
 
   // Create empty raygen main module
@@ -598,9 +614,9 @@ bool SpirvLowerRayTracing::runImpl(Module &module) {
 void SpirvLowerRayTracing::processLibraryFunction(Function *func) {
   assert(m_shaderStage == ShaderStageCompute);
   auto mangledName = func->getName();
-  const char *traceRayFuncName = m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_TRACE_RAY);
+  StringRef traceRayFuncName = m_context->getPipelineContext()->getRayTracingFunctionName(Vkgc::RT_ENTRY_TRACE_RAY);
 
-  if (mangledName.startswith(traceRayFuncName)) {
+  if (!traceRayFuncName.empty() && mangledName.startswith(traceRayFuncName)) {
     func->setLinkage(GlobalValue::ExternalLinkage);
   } else if (mangledName.startswith(RtName::GetFlattenedGroupThreadId)) {
     eraseFunctionBlocks(func);
@@ -647,6 +663,26 @@ void SpirvLowerRayTracing::processLibraryFunction(Function *func) {
 
   } else if (mangledName.startswith(RtName::SetTriangleIntersectionAttributes)) {
     createSetTriangleInsection(func);
+  } else if (mangledName.startswith(RtName::SetParentId)) {
+    eraseFunctionBlocks(func);
+    BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
+    m_builder->SetInsertPoint(entryBlock);
+    assert(func->arg_size() == 1);
+    m_builder->CreateStore(m_builder->CreateLoad(m_builder->getInt32Ty(), func->arg_begin()),
+                           m_traceParams[TraceParam::ParentRayId]);
+    m_builder->CreateRetVoid();
+  } else if (mangledName.startswith(RtName::GetParentId)) {
+    eraseFunctionBlocks(func);
+    BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
+    m_builder->SetInsertPoint(entryBlock);
+    m_builder->CreateRet(m_builder->CreateLoad(m_builder->getInt32Ty(), m_traceParams[TraceParam::ParentRayId]));
+  } else if (mangledName.startswith(RtName::DispatchRayIndex)) {
+    eraseFunctionBlocks(func);
+    BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
+    m_builder->SetInsertPoint(entryBlock);
+    m_builder->CreateRet(m_builder->CreateReadBuiltInInput(lgc::BuiltInGlobalInvocationId, {}, nullptr, nullptr, ""));
+  } else if (mangledName.startswith(RtName::SetHitTriangleNodePointer)) {
+    createSetHitTriangleNodePointer(func);
   }
 }
 
@@ -695,7 +731,7 @@ void SpirvLowerRayTracing::createSetTraceParams(Function *func) {
   BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
   m_builder->SetInsertPoint(entryBlock);
 
-#if GPURT_INTERFACE_VERSION >= MAKE_GPURT_VERSION(12, 0)
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 12
   assert(func->arg_size() == 9);
 #else
   assert(func->arg_size() == 8);
@@ -707,7 +743,7 @@ void SpirvLowerRayTracing::createSetTraceParams(Function *func) {
   rayFlags = m_builder->CreateLoad(m_traceParamsTys[TraceParam::RayFlags], rayFlags);
   m_builder->CreateStore(rayFlags, m_traceParams[TraceParam::RayFlags]);
 
-#if GPURT_INTERFACE_VERSION >= MAKE_GPURT_VERSION(12, 0)
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 12
   Value *instanceInclusionMask = argIt++;
   instanceInclusionMask =
       m_builder->CreateLoad(m_traceParamsTys[TraceParam::InstanceInclusionMask], instanceInclusionMask);
@@ -1633,17 +1669,21 @@ void SpirvLowerRayTracing::createTraceRay() {
   m_builder->CreateStore(elem2, traceRaysArgs[TraceRayLibFuncParam::DirZ]);
 
   // 14, TMax
-#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 56
   const float rayTMax = m_context->getPipelineContext()->getRayTracingState()->maxRayLength;
-#else
-  const float rayTMax = m_context->getPipelineContext()->getPipelineOptions()->rtMaxRayLength;
-#endif
   if (rayTMax > 0.0) {
     arg = ConstantFP::get(m_builder->getFloatTy(), rayTMax);
   } else {
     arg = argIt;
   }
   m_builder->CreateStore(arg, traceRaysArgs[TraceRayLibFuncParam::TMax]);
+
+  // Parent ray ID and static ID if logging feature is enabled
+  if (rayTracingContext->getRayTracingState()->enableRayTracingCounters) {
+    arg = ++argIt;
+    m_builder->CreateStore(arg, m_traceParams[TraceParam::ParentRayId]);
+    arg = ++argIt;
+    m_builder->CreateStore(arg, m_traceRayStaticId);
+  }
 
   // Call TraceRay function from traceRays module
   auto result =
@@ -1661,21 +1701,23 @@ void SpirvLowerRayTracing::createTraceRay() {
 void SpirvLowerRayTracing::initTraceParamsTy(unsigned attributeSize) {
   auto floatx3Ty = FixedVectorType::get(Type::getFloatTy(*m_context), 3);
   m_traceParamsTys = {
-      m_builder->getInt32Ty(),                                // 1, rayFlags
-      m_builder->getInt32Ty(),                                // 2, instanceInclusionMask
-      floatx3Ty,                                              // 3, origin
-      m_builder->getFloatTy(),                                // 4, tMin
-      floatx3Ty,                                              // 5, dir
-      m_builder->getFloatTy(),                                // 6, tMax
-      m_builder->getFloatTy(),                                // 7, tCurrent
-      m_builder->getInt32Ty(),                                // 8, kind
-      m_builder->getInt32Ty(),                                // 9, status
-      m_builder->getInt32Ty(),                                // 10, instNodeAddrLo
-      m_builder->getInt32Ty(),                                // 11, instNodeAddrHi
-      m_builder->getInt32Ty(),                                // 12, primitiveIndex
-      m_builder->getInt32Ty(),                                // 13, duplicateAnyHit
-      m_builder->getInt32Ty(),                                // 14, geometryIndex
-      ArrayType::get(m_builder->getFloatTy(), attributeSize), // 15, hit attribute
+      m_builder->getInt32Ty(),                                        // 1, rayFlags
+      m_builder->getInt32Ty(),                                        // 2, instanceInclusionMask
+      floatx3Ty,                                                      // 3, origin
+      m_builder->getFloatTy(),                                        // 4, tMin
+      floatx3Ty,                                                      // 5, dir
+      m_builder->getFloatTy(),                                        // 6, tMax
+      m_builder->getFloatTy(),                                        // 7, tCurrent
+      m_builder->getInt32Ty(),                                        // 8, kind
+      m_builder->getInt32Ty(),                                        // 9, status
+      m_builder->getInt32Ty(),                                        // 10, instNodeAddrLo
+      m_builder->getInt32Ty(),                                        // 11, instNodeAddrHi
+      m_builder->getInt32Ty(),                                        // 12, primitiveIndex
+      m_builder->getInt32Ty(),                                        // 13, duplicateAnyHit
+      m_builder->getInt32Ty(),                                        // 14, geometryIndex
+      ArrayType::get(m_builder->getFloatTy(), attributeSize),         // 15, hit attribute
+      m_builder->getInt32Ty(),                                        // 16, parentId
+      StructType::get(*m_context, {floatx3Ty, floatx3Ty, floatx3Ty}), // 16, HitTriangleVertexPositions
   };
   TraceParamsTySize[TraceParam::HitAttributes] = attributeSize;
   assert(sizeof(TraceParamsTySize) / sizeof(TraceParamsTySize[0]) == TraceParam::Count);
@@ -1769,6 +1811,10 @@ void SpirvLowerRayTracing::initShaderBuiltIns() {
     }
     case BuiltInCullMaskKHR: {
       m_builtInParams.insert(TraceParam::InstanceInclusionMask);
+      break;
+    }
+    case BuiltInHitTriangleVertexPositionsKHR: {
+      m_builtInParams.insert(TraceParam::HitTriangleVertexPositions);
       break;
     }
     default:
@@ -1970,6 +2016,13 @@ FunctionType *SpirvLowerRayTracing::getTraceRayFuncTy() {
       FixedVectorType::get(m_builder->getFloatTy(), 3), // Ray direction
       m_builder->getFloatTy(),                          // Ray Tmax
   };
+
+  // Add parent ray ID and static ID if logging feature is enabled.
+  if (m_context->getPipelineContext()->getRayTracingState()->enableRayTracingCounters) {
+    argsTys.push_back(m_builder->getInt32Ty());
+    argsTys.push_back(m_builder->getInt32Ty());
+  }
+
   auto funcTy = FunctionType::get(retTy, argsTys, false);
   return funcTy;
 }
@@ -2057,6 +2110,10 @@ SmallSet<unsigned, 4> SpirvLowerRayTracing::getShaderExtraInputParams(ShaderStag
   default:
     break;
   }
+
+  // Add parent ray ID if logging feature is enabled.
+  if (m_context->getPipelineContext()->getRayTracingState()->enableRayTracingCounters)
+    params.insert(TraceParam::ParentRayId);
 
   // Remove duplicated ones
   for (auto builtIn : m_builtInParams) {
@@ -2241,6 +2298,25 @@ Value *SpirvLowerRayTracing::createLoadRayTracingMatrix(unsigned builtInId, Inst
   matrixAddr = m_builder->CreateAdd(matrixAddr, matrixOffset);
 
   return createLoadMatrixFromAddr(matrixAddr);
+}
+
+// =====================================================================================================================
+// Process AmdTraceRaySetHitTriangleNodePointer function
+//
+// @param func : The function to create
+void SpirvLowerRayTracing::createSetHitTriangleNodePointer(Function *func) {
+  eraseFunctionBlocks(func);
+  BasicBlock *entryBlock = BasicBlock::Create(*m_context, "", func);
+  m_builder->SetInsertPoint(entryBlock);
+  if (m_builtInParams.find(TraceParam::HitTriangleVertexPositions) != m_builtInParams.end()) {
+    Value *bvh = func->arg_begin();
+    Value *nodePtr = func->arg_begin() + 1;
+    auto triangleDataTy = m_traceParamsTys[TraceParam::HitTriangleVertexPositions];
+    auto triangleData = m_builder->CreateNamedCall(RtName::FetchTrianglePositionFromNodePointer, triangleDataTy,
+                                                   {bvh, nodePtr}, {Attribute::NoUnwind, Attribute::AlwaysInline});
+    m_builder->CreateStore(triangleData, m_traceParams[TraceParam::HitTriangleVertexPositions]);
+  }
+  m_builder->CreateRetVoid();
 }
 
 // =====================================================================================================================

@@ -107,6 +107,7 @@ enum class ThreadGroupSwizzleMode : unsigned {
 static const unsigned ShadowDescriptorTableDisable = ~0U;
 
 static const char XfbStateMetadataName[] = "lgc.xfb.state";
+static const char SampleShadingMetaName[] = "lgc.sample.shading";
 
 // Middle-end per-pipeline options to pass to SetOptions.
 // The front-end should zero-initialize it with "= {}" in case future changes add new fields.
@@ -133,8 +134,8 @@ struct Options {
   bool fullSubgroups;                  // Use full subgroup lanes
   unsigned nggVertsPerSubgroup;        // How to determine NGG verts per subgroup
   unsigned nggPrimsPerSubgroup;        // How to determine NGG prims per subgroup
-  unsigned shadowDescriptorTable;      // High dword of shadow descriptor table address, or
-                                       //   ShadowDescriptorTableDisable to disable shadow descriptor tables
+  unsigned highAddrOfFmask;            // High dword of Fmask address
+  bool enableFmask;                    // Whether to use Fmasks when loading from MSAA images
   unsigned allowNullDescriptor;        // Allow and give defined behavior for null descriptor
   unsigned disableImageResourceCheck;  // Don't do image resource type check
   unsigned reserved0f;                 // Reserved for future functionality
@@ -155,6 +156,7 @@ struct Options {
   bool reserved15;
 #endif
   bool enableUberFetchShader; // Enable UberShader
+  bool reserved16;
 };
 
 /// Represent a pipeline option which can be automatic as well as explicitly set.
@@ -445,7 +447,6 @@ struct ColorExportState {
 // Struct to pass to SetInputAssemblyState.
 struct InputAssemblyState {
   PrimitiveType primitiveType; // Primitive type
-  unsigned patchControlPoints; // Number of control points for PrimitiveType::Patch
   unsigned disableVertexReuse; // Disable reusing vertex shader output for indexed draws
   unsigned switchWinding;      // Whether to reverse vertex ordering for tessellation
   unsigned enableMultiView;    // Whether to enable multi-view support
@@ -563,6 +564,7 @@ struct TessellationMode {
   PrimitiveMode primitiveMode; // Tessellation primitive mode
   unsigned pointMode;          // Whether point mode is specified
   unsigned outputVertices;     // Number of produced vertices in the output patch
+  unsigned inputVertices;      // Number of input vertices in the input patch.
 };
 
 // Kind of GS input primitives.
@@ -659,6 +661,56 @@ public:
   llvm::LLVMContext &getContext() const;
 
   // -----------------------------------------------------------------------------------------------------------------
+  // Methods to set shader modes (FP modes, tessellation modes, fragment modes, workgroup size) for the current
+  // shader that come from the input language.
+
+  // Set the common shader mode for the given shader stage, containing hardware FP round and denorm modes.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setCommonShaderMode(llvm::Module &module, ShaderStage shaderStage,
+                                  const CommonShaderMode &commonShaderMode);
+
+  // Get the common shader mode for the given shader stage.
+  static CommonShaderMode getCommonShaderMode(llvm::Module &module, ShaderStage shaderStage);
+
+  // Set the tessellation mode. This can be called in multiple shaders, and the values are merged
+  // together -- a zero value in one call is overridden by a non-zero value in another call. LLPC needs
+  // that because SPIR-V allows some of these execution mode items to appear in either the TCS or TES.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setTessellationMode(llvm::Module &module, ShaderStage shaderStage,
+                                  const TessellationMode &tessellationMode);
+
+  // Get the tessellation mode for the given shader stage.
+  static TessellationMode getTessellationMode(llvm::Module &module, ShaderStage shaderStage);
+
+  // Set the geometry shader state.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setGeometryShaderMode(llvm::Module &module, const GeometryShaderMode &geometryShaderMode);
+
+  // Set the mesh shader state.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setMeshShaderMode(llvm::Module &module, const MeshShaderMode &meshShaderMode);
+
+  // Set the fragment shader mode.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setFragmentShaderMode(llvm::Module &module, const FragmentShaderMode &fragmentShaderMode);
+
+  // Set the compute shader modes.
+  // The client should always zero-initialize the struct before setting it up, in case future versions
+  // add more fields. A local struct variable can be zero-initialized with " = {}".
+  static void setComputeShaderMode(llvm::Module &module, const ComputeShaderMode &computeShaderMode);
+
+  // Set subgroup size usage.
+  static void setSubgroupSizeUsage(llvm::Module &module, ShaderStage stage, bool usage);
+
+  // Get the compute shader mode (workgroup size)
+  static ComputeShaderMode getComputeShaderMode(llvm::Module &module);
+
+  // -----------------------------------------------------------------------------------------------------------------
   // State setting methods
 
   // Set whether pre-rasterization part has a geometry shader
@@ -725,6 +777,9 @@ public:
   //                 can be recorded in the module. The latter is provided as a hook for the LGC tool, which does not
   //                 do an irLink() at all.
   virtual void setOtherPartPipeline(Pipeline &otherPartPipeline, llvm::Module *linkedModule = nullptr) = 0;
+
+  // Set the client-defined metadata to be stored inside the ELF
+  virtual void setClientMetadata(llvm::StringRef clientMetadata) = 0;
 
   // -----------------------------------------------------------------------------------------------------------------
   // IR link and generate pipeline/library methods
@@ -807,6 +862,10 @@ public:
   //           instead. The client can call getLastError() to get a textual representation of the error, for
   //           use in logging or in error reporting in a command-line utility.
   virtual bool generate(std::unique_ptr<llvm::Module> pipelineModule, llvm::raw_pwrite_stream &outStream,
+                        CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers) = 0;
+
+  // Version of generate() that does not take ownership of the Module.
+  virtual bool generate(llvm::Module *pipelineModule, llvm::raw_pwrite_stream &outStream,
                         CheckShaderCacheFunc checkShaderCacheFunc, llvm::ArrayRef<llvm::Timer *> timers) = 0;
 
   // Create an ELF linker object for linking unlinked shader or part-pipeline ELFs into a pipeline ELF using
