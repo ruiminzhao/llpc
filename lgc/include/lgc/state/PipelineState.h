@@ -216,6 +216,12 @@ public:
   // Record pipeline state into IR metadata of specified module.
   void record(llvm::Module *module);
 
+  // Print pipeline state
+  void print(llvm::raw_ostream &out) const;
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  LLVM_DUMP_METHOD void dump() const { print(llvm::dbgs()); }
+#endif
+
   // Accessors for shader stage mask
   unsigned getShaderStageMask();
   bool getPreRasterHasGs() const { return m_preRasterHasGs; }
@@ -239,14 +245,15 @@ public:
   llvm::ArrayRef<ResourceNode> getUserDataNodes() const { return m_userDataNodes; }
 
   // Find the push constant resource node
-  const ResourceNode *findPushConstantResourceNode() const;
+  const ResourceNode *findPushConstantResourceNode(ShaderStage shaderStage = ShaderStageInvalid) const;
 
   // Find the resource node for the given set,binding
-  std::pair<const ResourceNode *, const ResourceNode *> findResourceNode(ResourceNodeType nodeType, unsigned descSet,
-                                                                         unsigned binding) const;
+  std::pair<const ResourceNode *, const ResourceNode *>
+  findResourceNode(ResourceNodeType nodeType, uint64_t descSet, unsigned binding,
+                   ShaderStage shaderStage = ShaderStageInvalid) const;
 
   // Find the single root resource node of the given type
-  const ResourceNode *findSingleRootResourceNode(ResourceNodeType nodeType) const;
+  const ResourceNode *findSingleRootResourceNode(ResourceNodeType nodeType, ShaderStage shaderStage) const;
 
   // Accessors for vertex input descriptions.
   llvm::ArrayRef<VertexInputDescription> getVertexInputDescriptions() const { return m_vertexInputDescriptions; }
@@ -395,6 +402,12 @@ public:
   // Get user data for a specific shader stage
   llvm::ArrayRef<unsigned> getUserDataMap(ShaderStage shaderStage) const { return m_userDataMaps[shaderStage]; }
 
+  // Set the flag for performing the copy from mrt0.z to mrtz.a
+  void setUseMrt0AToMrtzA(bool used) { m_useMrt0AToMrtzA = used; }
+
+  // Get the flag of whether to copy mrt0.a to mrtz.a
+  bool isUseMrt0AToMrtzA() const { return m_useMrt0AToMrtzA; }
+
   // -----------------------------------------------------------------------------------------------------------------
   // Utility method templates to read and write IR metadata, used by PipelineState and ShaderModes
 
@@ -519,7 +532,7 @@ private:
   llvm::ArrayRef<llvm::MDString *> getResourceTypeNames();
   llvm::MDString *getResourceTypeName(ResourceNodeType type);
   ResourceNodeType getResourceTypeFromName(llvm::MDString *typeName);
-  bool matchResourceNode(const ResourceNode &node, ResourceNodeType nodeType, unsigned descSet, unsigned binding) const;
+  bool matchResourceNode(const ResourceNode &node, ResourceNodeType nodeType, uint64_t descSet, unsigned binding) const;
 
   // Device index handling
   void recordDeviceIndex(llvm::Module *module);
@@ -575,6 +588,7 @@ private:
   bool m_outputPackState[ShaderStageGfxCount] = {}; // The output packable state per shader stage
   XfbStateMetadata m_xfbStateMetadata = {};         // Transform feedback state metadata
   llvm::SmallVector<unsigned, 32> m_userDataMaps[ShaderStageCountInternal]; // The user data per-shader
+  bool m_useMrt0AToMrtzA = false;                                           // Whether to copy mrt0.a to mrz.a
 };
 
 // =====================================================================================================================
@@ -616,6 +630,25 @@ public:
   bool runImpl(llvm::Module &module, PipelineState *pipelineState);
 
   static llvm::StringRef name() { return "LLPC pipeline state clearer"; }
+};
+
+// =====================================================================================================================
+// Pass to print the pipeline state in a human-readable way
+class PipelineStatePrinter : public llvm::PassInfoMixin<PipelineStatePrinter> {
+public:
+  explicit PipelineStatePrinter(llvm::raw_ostream &out = llvm::dbgs()) : m_out(out) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
+
+private:
+  llvm::raw_ostream &m_out;
+};
+
+// =====================================================================================================================
+// Pass to record the pipeline state back into the IR if present
+class PipelineStateRecorder : public llvm::PassInfoMixin<PipelineStateRecorder> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
 };
 
 } // namespace lgc

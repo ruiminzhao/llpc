@@ -792,7 +792,7 @@ Value *BuilderImpl::CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo
                                         const llvm::Twine &instName) {
   assert(builtIn == lgc::BuiltInBaryCoord || builtIn == lgc::BuiltInBaryCoordNoPerspKHR);
 
-  markBuiltInInputUsage(builtIn, 0);
+  markBuiltInInputUsage(builtIn, 0, inputInfo);
 
   // Force override to per-sample interpolation.
   if (getPipelineState()->getOptions().enableInterpModePatch && !auxInterpValue &&
@@ -865,7 +865,7 @@ Value *BuilderImpl::readBuiltIn(bool isOutput, BuiltInKind builtIn, InOutInfo in
     arraySize = constIndex->getZExtValue() + 1;
 
   if (!isOutput)
-    markBuiltInInputUsage(builtIn, arraySize);
+    markBuiltInInputUsage(builtIn, arraySize, inOutInfo);
   else
     markBuiltInOutputUsage(builtIn, arraySize, InvalidValue);
 
@@ -1168,7 +1168,7 @@ Value *BuilderImpl::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
     // On GFX11, it is a single VGPR and we need to extract the three components.
     if (getPipelineState()->getTargetInfo().getGfxIpVersion().major >= 11) {
       static const unsigned mask = 0x3ff;
-      Value *unpackedLocalInvocationId = UndefValue::get(FixedVectorType::get(getInt32Ty(), 3));
+      Value *unpackedLocalInvocationId = PoisonValue::get(FixedVectorType::get(getInt32Ty(), 3));
 
       // X = PackedId[9:0]
       unpackedLocalInvocationId =
@@ -1241,19 +1241,22 @@ Value *BuilderImpl::readCsBuiltIn(BuiltInKind builtIn, const Twine &instName) {
   }
 
   case BuiltInSubgroupId: {
+    GfxIpVersion gfxIp = getPipelineState()->getTargetInfo().getGfxIpVersion();
     // From Navi21, it should load the subgroupid from sgpr initialized at wave launch.
-    if (getPipelineState()->getTargetInfo().getGfxIpVersion() >= GfxIpVersion({10, 3})) {
-      Value *multiDispatchInfo =
-          ShaderInputs::getInput(ShaderInput::MultiDispatchInfo, BuilderBase::get(*this), *getLgcContext());
+    {
+      if (gfxIp >= GfxIpVersion({10, 3})) {
+        Value *multiDispatchInfo =
+            ShaderInputs::getInput(ShaderInput::MultiDispatchInfo, BuilderBase::get(*this), *getLgcContext());
 
-      // waveId = dispatchInfo[24:20]
-      Value *waveIdInSubgroup = CreateAnd(CreateLShr(multiDispatchInfo, 20), 0x1F, "waveIdInSubgroup");
-      return waveIdInSubgroup;
-    } else {
-      // Before Navi21, it should read the value before swizzling which is correct to calculate subgroup id.
-      Value *localInvocationIndex = readCsBuiltIn(BuiltInUnswizzledLocalInvocationIndex);
-      unsigned subgroupSize = getPipelineState()->getShaderSubgroupSize(m_shaderStage);
-      return CreateLShr(localInvocationIndex, getInt32(Log2_32(subgroupSize)));
+        // waveId = dispatchInfo[24:20]
+        Value *waveIdInSubgroup = CreateAnd(CreateLShr(multiDispatchInfo, 20), 0x1F, "waveIdInSubgroup");
+        return waveIdInSubgroup;
+      } else {
+        // Before Navi21, it should read the value before swizzling which is correct to calculate subgroup id.
+        Value *localInvocationIndex = readCsBuiltIn(BuiltInUnswizzledLocalInvocationIndex);
+        unsigned subgroupSize = getPipelineState()->getShaderSubgroupSize(m_shaderStage);
+        return CreateLShr(localInvocationIndex, getInt32(Log2_32(subgroupSize)));
+      }
     }
   }
 
@@ -1385,94 +1388,6 @@ Instruction *BuilderImpl::CreateWriteBuiltInOutput(Value *valueToWrite, BuiltInK
 }
 
 // =====================================================================================================================
-// Create a read from (part of) a task payload.
-// The result type is as specified by resultTy, a scalar or vector type with no more than four elements.
-//
-// @param resultTy : Type of value to read
-// @param byteOffset : Byte offset within the payload structure
-// @param instName : Name to give instruction(s)
-// @returns : Value read from the task payload
-Value *BuilderImpl::CreateReadTaskPayload(Type *resultTy, Value *byteOffset, const Twine &instName) {
-  assert(m_shaderStage == ShaderStageTask || m_shaderStage == ShaderStageMesh); // Only valid for task/mesh shader
-
-  std::string callName = lgcName::MeshTaskReadTaskPayload;
-  addTypeMangling(resultTy, byteOffset, callName);
-  return CreateNamedCall(callName, resultTy, byteOffset, {});
-}
-
-// =====================================================================================================================
-// Create a write to (part of) a task payload.
-//
-// @param valueToWrite : Value to write
-// @param byteOffset : Byte offset within the payload structure
-// @param instName : Name to give instruction(s)
-// @returns : Instruction to write value to task payload
-Instruction *BuilderImpl::CreateWriteTaskPayload(Value *valueToWrite, Value *byteOffset, const Twine &instName) {
-  assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
-
-  std::string callName = lgcName::MeshTaskWriteTaskPayload;
-  addTypeMangling(nullptr, {byteOffset, valueToWrite}, callName);
-  return CreateNamedCall(callName, getVoidTy(), {byteOffset, valueToWrite}, {});
-}
-
-// =====================================================================================================================
-// Create a task payload atomic operation other than compare-and-swap. An add of +1 or -1, or a sub
-// of -1 or +1, is generated as inc or dec. Result type is the same as the input value type.
-//
-// @param atomicOp : Atomic op to create
-// @param ordering : Atomic ordering
-// @param inputValue : Input value
-// @param byteOffset : Byte offset within the payload structure
-// @param instName : Name to give instruction(s)
-// @returns : Original value read from the task payload
-Value *BuilderImpl::CreateTaskPayloadAtomic(unsigned atomicOp, AtomicOrdering ordering, Value *inputValue,
-                                            Value *byteOffset, const Twine &instName) {
-  assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
-
-  std::string callName = lgcName::MeshTaskAtomicTaskPayload;
-  addTypeMangling(nullptr, inputValue, callName);
-  return CreateNamedCall(callName, inputValue->getType(),
-                         {getInt32(atomicOp), getInt32(static_cast<unsigned>(ordering)), inputValue, byteOffset}, {});
-}
-
-// =====================================================================================================================
-// Create a task payload atomic compare-and-swap.
-//
-// @param ordering : Atomic ordering
-// @param inputValue : Input value
-// @param comparatorValue : Value to compare against
-// @param byteOffset : Byte offset within the payload structure
-// @param instName : Name to give instruction(s)
-// @returns : Original value read from the task payload
-Value *BuilderImpl::CreateTaskPayloadAtomicCompareSwap(AtomicOrdering ordering, Value *inputValue,
-                                                       Value *comparatorValue, Value *byteOffset,
-                                                       const Twine &instName) {
-  assert(m_shaderStage == ShaderStageTask); // Only valid for task shader
-
-  std::string callName = lgcName::MeshTaskAtomicCompareSwapTaskPayload;
-  addTypeMangling(nullptr, inputValue, callName);
-  return CreateNamedCall(callName, inputValue->getType(),
-                         {getInt32(static_cast<unsigned>(ordering)), inputValue, comparatorValue, byteOffset}, {});
-}
-
-// =====================================================================================================================
-// Create debug printf operation, and write to the output debug buffer
-// @args : Printf variable parameters
-// @instName : Instance Name
-Value *BuilderImpl::CreateDebugPrintf(ArrayRef<Value *> args, const Twine &instName) {
-  Module *module = GetInsertPoint()->getModule();
-  SmallVector<Type *> argTys;
-  argTys.reserve(args.size());
-  for (auto arg : args)
-    argTys.push_back(arg->getType());
-
-  auto funcTy = FunctionType::get(getInt64Ty(), argTys, false);
-  auto func = Function::Create(funcTy, GlobalValue::InternalLinkage, lgcName::LowerDebugPrintf, module);
-  func->addFnAttr(Attribute::NoUnwind);
-  return CreateCall(func, args, instName);
-}
-
-// =====================================================================================================================
 // Get the type of a built-in. This overrides the one in Builder to additionally recognize the internal built-ins.
 //
 // @param builtIn : Built-in kind
@@ -1502,7 +1417,8 @@ Type *BuilderImpl::getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo) {
 // @param builtIn : Built-in ID
 // @param arraySize : Number of array elements for ClipDistance and CullDistance. (Multiple calls to this function for
 // this built-in might have different array sizes; we take the max)
-void BuilderImpl::markBuiltInInputUsage(BuiltInKind &builtIn, unsigned arraySize) {
+// @param inOutInfo : Extra input/output info (shader-defined array size)
+void BuilderImpl::markBuiltInInputUsage(BuiltInKind &builtIn, unsigned arraySize, InOutInfo inOutInfo) {
   auto &usage = getPipelineState()->getShaderResourceUsage(m_shaderStage)->builtInUsage;
   assert((builtIn != BuiltInClipDistance && builtIn != BuiltInCullDistance) || arraySize != 0);
   switch (m_shaderStage) {
@@ -1658,6 +1574,8 @@ void BuilderImpl::markBuiltInInputUsage(BuiltInKind &builtIn, unsigned arraySize
     switch (static_cast<unsigned>(builtIn)) {
     case BuiltInFragCoord:
       usage.fs.fragCoord = true;
+      if (inOutInfo.getInterpMode() == InOutInfo::InterpLocSample)
+        usage.fs.fragCoordIsSample = true;
       break;
     case BuiltInFrontFacing:
       usage.fs.frontFacing = true;
@@ -1805,6 +1723,9 @@ void BuilderImpl::markBuiltInOutputUsage(BuiltInKind builtIn, unsigned arraySize
     case BuiltInPrimitiveShadingRate:
       usage.vs.primitiveShadingRate = true;
       break;
+    case BuiltInEdgeFlag:
+      usage.vs.edgeFlag = true;
+      break;
     default:
       break;
     }
@@ -1892,9 +1813,6 @@ void BuilderImpl::markBuiltInOutputUsage(BuiltInKind builtIn, unsigned arraySize
     default:
       break;
     }
-    // Collect raster stream ID for the export of built-ins
-    if (streamId != InvalidValue)
-      getPipelineState()->getShaderResourceUsage(m_shaderStage)->inOutUsage.gs.rasterStream = streamId;
     break;
   }
 
@@ -1967,6 +1885,7 @@ unsigned BuilderImpl::getBuiltInValidMask(BuiltInKind builtIn, bool isOutput) {
     C = shaderStageToMask(ShaderStageCompute),
     D = shaderStageToMask(ShaderStageTessEval),
     H = shaderStageToMask(ShaderStageTessControl),
+    G = shaderStageToMask(ShaderStageGeometry),
     HD = shaderStageToMask(ShaderStageTessControl, ShaderStageTessEval),
     HDG = shaderStageToMask(ShaderStageTessControl, ShaderStageTessEval, ShaderStageGeometry),
     HDGP = shaderStageToMask(ShaderStageTessControl, ShaderStageTessEval, ShaderStageGeometry, ShaderStageFragment),

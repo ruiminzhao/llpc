@@ -38,6 +38,8 @@
 #include "lgc/CommonDefs.h"
 #include "lgc/Pipeline.h"
 #include "lgc/state/AbiMetadata.h"
+#include "lgc/state/IntrinsDefs.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
 #include <map>
 
@@ -70,15 +72,6 @@ struct VsEntryRegInfo {
   unsigned instanceId;        // VGPR for instance ID
   unsigned vgprCount;         // Total VGPRs at wave dispatch (exact)
   bool wave32;                // Whether VS is wave32
-};
-
-// =====================================================================================================================
-// Struct with the information for one color export
-struct ColorExportInfo {
-  unsigned hwColorTarget;
-  unsigned location;
-  bool isSigned;
-  llvm::Type *ty;
 };
 
 // =====================================================================================================================
@@ -155,6 +148,9 @@ public:
   // Store the color export info in the PAL metadata
   void addColorExportInfo(llvm::ArrayRef<ColorExportInfo> exports);
 
+  // Set discard state in the metadata for explicitly building color export shader.
+  void setDiscardState(bool enable);
+
   // Get the count of vertex fetches for a fetchless vertex shader with shader compilation (or 0 otherwise).
   unsigned getColorExportCount();
 
@@ -168,7 +164,10 @@ public:
   void finalizePipeline(bool isWholePipeline);
 
   // Updates the PS register information that depends on the exports.
-  void updateSpiShaderColFormat(llvm::ArrayRef<ColorExportInfo> exps, bool hasDepthExpFmtZero, bool killEnabled);
+  void updateSpiShaderColFormat(llvm::ArrayRef<ExportFormat> expFormats);
+
+  // Updates the CB shader mask information that depends on the exports.
+  void updateCbShaderMask(llvm::ArrayRef<ColorExportInfo> exps);
 
   // Sets the finalized 128-bit cache hash.  The version identifies the version of LLPC used to generate the hash.
   void setFinalized128BitCacheHash(const lgc::Hash128 &finalizedCacheHash, const llvm::VersionTuple &version);
@@ -252,11 +251,12 @@ private:
   static constexpr uint64_t MAX_SPILL_THRESHOLD = UINT_MAX;
 
   unsigned getUserDataCount(unsigned callingConv);
-  unsigned getCallingConventionForFirstHardwareShaderStage();
+  unsigned getCallingConventionForFirstHardwareShaderStage(std::string &hwStageName);
   unsigned getFirstUserDataReg(unsigned callingConv);
   unsigned getNumberOfSgprsBeforeUserData(unsigned conv);
   unsigned getOffsetOfUserDataReg(std::map<llvm::msgpack::DocNode, llvm::msgpack::DocNode>::iterator firstUserDataNode,
                                   UserDataMapping userDataMapping);
+  unsigned getOffsetOfUserDataReg(llvm::msgpack::ArrayDocNode &userDataReg, UserDataMapping userDataRegMapping);
   unsigned getNumberOfSgprsAfterUserData(unsigned callingConv);
   unsigned getVertexIdOffset(unsigned callingConv);
   unsigned getInstanceIdOffset(unsigned callingConv);

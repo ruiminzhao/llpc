@@ -134,10 +134,8 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
     processShader();
   }
 
-#if VKI_RAY_TRACING
   // Check ray query LDS stack usage
   checkRayQueryLdsStackUsage(&module);
-#endif
 
   if (pipelineState->isGraphics()) {
     // Set NGG control settings
@@ -404,6 +402,31 @@ bool PatchResourceCollect::canUseNggCulling(Module *module) {
   // Check position value, disable NGG culling if it is constant
   auto posValue = posCall->getArgOperand(posCall->arg_size() - 1); // Last argument is position value
   if (isa<Constant>(posValue))
+    return false;
+
+  // Heuristic detecting very simple calculated position for geometry that will
+  // never be culled, disable NGG culling if there is no position fetch.
+  auto hasPositionFetch = [posCall] {
+    std::list<Instruction *> workList;
+    workList.push_back(posCall);
+    std::unordered_set<Instruction *> visited;
+    while (!workList.empty()) {
+      Instruction *inst = workList.front();
+      workList.pop_front();
+      visited.insert(inst);
+      for (Value *op : inst->operands()) {
+        LoadInst *opLoad = dyn_cast<LoadInst>(op);
+        if (opLoad && opLoad->getPointerAddressSpace() != ADDR_SPACE_CONST)
+          return true;
+        Instruction *opInst = dyn_cast<Instruction>(op);
+        if (opInst && visited.find(opInst) == visited.end())
+          workList.push_back(opInst);
+      }
+    }
+    return false;
+  };
+  bool hasVertexFetch = m_pipelineState->getPalMetadata()->getVertexFetchCount() != 0;
+  if (!hasGs && !hasVertexFetch && !hasPositionFetch())
     return false;
 
   // We can safely enable NGG culling here
@@ -717,7 +740,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         assert(gsInstanceCount == 1);
       }
 
-#if VKI_RAY_TRACING
       // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
       // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
       // restriction by providing the capability of querying thread ID in the group rather than in wave.
@@ -732,7 +754,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         esVertsPerSubgroup = std::min(MaxRayQueryThreadsPerGroup, esVertsPerSubgroup);
         rayQueryLdsStackSize = MaxRayQueryLdsStackEntries * MaxRayQueryThreadsPerGroup;
       }
-#endif
 
       // Make sure that we have at least one primitive.
       gsPrimsPerSubgroup = std::max(1u, gsPrimsPerSubgroup);
@@ -745,9 +766,7 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
       unsigned ldsSizeDwords = alignTo(expectedEsLdsSize + expectedGsLdsSize, ldsSizeDwordGranularity);
 
       unsigned maxHwGsLdsSizeDwords = m_pipelineState->getTargetInfo().getGpuProperty().gsOnChipMaxLdsSize;
-#if VKI_RAY_TRACING
       maxHwGsLdsSizeDwords -= rayQueryLdsStackSize; // Exclude LDS space used as ray query stack
-#endif
 
       // In exceedingly rare circumstances, a NGG subgroup might calculate its LDS space requirements and overallocate.
       // In those cases we need to scale down our esVertsPerSubgroup/gsPrimsPerSubgroup so that they'll fit in LDS.
@@ -794,7 +813,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         else if (gfxIp.isGfx(10, 1))
           esVertsPerSubgroup = std::max(24u, esVertsPerSubgroup);
 
-#if VKI_RAY_TRACING
         // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
         // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
         // restriction by providing the capability of querying thread ID in the group rather than in wave.
@@ -802,7 +820,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
           gsPrimsPerSubgroup = std::min(MaxRayQueryThreadsPerGroup, gsPrimsPerSubgroup);
         if (esResUsage->useRayQueryLdsStack)
           esVertsPerSubgroup = std::min(MaxRayQueryThreadsPerGroup, esVertsPerSubgroup);
-#endif
 
         // And then recalculate our LDS usage.
         expectedEsLdsSize = (esVertsPerSubgroup * esGsRingItemSize) + esExtraLdsSize;
@@ -833,9 +850,7 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
 
       gsResUsage->inOutUsage.gs.calcFactor.primAmpFactor = primAmpFactor;
       gsResUsage->inOutUsage.gs.calcFactor.enableMaxVertOut = enableMaxVertOut;
-#if VKI_RAY_TRACING
       gsResUsage->inOutUsage.gs.calcFactor.rayQueryLdsStackSize = rayQueryLdsStackSize;
-#endif
 
       gsOnChip = true; // In NGG mode, GS is always on-chip since copy shader is not present.
     } else {
@@ -886,7 +901,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
       // Total LDS use per subgroup aligned to the register granularity.
       unsigned gsOnChipLdsSize = alignTo(esGsLdsSize + esGsExtraLdsDwords, ldsSizeDwordGranularity);
 
-#if VKI_RAY_TRACING
       // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
       // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
       // restriction by providing the capability of querying thread ID in the group rather than in wave.
@@ -895,15 +909,12 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
       unsigned rayQueryLdsStackSize = 0;
       if (esResUsage->useRayQueryLdsStack || gsResUsage->useRayQueryLdsStack)
         rayQueryLdsStackSize = MaxRayQueryLdsStackEntries * MaxRayQueryThreadsPerGroup;
-#endif
 
       // Use the client-specified amount of LDS space per subgroup. If they specified zero, they want us to
       // choose a reasonable default. The final amount must be 128-dword aligned.
       // TODO: Accept DefaultLdsSizePerSubgroup from panel setting
       unsigned maxLdsSize = Gfx9::DefaultLdsSizePerSubgroup;
-#if VKI_RAY_TRACING
       maxLdsSize -= rayQueryLdsStackSize; // Exclude LDS space used as ray query stack
-#endif
 
       // If total LDS usage is too big, refactor partitions based on ratio of ES-GS item sizes.
       if (gsOnChipLdsSize > maxLdsSize) {
@@ -994,7 +1005,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
       // beyond ES_VERTS_PER_SUBGRP.
       esVertsPerSubgroup -= (esMinVertsPerSubgroup - 1);
 
-#if VKI_RAY_TRACING
       // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
       // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
       // restriction by providing the capability of querying thread ID in the group rather than in wave.
@@ -1002,15 +1012,12 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         esVertsPerSubgroup = std::min(esVertsPerSubgroup, MaxRayQueryThreadsPerGroup);
       if (gsResUsage->useRayQueryLdsStack)
         gsPrimsPerSubgroup = std::min(gsPrimsPerSubgroup, MaxRayQueryThreadsPerGroup);
-#endif
 
       gsResUsage->inOutUsage.gs.calcFactor.esVertsPerSubgroup = esVertsPerSubgroup;
       gsResUsage->inOutUsage.gs.calcFactor.gsPrimsPerSubgroup = gsPrimsPerSubgroup;
       gsResUsage->inOutUsage.gs.calcFactor.esGsLdsSize = esGsLdsSize;
       gsResUsage->inOutUsage.gs.calcFactor.gsOnChipLdsSize = gsOnChipLdsSize;
-#if VKI_RAY_TRACING
       gsResUsage->inOutUsage.gs.calcFactor.rayQueryLdsStackSize = rayQueryLdsStackSize;
-#endif
 
       gsResUsage->inOutUsage.gs.calcFactor.esGsRingItemSize = esGsRingItemSize;
       gsResUsage->inOutUsage.gs.calcFactor.gsVsRingItemSize = gsOnChip ? gsVsRingItemSizeOnChip : gsVsRingItemSize;
@@ -1037,7 +1044,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
         // Support multiple GS instances
         unsigned gsPrimsNum = Gfx9::GsPrimsOffchipGsOrTess / gsInstanceCount;
 
-#if VKI_RAY_TRACING
         // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
         // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
         // restriction by providing the capability of querying thread ID in the group rather than in wave.
@@ -1045,7 +1051,6 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
           esVertsNum = std::min(esVertsNum, MaxRayQueryThreadsPerGroup);
         if (gsResUsage->useRayQueryLdsStack)
           gsPrimsNum = std::min(gsPrimsNum, MaxRayQueryThreadsPerGroup);
-#endif
 
         gsResUsage->inOutUsage.gs.calcFactor.esVertsPerSubgroup = esVertsNum;
         gsResUsage->inOutUsage.gs.calcFactor.gsPrimsPerSubgroup = gsPrimsNum;
@@ -1089,13 +1094,11 @@ bool PatchResourceCollect::checkGsOnChipValidity() {
   }
 
   if (gsOnChip || m_pipelineState->getTargetInfo().getGfxIpVersion().major >= 9) {
-#if VKI_RAY_TRACING
     if (gsResUsage->inOutUsage.gs.calcFactor.rayQueryLdsStackSize > 0) {
       LLPC_OUTS("Ray query LDS stack size (in dwords): "
                 << gsResUsage->inOutUsage.gs.calcFactor.rayQueryLdsStackSize
                 << " (start = " << gsResUsage->inOutUsage.gs.calcFactor.gsOnChipLdsSize << ")\n\n");
     }
-#endif
 
     if (meshPipeline) {
       LLPC_OUTS("GS primitive amplification factor: " << gsResUsage->inOutUsage.gs.calcFactor.primAmpFactor << "\n");
@@ -1239,7 +1242,6 @@ bool PatchResourceCollect::isVertexReuseDisabled() {
   return disableVertexReuse;
 }
 
-#if VKI_RAY_TRACING
 // =====================================================================================================================
 // Check if ray query LDS stack usage.
 //
@@ -1260,7 +1262,6 @@ void PatchResourceCollect::checkRayQueryLdsStackUsage(Module *module) {
     }
   }
 }
-#endif
 
 // =====================================================================================================================
 // Visits "call" instruction.
@@ -1302,9 +1303,9 @@ void PatchResourceCollect::visitCallInst(CallInst &callInst) {
     m_importedOutputBuiltIns.insert(builtInId);
   } else if (mangledName.startswith(lgcName::OutputExportGeneric)) {
     auto outputValue = callInst.getArgOperand(callInst.arg_size() - 1);
-    if (m_shaderStage != ShaderStageFragment && isa<UndefValue>(outputValue)) {
-      // NOTE: If an output value of vertex processing stages is undefined, we can safely drop it and remove the output
-      // export call.
+    if (m_shaderStage != ShaderStageFragment && (isa<UndefValue>(outputValue) || isa<PoisonValue>(outputValue))) {
+      // NOTE: If an output value of vertex processing stages is unspecified, we can safely drop it and remove the
+      // output export call.
       m_deadCalls.push_back(&callInst);
 
       if (m_pipelineState->getNextShaderStage(m_shaderStage) != ShaderStageInvalid) {
@@ -1346,11 +1347,11 @@ void PatchResourceCollect::visitCallInst(CallInst &callInst) {
       m_outputCalls.push_back(&callInst);
     }
   } else if (mangledName.startswith(lgcName::OutputExportBuiltIn)) {
-    // NOTE: If an output value is undefined, we can safely drop it and remove the output export call.
+    // NOTE: If an output value is unspecified, we can safely drop it and remove the output export call.
     // Currently, do this for geometry shader.
     if (m_shaderStage == ShaderStageGeometry) {
       auto outputValue = callInst.getArgOperand(callInst.arg_size() - 1);
-      if (isa<UndefValue>(outputValue))
+      if (isa<UndefValue>(outputValue) || isa<PoisonValue>(outputValue))
         m_deadCalls.push_back(&callInst);
       else {
         unsigned builtInId = cast<ConstantInt>(callInst.getOperand(0))->getZExtValue();
@@ -1359,8 +1360,8 @@ void PatchResourceCollect::visitCallInst(CallInst &callInst) {
     }
   } else if (mangledName.startswith(lgcName::OutputExportXfb)) {
     auto outputValue = callInst.getArgOperand(callInst.arg_size() - 1);
-    if (isa<UndefValue>(outputValue)) {
-      // NOTE: If an output value is undefined, we can safely drop it and remove the transform feedback export call.
+    if (isa<UndefValue>(outputValue) || isa<PoisonValue>(outputValue)) {
+      // NOTE: If an output value is unspecified, we can safely drop it and remove the transform feedback export call.
       m_deadCalls.push_back(&callInst);
     } else if (m_pipelineState->enableSwXfb()) {
       // Collect transform feedback export calls, used in SW-emulated stream-out. For GS, the collecting will
@@ -2571,8 +2572,8 @@ void PatchResourceCollect::mapBuiltInToGenericInOut() {
     const unsigned loc = builtInMap.second;
 
     if (m_shaderStage == ShaderStageGeometry) {
-      LLPC_OUTS("(" << getShaderStageAbbreviation(m_shaderStage) << ") Output: stream = " << inOutUsage.gs.rasterStream
-                    << " , "
+      LLPC_OUTS("(" << getShaderStageAbbreviation(m_shaderStage)
+                    << ") Output: stream = " << m_pipelineState->getRasterizerState().rasterStream << " , "
                     << "builtin = " << PipelineState::getBuiltInName(builtInId) << "  =>  Mapped = " << loc << "\n");
     } else {
       LLPC_OUTS("(" << getShaderStageAbbreviation(m_shaderStage) << ") Output: builtin = "
@@ -2651,7 +2652,7 @@ void PatchResourceCollect::mapGsBuiltInOutput(unsigned builtInId, unsigned elemC
   assert(m_shaderStage == ShaderStageGeometry);
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
   auto &inOutUsage = resUsage->inOutUsage.gs;
-  unsigned streamId = inOutUsage.rasterStream;
+  unsigned streamId = m_pipelineState->getRasterizerState().rasterStream;
 
   resUsage->inOutUsage.builtInOutputLocMap[builtInId] = inOutUsage.outLocCount[streamId]++;
 
@@ -3038,6 +3039,8 @@ void PatchResourceCollect::updateOutputLocInfoMapWithPack() {
     outputLocInfoMap = nextStageInputLocInfoMap;
   } else {
     // For {VS, TES, GS}-FS, the dead output is neither a XFB output or a corresponding FS' input.
+    assert(nextStage == ShaderStageFragment);
+
     // Collect XFB locations
     auto &xfbOutLocInfoMap = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage.locInfoXfbOutInfoMap;
     std::set<unsigned> xfbOutputLocs[MaxGsStreams];
@@ -3049,17 +3052,18 @@ void PatchResourceCollect::updateOutputLocInfoMapWithPack() {
     // Store the output calls that have no corresponding input in FS
     std::vector<CallInst *> noMappedCalls;
     for (auto call : m_outputCalls) {
+      // NOTE: Don't set stream ID to the original output location info for GS. This is because the corresponding input
+      // location info of FS doesn't have stream ID. This will cause in-out mismatch.
       InOutLocationInfo origLocInfo;
       origLocInfo.setLocation(cast<ConstantInt>(call->getOperand(0))->getZExtValue());
       origLocInfo.setComponent(cast<ConstantInt>(call->getOperand(1))->getZExtValue());
-      unsigned streamId = 0;
-      if (m_shaderStage == ShaderStageGeometry) {
-        streamId = cast<ConstantInt>(call->getOperand(2))->getZExtValue();
-        origLocInfo.setStreamId(streamId);
-      }
+
       const unsigned origLocation = origLocInfo.getLocation();
       const bool hasNoMappedInput = (nextStageInputLocInfoMap.find(origLocInfo) == nextStageInputLocInfoMap.end());
       if (hasNoMappedInput) {
+        const unsigned streamId =
+            m_shaderStage == ShaderStageGeometry ? cast<ConstantInt>(call->getOperand(2))->getZExtValue() : 0;
+
         if (xfbOutputLocs[streamId].count(origLocation) == 0)
           m_deadCalls.push_back(call);
         else
@@ -3080,7 +3084,21 @@ void PatchResourceCollect::updateOutputLocInfoMapWithPack() {
     m_locationInfoMapManager->createMap(outLocInfos, m_shaderStage);
     const auto &calcOutLocInfoMap = m_locationInfoMapManager->getMap();
 
-    outputLocInfoMap = nextStageInputLocInfoMap;
+    if (m_shaderStage == ShaderStageGeometry) {
+      // NOTE: The output location info from next shader stage (FS) doesn't contain raster stream ID. We have to
+      // reconstruct it.
+      const auto rasterStream = m_pipelineState->getRasterizerState().rasterStream;
+      for (auto &entry : nextStageInputLocInfoMap) {
+        InOutLocationInfo origLocInfo(entry.first);
+        origLocInfo.setStreamId(rasterStream);
+        InOutLocationInfo newLocInfo(entry.second);
+        newLocInfo.setStreamId(rasterStream);
+        outputLocInfoMap.insert({origLocInfo, newLocInfo});
+      }
+    } else {
+      outputLocInfoMap = nextStageInputLocInfoMap;
+    }
+
     unsigned newLocMax = 0;
     for (const auto &entry : outputLocInfoMap)
       newLocMax = std::max(newLocMax, entry.second.getLocation() + 1);
@@ -3210,7 +3228,7 @@ void PatchResourceCollect::reassembleOutputExportCalls() {
       outValue = builder.CreateBitCast(outValue, builder.getFloatTy());
     } else {
       // Output a vector
-      outValue = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), compCount));
+      outValue = PoisonValue::get(FixedVectorType::get(builder.getFloatTy(), compCount));
       for (unsigned vectorComp = 0, elemIdx = baseElementIdx; vectorComp < compCount; vectorComp += 1, elemIdx += 2) {
         assert(elemIdx < MaxNumElems);
         Value *component = elementsInfo.elements[elemIdx];

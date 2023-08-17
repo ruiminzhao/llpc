@@ -33,6 +33,7 @@
 #include "llpcCompiler.h"
 #include "llpcDebug.h"
 #include "llpcUtil.h"
+#include "vkgcGpurtShim.h"
 #include "vkgcPipelineDumper.h"
 #include "lgc/Builder.h"
 #include "lgc/LgcContext.h"
@@ -139,18 +140,8 @@ namespace Llpc {
 // @param gfxIp : Graphics IP version info
 // @param pipelineHash : Pipeline hash code
 // @param cacheHash : Cache hash code
-PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash
-#if VKI_RAY_TRACING
-                                 ,
-                                 const Vkgc::RtState *rtState
-#endif
-                                 )
-    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash)
-#if VKI_RAY_TRACING
-      ,
-      m_rtState(rtState)
-#endif
-{
+PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash)
+    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash) {
 }
 
 // =====================================================================================================================
@@ -202,7 +193,6 @@ ShaderHash PipelineContext::getShaderHashCode(const PipelineShaderInfo &shaderIn
   return hash;
 }
 
-#if VKI_RAY_TRACING
 // =====================================================================================================================
 // Return ray tracing/ray query entry function names
 //
@@ -211,9 +201,40 @@ ShaderHash PipelineContext::getShaderHashCode(const PipelineShaderInfo &shaderIn
 // @param funcType : function type
 StringRef PipelineContext::getRayTracingFunctionName(unsigned funcType) {
   assert(funcType < Vkgc::RT_ENTRY_FUNC_COUNT);
-  return getRayTracingState()->gpurtFuncTable.pFunc[funcType];
+  return m_rtState.gpurtFuncTable.pFunc[funcType];
 }
+
+// =====================================================================================================================
+// Set the raytracing state
+//
+// @param rtState : the raytracing state configured by the driver
+// @param shaderLibrary : [interface major version < 62 only] the GPURT shader library passed in by the driver via
+//                        the old interface
+void PipelineContext::setRayTracingState(const Vkgc::RtState &rtState, const Vkgc::BinaryData *shaderLibrary) {
+  m_rtState = rtState;
+
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 62
+  assert(!shaderLibrary);
+#else
+  assert(shaderLibrary);
+  if (!m_rtState.gpurtOverride && shaderLibrary->pCode) {
+    m_rtState.gpurtOverride = true;
+    m_rtState.rtIpOverride = true;
+    m_rtState.gpurtShaderLibrary = *shaderLibrary;
+  }
 #endif
+
+#if HAVE_GPURT_SHIM
+  if (!m_rtState.rtIpOverride)
+    m_rtState.rtIpVersion = Vkgc::gpurt::getRtIpVersion(m_gfxIp);
+
+  if (m_rtState.rtIpVersion.major != 0 && !m_rtState.gpurtOverride) {
+    gpurt::getShaderLibrarySpirv(m_rtState.gpurtFeatureFlags, m_rtState.gpurtShaderLibrary.pCode,
+                                 m_rtState.gpurtShaderLibrary.codeSize);
+    gpurt::getFuncTable(m_rtState.rtIpVersion, m_rtState.gpurtFuncTable);
+  }
+#endif
+}
 
 // =====================================================================================================================
 // Set pipeline state in Pipeline object for middle-end and/or calculate the hash for the state to be added.
@@ -237,10 +258,9 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
   // Give the shader stage mask to the middle-end. We need to translate the Vkgc::ShaderStage bit numbers
   // to lgc::ShaderStage bit numbers. We only process native shader stages, ignoring the CopyShader stage.
   unsigned stageMask = getShaderStageMask();
-#if VKI_RAY_TRACING
   if (hasRayTracingShaderStage(stageMask))
     stageMask = ShaderStageComputeBit;
-#endif
+
   // Give the user data nodes to the middle-end, and/or hash them.
   setUserDataInPipeline(pipeline, hasher, stageMask);
 
@@ -312,18 +332,15 @@ Options PipelineContext::computePipelineOptions() const {
 
   options.allowNullDescriptor = getPipelineOptions()->extendedRobustness.nullDescriptor;
   options.disableImageResourceCheck = getPipelineOptions()->disableImageResourceCheck;
-#if VKI_BUILD_GFX11
   options.optimizeTessFactor = getPipelineOptions()->optimizeTessFactor;
-#endif
   options.enableInterpModePatch = getPipelineOptions()->enableInterpModePatch;
   options.pageMigrationEnabled = getPipelineOptions()->pageMigrationEnabled;
   options.resourceLayoutScheme = static_cast<lgc::ResourceLayoutScheme>(getPipelineOptions()->resourceLayoutScheme);
 
   // Driver report full subgroup lanes for compute shader, here we just set fullSubgroups as default options
   options.fullSubgroups = true;
-#if VKI_RAY_TRACING
   options.internalRtShaders = getPipelineOptions()->internalRtShaders;
-#endif
+
   return options;
 }
 
@@ -405,6 +422,7 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
     destNode.sizeInDwords = node.sizeInDwords;
     destNode.offsetInDwords = node.offsetInDwords;
     destNode.abstractType = ResourceNodeType::Unknown;
+    destNode.visibility = 0;
 
     switch (node.type) {
     case ResourceMappingNodeType::DescriptorTableVaPtr: {
@@ -471,6 +489,10 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
         destNode.concreteType = ResourceNodeType::DescriptorBufferCompact;
       else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorConstBuffer)
         destNode.concreteType = ResourceNodeType::DescriptorBuffer;
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 63
+      else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorAtomicCounter)
+        destNode.concreteType = ResourceNodeType::DescriptorBuffer;
+#endif
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 61
       else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorMutable)
         destNode.concreteType = ResourceNodeType::DescriptorMutable;
@@ -478,7 +500,12 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
       else
         destNode.concreteType = static_cast<ResourceNodeType>(node.type);
 
-      destNode.set = node.srdRange.set;
+      if (getPipelineOptions()->replaceSetWithResourceType && node.srdRange.set == 0) {
+        // Special value InternalDescriptorSetId(-1) will be passed in for internal usage
+        destNode.set = getGlResourceNodeSetFromType(node.type);
+      } else {
+        destNode.set = node.srdRange.set;
+      }
       destNode.binding = node.srdRange.binding;
       destNode.abstractType = destNode.concreteType;
       destNode.immutableValue = nullptr;
@@ -622,7 +649,7 @@ ShaderOptions PipelineContext::computeShaderOptions(const PipelineShaderInfo &sh
     // size for a shader that uses gl_SubgroupSize.
     shaderOptions.subgroupSize = SubgroupSize;
   }
-#if VKI_RAY_TRACING
+
   // NOTE: WaveSize of raytracing usually be 32
   bool useRayTracingWaveSize = false;
   if (getPipelineType() == PipelineType::RayTracing) {
@@ -634,7 +661,6 @@ ShaderOptions PipelineContext::computeShaderOptions(const PipelineShaderInfo &sh
   }
   if (useRayTracingWaveSize)
     shaderOptions.waveSize = getRayTracingWaveSize();
-#endif
 
   // Use a static cast from Vkgc WaveBreakSize to LGC WaveBreak, and static assert that
   // that is valid.
@@ -658,7 +684,6 @@ ShaderOptions PipelineContext::computeShaderOptions(const PipelineShaderInfo &sh
   shaderOptions.useSiScheduler = EnableSiScheduler || shaderInfo.options.useSiScheduler;
   shaderOptions.disableCodeSinking = shaderInfo.options.disableCodeSinking;
   shaderOptions.favorLatencyHiding = shaderInfo.options.favorLatencyHiding;
-  shaderOptions.updateDescInElf = shaderInfo.options.updateDescInElf;
   shaderOptions.unrollThreshold = shaderInfo.options.unrollThreshold;
   // A non-zero command line -force-loop-unroll-count value overrides the shaderInfo option value.
   shaderOptions.forceLoopUnrollCount =
@@ -717,7 +742,6 @@ ShaderOptions PipelineContext::computeShaderOptions(const PipelineShaderInfo &sh
   return shaderOptions;
 }
 
-#if VKI_RAY_TRACING
 // =====================================================================================================================
 // Get wave size used for raytracing
 unsigned PipelineContext::getRayTracingWaveSize() const {
@@ -725,8 +749,6 @@ unsigned PipelineContext::getRayTracingWaveSize() const {
     return 32;
   return 64;
 }
-
-#endif
 
 // =====================================================================================================================
 // Map a VkFormat to a {BufDataFormat, BufNumFormat}. Returns BufDataFormatInvalid if the
@@ -1012,6 +1034,47 @@ std::pair<BufDataFormat, BufNumFormat> PipelineContext::mapVkFormat(VkFormat for
     }
   }
   return {dfmt, nfmt};
+}
+
+// =====================================================================================================================
+// Convert Resource node type to set for OGL
+uint32_t PipelineContext::getGlResourceNodeSetFromType(Vkgc::ResourceMappingNodeType resourceType) {
+  GlResourceMappingSet resourceSet = GlResourceMappingSet::Unknown;
+
+  switch (resourceType) {
+  case ResourceMappingNodeType::DescriptorConstBuffer:
+  case ResourceMappingNodeType::InlineBuffer:
+    resourceSet = GlResourceMappingSet::DescriptorConstBuffer;
+    break;
+  case ResourceMappingNodeType::DescriptorBuffer:
+    resourceSet = GlResourceMappingSet::DescriptorBuffer;
+    break;
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 63
+  case ResourceMappingNodeType::DescriptorAtomicCounter:
+    resourceSet = GlResourceMappingSet::DescriptorAtomicCounter;
+    break;
+#endif
+  case ResourceMappingNodeType::DescriptorImage:
+  case ResourceMappingNodeType::DescriptorTexelBuffer:
+    resourceSet = GlResourceMappingSet::DescriptorImage;
+    break;
+  case ResourceMappingNodeType::DescriptorResource:
+  case ResourceMappingNodeType::DescriptorCombinedTexture:
+  case ResourceMappingNodeType::DescriptorConstTexelBuffer:
+    resourceSet = GlResourceMappingSet::DescriptorResource;
+    break;
+  case ResourceMappingNodeType::DescriptorSampler:
+    resourceSet = GlResourceMappingSet::DescriptorSampler;
+    break;
+  case ResourceMappingNodeType::DescriptorFmask:
+    resourceSet = GlResourceMappingSet::DescriptorFmask;
+    break;
+  default:
+    assert("Not supported resource type.");
+    break;
+  }
+
+  return static_cast<uint32_t>(resourceSet);
 }
 
 } // namespace Llpc

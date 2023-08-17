@@ -132,9 +132,7 @@ cl::opt<bool> ValidateSpirv("validate-spirv", cl::desc("Validate input SPIR-V bi
 cl::opt<bool> IgnoreColorAttachmentFormats("ignore-color-attachment-formats",
                                            cl::desc("Ignore color attachment formats"), cl::init(false));
 
-#if VKI_RAY_TRACING
 cl::opt<unsigned> BvhNodeStride("bvh-node-stride", cl::desc("Ray tracing BVH node stride"), cl::init(64u));
-#endif
 
 // -num-threads: number of CPU threads to use when compiling the inputs
 cl::opt<unsigned> NumThreads("num-threads",
@@ -323,12 +321,19 @@ cl::opt<ResourceLayoutScheme> LayoutScheme("resource-layout-scheme", cl::desc("T
 cl::opt<bool> AssertToMsgBox("assert-to-msgbox", cl::desc("Pop message box when assert is hit"));
 #endif
 
-#if VKI_RAY_TRACING
 // -enable-internal-rt-shaders: enable intrinsics for internal RT shaders
 cl::opt<bool> EnableInternalRtShaders("enable-internal-rt-shaders",
                                       cl::desc("Enable intrinsics for internal RT shaders"),
                                       cl::init(false));
-#endif
+
+cl::opt<bool> GpuRtUseDumped("gpurt-use-dumped", cl::desc("Use the GPURT shader library that was dumped with the pipeline dump (may fail due to incompatibility)"));
+
+cl::opt<std::string> GpuRtLibrary("gpurt-library", cl::desc("Use the GPURT shader library from the given file"));
+
+// -enable-color-export-shader
+cl::opt<bool> EnableColorExportShader("enable-color-export-shader",
+                                      cl::desc("Enable color export shader, only compile each stage of the pipeline without linking"),
+                                      cl::init(false));
 
 } // namespace
 // clang-format on
@@ -514,18 +519,15 @@ static Result init(int argc, char *argv[], ICompiler *&compiler) {
 // Performs per-pipeline initialization work for LLPC standalone tool.
 //
 // @param [out] compileInfo : Compilation info of LLPC standalone tool
-// @returns : Result::Success on success, other status codes on failure
-static Result initCompileInfo(CompileInfo *compileInfo) {
+static void initCompileInfo(CompileInfo *compileInfo) {
   compileInfo->gfxIp = ParsedGfxIp;
   compileInfo->relocatableShaderElf = EnableRelocatableShaderElf;
-  compileInfo->autoLayoutDesc = AutoLayoutDesc;
   compileInfo->robustBufferAccess = RobustBufferAccess;
   compileInfo->scalarBlockLayout = ScalarBlockLayout;
   compileInfo->scratchAccessBoundsChecks = EnableScratchAccessBoundsChecks;
   compileInfo->enableImplicitInvariantExports = EnableImplicitInvariantExports;
-#if VKI_RAY_TRACING
   compileInfo->bvhNodeStride = BvhNodeStride;
-#endif
+  compileInfo->enableColorExportShader = EnableColorExportShader;
 
   if (LlpcOptLevel.getPosition() != 0) {
     compileInfo->optimizationLevel = LlpcOptLevel;
@@ -544,10 +546,8 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
 
   compileInfo->compPipelineInfo.options.forceNonUniformResourceIndexStageMask = ForceNonUniformResourceIndexStageMask;
   compileInfo->gfxPipelineInfo.options.forceNonUniformResourceIndexStageMask = ForceNonUniformResourceIndexStageMask;
-#if VKI_RAY_TRACING
   compileInfo->rayTracePipelineInfo.options.forceNonUniformResourceIndexStageMask =
       ForceNonUniformResourceIndexStageMask;
-#endif
 
   // Set NGG control settings
   if (ParsedGfxIp.major >= 10) {
@@ -570,11 +570,55 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
     nggState.vertsPerSubgroup = NggVertsPerSubgroup;
   }
 
-#if VKI_RAY_TRACING
   compileInfo->internalRtShaders = EnableInternalRtShaders;
-#endif
+}
 
-  return Result::Success;
+static Error fixupRtState(RtState &rtState, std::vector<char> &shaderLibraryStorage) {
+  if (rtState.gpurtOverride || rtState.rtIpOverride) {
+    // Trying to compile a .pipe file that was dumped from a driver with an explicit shader library override setting
+    // may have unexpected results. Complain loudly to make sure the user knows what they're doing.
+    if (!GpuRtUseDumped.getNumOccurrences() && GpuRtLibrary.empty()) {
+      return createResultError(Result::ErrorInvalidValue,
+                               "The .pipe file explicitly sets gpurtOverride and/or rtIpOverride to true. You must "
+                               "explicitly choose -gpurt-use-dumped=true/false.");
+    }
+
+    if (!GpuRtUseDumped) {
+      rtState.gpurtOverride = false;
+      rtState.rtIpOverride = false;
+    }
+  }
+
+  if (GpuRtUseDumped)
+    rtState.gpurtOverride = true;
+  else
+    rtState.gpurtShaderLibrary = {};
+
+  if (!GpuRtLibrary.empty()) {
+    if (GpuRtUseDumped)
+      return createResultError(Result::ErrorInvalidValue, "Cannot use both -gpurt-use-dumped and -gpurt-library");
+
+    FILE *gpurtFile = fopen(GpuRtLibrary.c_str(), "rb");
+    if (!gpurtFile)
+      return createResultError(Result::ErrorUnavailable, Twine("Failed to open input file: ") + GpuRtLibrary);
+    auto closeInput = make_scope_exit([gpurtFile] { fclose(gpurtFile); });
+
+    fseek(gpurtFile, 0, SEEK_END);
+    shaderLibraryStorage.resize(ftell(gpurtFile));
+    fseek(gpurtFile, 0, SEEK_SET);
+    size_t nread = fread(shaderLibraryStorage.data(), 1, shaderLibraryStorage.size(), gpurtFile);
+
+    if (nread != shaderLibraryStorage.size()) {
+      // cppcheck-suppress resourceLeak; gpurtFile is closed via the make_scope_exit.
+      return createResultError(Result::ErrorInvalidValue, Twine("Error reading: ") + GpuRtLibrary);
+    }
+
+    rtState.gpurtOverride = true;
+    rtState.gpurtShaderLibrary.pCode = shaderLibraryStorage.data();
+    rtState.gpurtShaderLibrary.codeSize = shaderLibraryStorage.size();
+  }
+
+  return Error::success();
 }
 
 // =====================================================================================================================
@@ -591,24 +635,44 @@ static Error processInputs(ICompiler *compiler, InputSpecGroup &inputSpecs) {
 
   // Clean code that gets run automatically before returning.
   auto onExit = make_scope_exit([&compileInfo] { cleanupCompileInfo(&compileInfo); });
-  Result result = initCompileInfo(&compileInfo);
-  if (result != Result::Success)
-    return createResultError(result);
+  initCompileInfo(&compileInfo);
 
   const InputSpec &firstInput = inputSpecs.front();
   if (isPipelineInfoFile(firstInput.filename)) {
+    compileInfo.autoLayoutDesc = false;
     if (Error err = processInputPipeline(compiler, compileInfo, firstInput, Unlinked, IgnoreColorAttachmentFormats))
       return err;
   } else {
+    compileInfo.autoLayoutDesc = true;
     if (Error err = processInputStages(compileInfo, inputSpecs, ValidateSpirv, NumThreads))
       return err;
+
     compileInfo.pipelineType =
         isComputePipeline(compileInfo.stageMask) ? VfxPipelineTypeCompute : VfxPipelineTypeGraphics;
-#if VKI_RAY_TRACING
+
     if (isRayTracingPipeline(compileInfo.stageMask))
       compileInfo.pipelineType = VfxPipelineTypeRayTracing;
-#endif
   }
+
+  if (AutoLayoutDesc.getNumOccurrences())
+    compileInfo.autoLayoutDesc = AutoLayoutDesc;
+
+  RtState *rtState = nullptr;
+  switch (compileInfo.pipelineType) {
+  case VfxPipelineTypeGraphics:
+    rtState = &compileInfo.gfxPipelineInfo.rtState;
+    break;
+  case VfxPipelineTypeCompute:
+    rtState = &compileInfo.compPipelineInfo.rtState;
+    break;
+  case VfxPipelineTypeRayTracing:
+    rtState = &compileInfo.rayTracePipelineInfo.rtState;
+    break;
+  }
+
+  std::vector<char> gpurtShaderLibraryStorage;
+  if (Error err = fixupRtState(*rtState, gpurtShaderLibraryStorage))
+    return err;
 
   //
   // Build shader modules

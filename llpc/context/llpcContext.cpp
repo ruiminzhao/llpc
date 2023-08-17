@@ -30,6 +30,8 @@
  */
 #include "llpcContext.h"
 #include "SPIRVInternal.h"
+#include "lgccps/LgcCpsDialect.h"
+#include "lgcrt/LgcRtDialect.h"
 #include "llpcCompiler.h"
 #include "llpcDebug.h"
 #include "llpcPipelineContext.h"
@@ -37,6 +39,7 @@
 #include "llpcShaderCacheManager.h"
 #include "vkgcMetroHash.h"
 #include "lgc/Builder.h"
+#include "lgc/GpurtDialect.h"
 #include "lgc/LgcContext.h"
 #include "lgc/LgcDialect.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -57,6 +60,7 @@
 #define DEBUG_TYPE "llpc-context"
 
 using namespace lgc;
+using namespace lgc::rt;
 using namespace llvm;
 
 namespace Llpc {
@@ -65,8 +69,7 @@ namespace Llpc {
 //
 // @param gfxIp : Graphics IP version info
 Context::Context(GfxIpVersion gfxIp) : LLVMContext(), m_gfxIp(gfxIp) {
-  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect>(*this);
-
+  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect, GpurtDialect, LgcRtDialect>(*this);
   reset();
 }
 
@@ -148,7 +151,10 @@ std::unique_ptr<Module> Context::loadLibrary(const BinaryData *lib) {
 void Context::setModuleTargetMachine(Module *module) {
   TargetMachine *targetMachine = getLgcContext()->getTargetMachine();
   module->setTargetTriple(targetMachine->getTargetTriple().getTriple());
-  module->setDataLayout(targetMachine->createDataLayout());
+  std::string dataLayoutStr = targetMachine->createDataLayout().getStringRepresentation();
+  // continuation stack address space.
+  dataLayoutStr = dataLayoutStr + "-p" + std::to_string(cps::stackAddrSpace) + ":32:32";
+  module->setDataLayout(dataLayoutStr);
 }
 
 } // namespace Llpc
