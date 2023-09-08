@@ -207,6 +207,14 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
   // Lower SPIR-V global variables, inputs, and outputs
   passMgr.addPass(SpirvLowerGlobal());
 
+  // Lower SPIR-V ray tracing related stuff, including entry point generation, lgc.rt dialect handling, some of
+  // lgc.gpurt dialect handling.
+  // And do inlining after SpirvLowerRayTracing as it will produce some extra functions.
+  if (rayTracing) {
+    passMgr.addPass(SpirvLowerRayTracing());
+    passMgr.addPass(AlwaysInlinerPass());
+  }
+
   // Lower SPIR-V constant immediate store.
   passMgr.addPass(SpirvLowerConstImmediateStore());
 
@@ -225,8 +233,15 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
   // New version of the code (also handles unknown version, which we treat as latest)
   passMgr.addPass(createModuleToFunctionPassAdaptor(SROAPass(SROAOptions::ModifyCFG)));
 #endif
+
+  // Lower SPIR-V precision / adjust fast math flags.
+  // Must be done before instruction combining pass to prevent incorrect contractions.
+  // Should be after SROA to avoid having to track values through memory load/store.
+  passMgr.addPass(SpirvLowerMathPrecision());
+
   passMgr.addPass(GlobalOptPass());
   passMgr.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
+
 #if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 452298
   // Old version of the code
   unsigned instCombineOpt = 2;
@@ -244,16 +259,10 @@ void SpirvLower::addPasses(Context *context, ShaderStage stage, lgc::PassManager
   // Lower SPIR-V instruction metadata remove
   passMgr.addPass(SpirvLowerInstMetaRemove());
 
-  // Lower SPIR-V ray tracing related stuff, including entry point generation, lgc.rt dialect handling, some of
-  // lgc.gpurt dialect handling.
-  // And do inlining after SpirvLowerRayTracing as it will produce some extra functions.
-  if (rayTracing) {
-    passMgr.addPass(SpirvLowerRayTracing());
-    passMgr.addPass(AlwaysInlinerPass());
-  }
-
-  if (rayTracing || rayQuery)
+  if (rayTracing || rayQuery) {
     passMgr.addPass(LowerGpuRt());
+    passMgr.addPass(createModuleToFunctionPassAdaptor(InstCombinePass(instCombineOpt)));
+  }
 
   // Stop timer for lowering passes.
   if (lowerTimer)

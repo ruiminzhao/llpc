@@ -402,11 +402,6 @@ Result VKAPI_CALL ICompiler::Create(GfxIpVersion gfxIp, unsigned optionCount, co
     SOptionHash = optionHash;
     *ppCompiler = new Compiler(gfxIp, optionCount, options, SOptionHash, cache);
     assert(*ppCompiler);
-
-    if (EnableOuts()) {
-      // LLPC_OUTS is enabled. Ensure it is enabled in LGC (the middle-end) too.
-      LgcContext::setLlpcOuts(&outs());
-    }
   } else {
     *ppCompiler = nullptr;
     result = Result::ErrorInvalidValue;
@@ -1978,9 +1973,9 @@ std::unique_ptr<Module> Compiler::createGpurtShaderLibrary(Context *context) {
   shaderInfo.pEntryTarget = Vkgc::getEntryPointNameFromSpirvBinary(&rtState->gpurtShaderLibrary);
   shaderInfo.pModuleData = &moduleData;
 
-  // Disable fast math Contract when there is no hardware intersectRay
+  // Disable fast math contract on OpDot when there is no hardware intersectRay
   bool hwIntersectRay = rtState->bvhResDesc.dataSizeInDwords > 0;
-  shaderInfo.options.noContract = !hwIntersectRay;
+  shaderInfo.options.noContractOpDot = !hwIntersectRay;
 
   auto module = std::make_unique<Module>(RtName::TraceRayKHR, *context);
   context->setModuleTargetMachine(module.get());
@@ -2211,6 +2206,19 @@ Result Compiler::buildRayTracingPipelineElf(Context *context, std::unique_ptr<Mo
     shaderProp.shaderIdExtraBits = 0;
   }
 
+  auto options = pipeline->getOptions();
+  MetroHash64 hasher;
+  MetroHash::Hash hash = {};
+  hasher.Update(options.hash[1]);
+  hasher.Update(moduleIndex);
+  hasher.Finalize(hash.bytes);
+  options.hash[1] = MetroHash::compact64(&hash);
+
+  if (static_cast<const RayTracingContext *>(context->getPipelineContext())->getIndirectStageMask() == 0)
+    options.rtIndirectMode = lgc::RayTracingIndirectMode::NotIndirect;
+
+  pipeline->setOptions(options);
+
   generatePipeline(context, moduleIndex, std::move(module), pipelineElf, pipeline.get(), timerProfiler);
 
   if (moduleIndex > 0)
@@ -2231,15 +2239,6 @@ Result Compiler::generatePipeline(Context *context, unsigned moduleIndex, std::u
                                   ElfPackage &pipelineElf, Pipeline *pipeline, TimerProfiler &timerProfiler) {
   // Generate pipeline.
   std::unique_ptr<Module> pipelineModule;
-
-  auto options = pipeline->getOptions();
-  MetroHash64 hasher;
-  MetroHash::Hash hash = {};
-  hasher.Update(options.hash[1]);
-  hasher.Update(moduleIndex);
-  hasher.Finalize(hash.bytes);
-  options.hash[1] = MetroHash::compact64(&hash);
-  pipeline->setOptions(options);
 
   pipelineModule.reset(pipeline->irLink(module.release(), context->getPipelineContext()->isUnlinked()
                                                               ? PipelineLink::Unlinked
@@ -2793,45 +2792,6 @@ Result Compiler::validatePipelineShaderInfo(const PipelineShaderInfo *shaderInfo
 
   return result;
 }
-
-#if LLPC_ENABLE_SHADER_CACHE
-// =====================================================================================================================
-// Creates shader cache object with the requested properties.
-// @param : Shader cache create info.
-// @param [out] : Shader cache object
-// @returns : Result::Success if creation succeeds, error status otherwise.
-Result Compiler::CreateShaderCache(const ShaderCacheCreateInfo *pCreateInfo, IShaderCache **ppShaderCache) {
-  Result result = Result::Success;
-
-  ShaderCacheAuxCreateInfo auxCreateInfo = {};
-  auxCreateInfo.shaderCacheMode = ShaderCacheMode::ShaderCacheEnableRuntime;
-  auxCreateInfo.gfxIp = m_gfxIp;
-  auxCreateInfo.hash = m_optionHash;
-
-  ShaderCache *shaderCache = new ShaderCache();
-
-  if (shaderCache) {
-    result = shaderCache->init(pCreateInfo, &auxCreateInfo);
-    if (result != Result::Success) {
-      shaderCache->Destroy();
-      delete shaderCache;
-      shaderCache = nullptr;
-    }
-  } else {
-    result = Result::ErrorOutOfMemory;
-  }
-
-  *ppShaderCache = shaderCache;
-
-  if ((result == Result::Success) &&
-      ((cl::ShaderCacheMode == ShaderCacheEnableRuntime) || (cl::ShaderCacheMode == ShaderCacheEnableOnDisk)) &&
-      (pCreateInfo->initialDataSize > 0)) {
-    result = m_shaderCache->Merge(1, const_cast<const IShaderCache **>(ppShaderCache));
-  }
-
-  return result;
-}
-#endif
 
 // =====================================================================================================================
 // Acquires a free context from context pool.

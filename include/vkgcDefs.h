@@ -45,7 +45,7 @@
 #endif
 
 /// LLPC major interface version.
-#define LLPC_INTERFACE_MAJOR_VERSION 65
+#define LLPC_INTERFACE_MAJOR_VERSION 66
 
 /// LLPC minor interface version.
 #define LLPC_INTERFACE_MINOR_VERSION 0
@@ -56,10 +56,6 @@
 
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 60
 #error LLPC client version is too old
-#endif
-
-#ifndef LLPC_ENABLE_SHADER_CACHE
-#define LLPC_ENABLE_SHADER_CACHE 0
 #endif
 
 /// LLPC_NODISCARD - Warns when function return value is discarded.
@@ -83,6 +79,8 @@
 //  %Version History
 //  | %Version | Change Description                                                                                    |
 //  | -------- | ----------------------------------------------------------------------------------------------------- |
+//  |     66.0 | Rename noContract in PipelineShaderOptions to noContractOpDot
+//  |     65.1 | Add disableSampleMask to PipelineOptions                                                              |
 //  |     65.0 | Remove updateDescInElf                                                                                |
 //  |     64.0 | Add enableColorExportShader to GraphicsPipelineBuildInfo.                                             |
 //  |     63.0 | Add Atomic Counter, its default descriptor and map its concreteType to Buffer.                        |
@@ -572,6 +570,7 @@ struct PipelineOptions {
   unsigned forceNonUniformResourceIndexStageMask; ///< Mask of the stage to force using non-uniform resource index.
   bool reserved16;
   bool replaceSetWithResourceType; ///< For OGL only, replace 'set' with resource type during spirv translate
+  bool disableSampleMask;          ///< For OGL only, disabled if framebuffer doesn't attach multisample texture
 };
 
 /// Prototype of allocator for output data buffer, used in shader-specific operations.
@@ -798,8 +797,8 @@ struct PipelineShaderOptions {
   /// Threshold to use for loops with "DontUnroll" hint (0 = use llvm.llop.unroll.disable).
   unsigned dontUnrollHintThreshold;
 
-  /// Whether fastmath contract could be disabled
-  bool noContract;
+  /// Whether fastmath contract could be disabled on Dot operations.
+  bool noContractOpDot;
 
   /// The enabled fast math flags (0 = depends on input language).
   unsigned fastMathFlags;
@@ -1164,16 +1163,13 @@ struct GraphicsPipelineBuildInfo {
   void *pUserData;                ///< User data
   OutputAllocFunc pfnOutputAlloc; ///< Output buffer allocator
   ICache *cache;                  ///< ICache, used to search for the compiled shader data
-#if LLPC_ENABLE_SHADER_CACHE
-  IShaderCache *pShaderCache; ///< Shader cache, used to search for the compiled shader data
-#endif
-  PipelineShaderInfo task; ///< Task shader
-  PipelineShaderInfo vs;   ///< Vertex shader
-  PipelineShaderInfo tcs;  ///< Tessellation control shader
-  PipelineShaderInfo tes;  ///< Tessellation evaluation shader
-  PipelineShaderInfo gs;   ///< Geometry shader
-  PipelineShaderInfo mesh; ///< Mesh shader
-  PipelineShaderInfo fs;   ///< Fragment shader
+  PipelineShaderInfo task;        ///< Task shader
+  PipelineShaderInfo vs;          ///< Vertex shader
+  PipelineShaderInfo tcs;         ///< Tessellation control shader
+  PipelineShaderInfo tes;         ///< Tessellation evaluation shader
+  PipelineShaderInfo gs;          ///< Geometry shader
+  PipelineShaderInfo mesh;        ///< Mesh shader
+  PipelineShaderInfo fs;          ///< Fragment shader
 
   ResourceMappingData resourceMapping; ///< Resource mapping graph and static descriptor values
   uint64_t pipelineLayoutApiHash;      ///< Pipeline Layout Api Hash
@@ -1247,13 +1243,10 @@ struct GraphicsPipelineBuildInfo {
 
 /// Represents info to build a compute pipeline.
 struct ComputePipelineBuildInfo {
-  void *pInstance;                ///< Vulkan instance object
-  void *pUserData;                ///< User data
-  OutputAllocFunc pfnOutputAlloc; ///< Output buffer allocator
-  ICache *cache;                  ///< ICache, used to search for the compiled shader data
-#if LLPC_ENABLE_SHADER_CACHE
-  IShaderCache *pShaderCache; ///< Shader cache, used to search for the compiled shader data
-#endif
+  void *pInstance;                     ///< Vulkan instance object
+  void *pUserData;                     ///< User data
+  OutputAllocFunc pfnOutputAlloc;      ///< Output buffer allocator
+  ICache *cache;                       ///< ICache, used to search for the compiled shader data
   unsigned deviceIndex;                ///< Device index for device group
   PipelineShaderInfo cs;               ///< Compute shader
   ResourceMappingData resourceMapping; ///< Resource mapping graph and static descriptor values

@@ -57,6 +57,7 @@
 #include "lgc/LgcContext.h"
 #include "lgc/LgcDialect.h"
 #include "lgc/patch/ShaderInputs.h"
+#include "lgc/state/AbiMetadata.h"
 #include "lgc/state/AbiUnlinked.h"
 #include "lgc/state/IntrinsDefs.h"
 #include "lgc/state/PalMetadata.h"
@@ -321,8 +322,11 @@ bool PatchEntryPointMutate::lowerCpsOps(Function *func) {
   IRBuilder<> builder(func->getContext());
 
   // Lower cps jumps.
-  for (auto *jump : cpsJumps)
-    lowerCpsJump(func, jump, tailBlock, exitInfos);
+  unsigned stackSize = 0;
+  for (auto *jump : cpsJumps) {
+    unsigned stateSize = lowerCpsJump(func, jump, tailBlock, exitInfos);
+    stackSize = std::max(stackSize, stateSize);
+  }
 
   // Lower returns.
   for (auto *ret : retInstrs) {
@@ -433,13 +437,25 @@ bool PatchEntryPointMutate::lowerCpsOps(Function *func) {
   // New version of the code (also handles unknown version, which we treat as
   // latest)
   Type *chainTys[] = {builder.getPtrTy(), builder.getIntNTy(waveSize), userDataVec->getType(), vgprArg->getType()};
-  builder.CreateIntrinsic(Intrinsic::amdgcn_cs_chain, chainTys, chainArgs);
+  auto *chainCall = builder.CreateIntrinsic(Intrinsic::amdgcn_cs_chain, chainTys, chainArgs);
+  // Add inreg attribute for (fn, exec, sgprs).
+  for (unsigned arg = 0; arg < 3; arg++)
+    chainCall->addParamAttr(arg, Attribute::InReg);
 #endif
   builder.CreateUnreachable();
 
+  auto funcName = func->getName();
   // Lower cps stack operations
   CpsStackLowering stackLowering(func->getContext());
   stackLowering.lowerCpsStackOps(*func, m_funcCpsStackMap[func]);
+
+  stackSize += stackLowering.getStackSize();
+  // Set per-function .frontend_stack_size PAL metadata.
+  auto &shaderFunctions = m_pipelineState->getPalMetadata()
+                              ->getPipelineNode()
+                              .getMap(true)[Util::Abi::PipelineMetadataKey::ShaderFunctions]
+                              .getMap(true);
+  shaderFunctions[funcName].getMap(true)[Util::Abi::HardwareStageMetadataKey::FrontendStackSize] = stackSize;
 
   return true;
 }
@@ -534,14 +550,14 @@ Function *PatchEntryPointMutate::lowerCpsFunction(Function *func, ArrayRef<Type 
 }
 
 // =====================================================================================================================
-// Lower cps.jump, fill cps exit information and branch to tailBlock.
+// Lower cps.jump, fill cps exit information and branch to tailBlock. Return the state size.
 // This assume the arguments of the parent function are setup correctly.
 //
 // @param parent : the parent function of the cps.jump operation
 // @param jumpOp : the call instruction of cps.jump
 // @param [in/out] exitInfos : the vector of cps exit information to be filled
-void PatchEntryPointMutate::lowerCpsJump(Function *parent, cps::JumpOp *jumpOp, BasicBlock *tailBlock,
-                                         SmallVectorImpl<CpsExitInfo> &exitInfos) {
+unsigned PatchEntryPointMutate::lowerCpsJump(Function *parent, cps::JumpOp *jumpOp, BasicBlock *tailBlock,
+                                             SmallVectorImpl<CpsExitInfo> &exitInfos) {
   IRBuilder<> builder(parent->getContext());
   const DataLayout &layout = parent->getParent()->getDataLayout();
   // Translate @lgc.cps.jump(CR %target, i32 %levels, T %state, ...) into:
@@ -553,8 +569,9 @@ void PatchEntryPointMutate::lowerCpsJump(Function *parent, cps::JumpOp *jumpOp, 
   Value *state = jumpOp->getState();
   Value *vsp = builder.CreateAlignedLoad(builder.getPtrTy(getLoweredCpsStackAddrSpace()), m_funcCpsStackMap[parent],
                                          Align(getLoweredCpsStackPointerSize(layout)));
+  unsigned stateSize = 0;
   if (!state->getType()->isEmptyTy()) {
-    unsigned stateSize = layout.getTypeStoreSize(state->getType());
+    stateSize = layout.getTypeStoreSize(state->getType());
     builder.CreateStore(state, vsp);
     // Make vsp properly aligned across cps function.
     stateSize = alignTo(stateSize, continuationStackAlignment);
@@ -581,6 +598,7 @@ void PatchEntryPointMutate::lowerCpsJump(Function *parent, cps::JumpOp *jumpOp, 
   builder.CreateBr(tailBlock);
 
   jumpOp->eraseFromParent();
+  return stateSize;
 }
 
 // =====================================================================================================================
@@ -726,33 +744,7 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
       continue;
     }
 
-    if (func.getName().startswith(lgcName::DescriptorTableAddr)) {
-      for (User *user : func.users()) {
-        CallInst *call = cast<CallInst>(user);
-        ResourceNodeType searchType = ResourceNodeType(cast<ConstantInt>(call->getArgOperand(1))->getZExtValue());
-        uint64_t set = cast<ConstantInt>(call->getArgOperand(2))->getZExtValue();
-        unsigned binding = cast<ConstantInt>(call->getArgOperand(3))->getZExtValue();
-        ShaderStage stage = getShaderStage(call->getFunction());
-        assert(stage != ShaderStageCopyShader);
-        auto *userDataUsage = getUserDataUsage(stage);
-
-        const ResourceNode *node = m_pipelineState->findResourceNode(searchType, set, binding, stage).first;
-        if (!node) {
-          // Handle mutable descriptors
-          node = m_pipelineState->findResourceNode(ResourceNodeType::DescriptorMutable, set, binding, stage).first;
-        }
-        assert(node && "Could not find resource node");
-
-        UserDataLoad load;
-        load.load = call;
-        load.dwordOffset = node->offsetInDwords;
-        load.dwordSize = 1;
-
-        userDataUsage->descriptorTables.push_back(load);
-        userDataUsage->addLoad(load.dwordOffset, load.dwordSize);
-      }
-    } else if ((func.getName().startswith(lgcName::OutputExportXfb) && !func.use_empty()) ||
-               m_pipelineState->enableSwXfb()) {
+    if ((func.getName().startswith(lgcName::OutputExportXfb) && !func.use_empty()) || m_pipelineState->enableSwXfb()) {
       // NOTE: For GFX11+, SW emulated stream-out will always use stream-out buffer descriptors and stream-out buffer
       // offsets to calculate numbers of written primitives/dwords and update the counters.  auto lastVertexStage =
       auto lastVertexStage = m_pipelineState->getLastVertexProcessingStage();
@@ -837,8 +829,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     if (userDataUsage->spillTableEntryArgIdx != 0) {
       builder.SetInsertPoint(addressExtender.getFirstInsertionPt());
       Argument *arg = getFunctionArgument(&func, userDataUsage->spillTableEntryArgIdx);
-      spillTable = addressExtender.extend(arg, builder.getInt32(HighAddrPc),
-                                          builder.getInt8Ty()->getPointerTo(ADDR_SPACE_CONST), builder);
+      spillTable = addressExtender.extendWithPc(arg, builder.getPtrTy(ADDR_SPACE_CONST), builder);
     }
 
     // Handle direct uses of the spill table that were generated in DescBuilder.
@@ -871,25 +862,6 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
           loadUserData(*userDataUsage, spillTable, load.load->getType(), load.dwordOffset, builder));
       load.load->eraseFromParent();
       load.load = nullptr;
-    }
-
-    // Descriptor tables
-    Type *ptrType = builder.getPtrTy(ADDR_SPACE_CONST);
-    for (auto &descriptorTable : userDataUsage->descriptorTables) {
-      if (!descriptorTable.load || descriptorTable.load->getFunction() != &func)
-        continue;
-
-      auto *op = cast<CallInst>(descriptorTable.load);
-      descriptorTable.load = nullptr;
-
-      builder.SetInsertPoint(op);
-      Value *va = loadUserData(*userDataUsage, spillTable, builder.getInt32Ty(), descriptorTable.dwordOffset, builder);
-
-      Value *highHalf = op->getArgOperand(4);
-      Value *ptr = addressExtender.extend(va, highHalf, ptrType, builder);
-
-      op->replaceAllUsesWith(ptr);
-      op->eraseFromParent();
     }
 
     // Special user data from lgc.special.user.data calls
@@ -1350,6 +1322,18 @@ uint64_t PatchEntryPointMutate::generateEntryPointArgTys(ShaderInputs *shaderInp
     }
   }
 
+  // NOTE: We encounter a HW defect on GFX9. When there is only one user SGPR (corresponds to global table, s0),
+  // the SGPR corresponding to scratch offset (s2) of PS is incorrectly initialized. This leads to invalid scratch
+  // memory access, causing GPU hang. Thus, we detect such case and add a dummy user SGPR in order not to map scratch
+  // offset to s2.
+  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major == 9 && m_shaderStage == ShaderStageFragment) {
+    if (userDataIdx == 1) {
+      argTys.push_back(builder.getInt32Ty());
+      argNames.push_back("dummyInit");
+      userDataIdx += 1;
+    }
+  }
+
   intfData->userDataCount = userDataIdx;
   inRegMask = (1ull << argTys.size()) - 1;
 
@@ -1576,47 +1560,60 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
   if (userDataUsage->usesStreamOutTable || userDataUsage->isSpecialUserDataUsed(UserDataMapping::StreamOutTable)) {
     if (enableNgg || !m_pipelineState->hasShaderStage(ShaderStageCopyShader) && m_pipelineState->enableXfb()) {
       // If no NGG, stream out table will be set to copy shader's user data entry, we should not set it duplicately.
+      unsigned *tablePtr = nullptr;
+
       switch (m_shaderStage) {
       case ShaderStageVertex:
-        userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
-                                           &intfData->entryArgIdxs.vs.streamOutData.tablePtr));
-        if (m_pipelineState->enableSwXfb()) {
-          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
-          // stream-out control buffer address.
-          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
-                                                    UserDataMapping::StreamOutControlBuf,
-                                                    &intfData->entryArgIdxs.vs.streamOutData.controlBufPtr));
-        }
+        tablePtr = &intfData->entryArgIdxs.vs.streamOutData.tablePtr;
         break;
       case ShaderStageTessEval:
-        userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
-                                           &intfData->entryArgIdxs.tes.streamOutData.tablePtr));
-        if (m_pipelineState->enableSwXfb()) {
-          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
-          // stream-out control buffer address.
-          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
-                                                    UserDataMapping::StreamOutControlBuf,
-                                                    &intfData->entryArgIdxs.tes.streamOutData.controlBufPtr));
-        }
+        tablePtr = &intfData->entryArgIdxs.tes.streamOutData.tablePtr;
         break;
       case ShaderStageGeometry:
-        if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 10) {
+        if (m_pipelineState->enableSwXfb()) {
+          tablePtr = &intfData->entryArgIdxs.gs.streamOutData.tablePtr;
+        } else {
+          assert(m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 10);
           // Allocate dummy stream-out register for geometry shader
           userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "dummyStreamOut"));
-        } else if (m_pipelineState->enableSwXfb()) {
-          userDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable,
-                                             &intfData->entryArgIdxs.gs.streamOutData.tablePtr));
-          // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the
-          // stream-out control buffer address.
-          specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
-                                                    UserDataMapping::StreamOutControlBuf,
-                                                    &intfData->entryArgIdxs.gs.streamOutData.controlBufPtr));
         }
+
         break;
       default:
         llvm_unreachable("Should never be called!");
         break;
       }
+
+      if (tablePtr) {
+        userDataArgs.push_back(
+            UserDataArg(builder.getInt32Ty(), "streamOutTable", UserDataMapping::StreamOutTable, tablePtr));
+      }
+    }
+  }
+
+  // NOTE: For GFX11+, the SW stream-out needs an additional special user data SGPR to store the stream-out control
+  // buffer address.
+  if (m_pipelineState->enableSwXfb()) {
+    unsigned *controlBufPtr = nullptr;
+
+    switch (m_shaderStage) {
+    case ShaderStageVertex:
+      controlBufPtr = &intfData->entryArgIdxs.vs.streamOutData.controlBufPtr;
+      break;
+    case ShaderStageTessEval:
+      controlBufPtr = &intfData->entryArgIdxs.tes.streamOutData.controlBufPtr;
+      break;
+    case ShaderStageGeometry:
+      controlBufPtr = &intfData->entryArgIdxs.gs.streamOutData.controlBufPtr;
+      break;
+    default:
+      // Ignore other shader stages
+      break;
+    }
+
+    if (controlBufPtr) {
+      specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "streamOutControlBuf",
+                                                UserDataMapping::StreamOutControlBuf, controlBufPtr));
     }
   }
 }
@@ -1699,20 +1696,30 @@ void PatchEntryPointMutate::finalizeUserDataArgs(SmallVectorImpl<UserDataArg> &u
 
       if (userDataEnd + size > userDataAvailable) {
         // We ran out of SGPR space -- need to spill.
-        unsigned spillUsage = i;
         if (!spill) {
-          if (userDataEnd >= userDataAvailable) {
+          --userDataAvailable;
+          spill = true;
+          if (userDataEnd > userDataAvailable) {
             // No space left for the spill table, we need to backtrack.
             assert(lastSize > 0);
             userDataArgs.erase(userDataArgs.end() - lastSize, userDataArgs.end());
-            userDataEnd -= size;
-            spillUsage = lastIdx;
+            userDataEnd -= lastSize;
+            assert(userDataEnd <= userDataAvailable);
+            m_pipelineState->getPalMetadata()->setUserDataSpillUsage(lastIdx);
+
+            // Retry since the current load may now fit.
+            continue;
+          } else {
+            m_pipelineState->getPalMetadata()->setUserDataSpillUsage(i);
           }
-          --userDataAvailable;
-          spill = true;
         }
-        m_pipelineState->getPalMetadata()->setUserDataSpillUsage(spillUsage);
-        break;
+
+        if (userDataEnd >= userDataAvailable)
+          break; // All SGPRs in use, may as well give up.
+
+        // Subsequent loads may be smaller and could still fit.
+        ++i;
+        continue;
       }
 
       lastSize = size;

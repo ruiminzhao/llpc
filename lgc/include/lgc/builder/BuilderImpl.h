@@ -315,11 +315,11 @@ private:
                                    const ResourceNode *topNode, const ResourceNode *node, bool shadow);
 
   // Get the stride (in bytes) of a descriptor.
-  llvm::Value *getStride(ResourceNodeType descType, uint64_t descSet, unsigned binding, const ResourceNode *node);
+  llvm::Value *getStride(ResourceNodeType descType, const ResourceNode *node);
 
   // Get a pointer to a descriptor, as a pointer to i8
-  llvm::Value *getDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, uint64_t descSet,
-                          unsigned binding, const ResourceNode *topNode, const ResourceNode *node);
+  llvm::Value *getDescPtr(ResourceNodeType concreteType, const ResourceNode *topNode, const ResourceNode *node,
+                          unsigned binding);
 
   llvm::Value *scalarizeIfUniform(llvm::Value *value, bool isNonUniform);
 
@@ -516,7 +516,7 @@ private:
 
   // Mark usage for a generic (user) input or output
   void markGenericInputOutputUsage(bool isOutput, unsigned location, unsigned locationCount, InOutInfo &inOutInfo,
-                                   llvm::Value *vertexOrPrimIndex);
+                                   llvm::Value *vertexOrPrimIndex, bool isDynLocOffset = false);
 
   // Mark interpolation info for FS input.
   void markInterpolationInfo(InOutInfo &interpInfo);
@@ -649,6 +649,10 @@ public:
 
   // Create a subgroup all.
   llvm::Value *CreateSubgroupAll(llvm::Value *const value, const llvm::Twine &instName = "");
+
+  // Create a subgroup rotate.
+  llvm::Value *CreateSubgroupRotate(llvm::Value *const value, llvm::Value *const delta, llvm::Value *const clusterSize,
+                                    const llvm::Twine &instName = "");
 
   // Create a subgroup any
   llvm::Value *CreateSubgroupAny(llvm::Value *const value, const llvm::Twine &instName = "");

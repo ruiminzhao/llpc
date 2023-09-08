@@ -43,17 +43,10 @@ add_library(vkgc_headers INTERFACE)
 option(LLPC_BUILD_TOOLS "LLPC build all tools" ON)
 
 ### Options that affect the headers ####################################################################################
-option(LLPC_ENABLE_SHADER_CACHE "Enable experimental shader cache" OFF)
-
-if(LLPC_ENABLE_SHADER_CACHE)
-    target_compile_definitions(vkgc_headers INTERFACE LLPC_ENABLE_SHADER_CACHE)
-endif()
-
 if (LLPC_CLIENT_INTERFACE_MAJOR_VERSION)
     target_compile_definitions(vkgc_headers INTERFACE LLPC_CLIENT_INTERFACE_MAJOR_VERSION=${LLPC_CLIENT_INTERFACE_MAJOR_VERSION})
 else()
-    # LLPC is not compiled, so fall back to the latest version
-    target_compile_definitions(vkgc_headers INTERFACE LLPC_CLIENT_INTERFACE_MAJOR_VERSION=LLPC_INTERFACE_MAJOR_VERSION)
+    message(FATAL_ERROR "Client of LLPC must set LLPC_CLIENT_INTERFACE_MAJOR_VERSION")
 endif()
 
 #if VKI_BUILD_GFX11

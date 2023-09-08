@@ -1,7 +1,7 @@
 /*
  ***********************************************************************************************************************
  *
- *  Copyright (c) 2019-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+ *  Copyright (c) 2023 Advanced Micro Devices, Inc. All Rights Reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -24,26 +24,22 @@
  **********************************************************************************************************************/
 /**
  ***********************************************************************************************************************
- * @file  BuiltIns.h
- * @brief LLPC header file: declaration of BuiltIns supported by the Builder interface
+ * @file  Continufy.h
+ * @brief LGC header file : contains declaration of class lgc::Continufy
  ***********************************************************************************************************************
  */
-
 #pragma once
+#include "lgc/state/PipelineState.h"
 
 namespace lgc {
 
-// Max spirv builtIn value
-static constexpr unsigned BuiltInInternalBase = 0x10000000;
+// =====================================================================================================================
+// Pass to transform indirect call into continuation-style call.
+class Continufy : public llvm::PassInfoMixin<Continufy> {
 
-// Max builtIn value = BuiltInInternalBase + 13
-static constexpr unsigned MaxBuiltIn = 0x1000000D;
-
-// Define built-in kind enum.
-enum BuiltInKind : unsigned {
-#define BUILTIN(name, number, out, in, type) BuiltIn##name = number,
-#include "lgc/BuiltInDefs.h"
-#undef BUILTIN
+public:
+  llvm::PreservedAnalyses run(llvm::Module &module, llvm::ModuleAnalysisManager &analysisManager);
+  static llvm::StringRef name() { return "Continufy Indirect calls"; }
 };
 
 } // namespace lgc

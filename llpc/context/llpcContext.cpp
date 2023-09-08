@@ -62,6 +62,7 @@
 using namespace lgc;
 using namespace lgc::rt;
 using namespace llvm;
+using namespace lgc::cps;
 
 namespace Llpc {
 
@@ -69,7 +70,7 @@ namespace Llpc {
 //
 // @param gfxIp : Graphics IP version info
 Context::Context(GfxIpVersion gfxIp) : LLVMContext(), m_gfxIp(gfxIp) {
-  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect, GpurtDialect, LgcRtDialect>(*this);
+  m_dialectContext = llvm_dialects::DialectContext::make<LgcDialect, GpurtDialect, LgcRtDialect, LgcCpsDialect>(*this);
   reset();
 }
 
@@ -90,10 +91,16 @@ LgcContext *Context::getLgcContext() {
   // Create the LgcContext on first execution or optimization level change.
   if (!m_builderContext || getLastOptimizationLevel() != getOptimizationLevel()) {
     std::string gpuName = LgcContext::getGpuNameString(m_gfxIp.major, m_gfxIp.minor, m_gfxIp.stepping);
+    // Pass the state of LLPC_OUTS on to LGC for the logging inside createTargetMachine.
+    LgcContext::setLlpcOuts(EnableOuts() ? &outs() : nullptr);
     m_targetMachine = LgcContext::createTargetMachine(gpuName, getOptimizationLevel());
+    LgcContext::setLlpcOuts(nullptr);
     if (!m_targetMachine)
       report_fatal_error(Twine("Unknown target '") + Twine(gpuName) + Twine("'"));
     m_builderContext.reset(LgcContext::create(&*m_targetMachine, *this, PAL_CLIENT_INTERFACE_MAJOR_VERSION));
+
+    // Pass the state of LLPC_OUTS on to LGC.
+    LgcContext::setLlpcOuts(EnableOuts() ? &outs() : nullptr);
   }
   return &*m_builderContext;
 }

@@ -32,6 +32,7 @@
 #include "llpcSpirvLowerRayTracing.h"
 #include "SPIRVInternal.h"
 #include "gpurt-compiler.h"
+#include "lgccps/LgcCpsDialect.h"
 #include "lgcrt/LgcRtDialect.h"
 #include "llpcContext.h"
 #include "llpcRayTracingContext.h"
@@ -71,6 +72,7 @@ const char *ShaderTable = "ShaderTable";
 static const char *CallAnyHitShader = "AmdTraceRayCallAnyHitShader";
 static const char *FetchTrianglePositionFromNodePointer = "FetchTrianglePositionFromNodePointer";
 static const char *RemapCapturedVaToReplayVa = "AmdTraceRayRemapCapturedVaToReplayVa";
+static const char *ContinufyStageMeta = "continufy.stage";
 } // namespace RtName
 
 namespace Llpc {
@@ -175,6 +177,10 @@ void SpirvLowerRayTracing::processTraceRayCall(BaseTraceRayOp *inst) {
       // Create the indirect function call
       result = m_builder->CreateCall(funcTy, funcPtr, args);
       result->setCallingConv(CallingConv::SPIR_FUNC);
+
+      unsigned lgcRtStage = ~0u;
+      result->setMetadata(RtName::ContinufyStageMeta,
+                          MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
     } else {
       result =
           m_builder->CreateNamedCall(RtName::TraceRayKHR, funcTy->getReturnType(), args, {Attribute::AlwaysInline});
@@ -256,6 +262,11 @@ void SpirvLowerRayTracing::visitCallCallableShaderOp(CallCallableShaderOp &inst)
       auto funcPtr = m_builder->CreateIntToPtr(shaderIdentifier, funcPtrTy);
       CallInst *result = m_builder->CreateCall(funcTy, funcPtr, args);
       result->setCallingConv(CallingConv::SPIR_FUNC);
+
+      unsigned lgcRtStage = static_cast<unsigned>(mapStageToLgcRtShaderStage(ShaderStageRayTracingCallable));
+      result->setMetadata(RtName::ContinufyStageMeta,
+                          MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
+
       m_builder->CreateStore(result, inputResult);
       m_builder->CreateBr(endBlock);
     } else {
@@ -543,9 +554,13 @@ PreservedAnalyses SpirvLowerRayTracing::run(Module &module, ModuleAnalysisManage
   }
   // Process traceRays module
   if (m_shaderStage == ShaderStageCompute) {
-
     CallInst *call = createTraceRay();
     inlineTraceRay(call, analysisManager);
+
+    unsigned lgcRtStage = ~0u;
+    m_entryPoint->setMetadata(RtName::ContinufyStageMeta,
+                              MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
+
     static auto visitor = llvm_dialects::VisitorBuilder<SpirvLowerRayTracing>()
                               .setStrategy(llvm_dialects::VisitorStrategy::ByFunctionDeclaration)
                               .add(&SpirvLowerRayTracing::visitGetHitAttributes)
@@ -569,6 +584,10 @@ PreservedAnalyses SpirvLowerRayTracing::run(Module &module, ModuleAnalysisManage
     m_builder->SetInsertPoint(insertPos);
     createDispatchRaysInfoDesc();
     m_spirvOpMetaKindId = m_context->getMDKindID(MetaNameSpirvOp);
+
+    unsigned lgcRtStage = static_cast<unsigned>(mapStageToLgcRtShaderStage(m_shaderStage));
+    m_entryPoint->setMetadata(RtName::ContinufyStageMeta,
+                              MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
 
     if (m_shaderStage == ShaderStageRayTracingAnyHit || m_shaderStage == ShaderStageRayTracingClosestHit ||
         m_shaderStage == ShaderStageRayTracingIntersect) {
@@ -836,6 +855,11 @@ void SpirvLowerRayTracing::createCallShader(Function *func, ShaderStage stage, u
 
     auto funcPtr = m_builder->CreateIntToPtr(shaderId, funcPtrTy);
     CallInst *result = m_builder->CreateCall(funcTy, funcPtr, args);
+
+    unsigned lgcRtStage = static_cast<unsigned>(mapStageToLgcRtShaderStage(stage));
+    result->setMetadata(RtName::ContinufyStageMeta,
+                        MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
+
     result->setCallingConv(CallingConv::SPIR_FUNC);
     storeFunctionCallResult(stage, result, traceParamsIt);
     m_builder->CreateBr(endBlock);
@@ -1246,6 +1270,16 @@ void SpirvLowerRayTracing::createRayGenEntryFunc() {
   m_builder->SetInsertPoint(mainBlock);
   auto rayGenId = getShaderIdentifier(m_shaderStage, m_builder->getInt32(0), m_dispatchRaysInfoDesc);
   auto rayTracingContext = static_cast<RayTracingContext *>(m_context->getPipelineContext());
+
+  if (rayTracingContext->getRaytracingMode() == Vkgc::LlpcRaytracingMode::Continuations) {
+    // Setup continuation stack pointer
+    auto offset = offsetof(GpuRt::DispatchRaysConstantData, cpsBackendStackSize);
+    auto gep = m_builder->CreateConstGEP1_32(m_builder->getInt8Ty(), m_dispatchRaysInfoDesc, offset);
+    Value *stackPtr = m_builder->CreateLoad(m_builder->getInt32Ty(), gep);
+    stackPtr = m_builder->CreateIntToPtr(stackPtr, PointerType::get(*m_context, lgc::cps::stackAddrSpace));
+    m_builder->create<lgc::cps::SetVspOp>(stackPtr);
+  }
+
   bool indirect = rayTracingContext->getIndirectStageMask() & shaderStageToMask(m_shaderStage);
   if (!indirect) {
     // Create Shader selection
@@ -1262,6 +1296,11 @@ void SpirvLowerRayTracing::createRayGenEntryFunc() {
     auto funcPtr = m_builder->CreateIntToPtr(rayGenId, funcPtrTy);
     CallInst *call = m_builder->CreateCall(funcTy, funcPtr, {});
     call->setCallingConv(CallingConv::SPIR_FUNC);
+
+    unsigned lgcRtStage = static_cast<unsigned>(mapStageToLgcRtShaderStage(ShaderStageRayTracingRayGen));
+    call->setMetadata(RtName::ContinufyStageMeta,
+                      MDNode::get(*m_context, ConstantAsMetadata::get(m_builder->getInt32(lgcRtStage))));
+
     m_builder->CreateBr(endBlock);
   }
   // Construct end block
@@ -2931,6 +2970,11 @@ llvm::Function *SpirvLowerRayTracing::createImplFunc(CallInst &inst, ArrayRef<Va
   inst.replaceAllUsesWith(newCall);
 
   return m_module->getFunction(mangledName);
+}
+
+lgc::rt::RayTracingShaderStage SpirvLowerRayTracing::mapStageToLgcRtShaderStage(ShaderStage stage) {
+  assert((stage >= ShaderStageRayTracingRayGen) && (stage <= ShaderStageRayTracingCallable));
+  return static_cast<lgc::rt::RayTracingShaderStage>(stage - ShaderStageRayTracingRayGen);
 }
 
 } // namespace Llpc
