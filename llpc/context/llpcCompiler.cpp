@@ -30,6 +30,9 @@
  */
 #include "llpcCompiler.h"
 #include "LLVMSPIRVLib.h"
+#include "SPIRVEntry.h"
+#include "SPIRVFunction.h"
+#include "SPIRVInstruction.h"
 #include "SPIRVInternal.h"
 #include "llpcCacheAccessor.h"
 #include "llpcComputeContext.h"
@@ -556,26 +559,365 @@ Result Compiler::BuildShaderModule(const ShaderModuleBuildInfo *shaderInfo, Shad
 
   unsigned codeSize = ShaderModuleHelper::getCodeSize(shaderInfo);
   size_t allocSize = sizeof(ShaderModuleData) + codeSize;
-  unsigned *allocBuf =
-      static_cast<unsigned *>(shaderInfo->pfnOutputAlloc(shaderInfo->pInstance, shaderInfo->pUserData, allocSize));
+
+  ShaderModuleData moduleData = {};
+  std::vector<unsigned> codeBufferVector(codeSize / sizeof(unsigned));
+  MutableArrayRef<unsigned> codeBuffer(codeBufferVector);
+  memcpy(moduleData.hash, &hash, sizeof(hash));
+  Result result = ShaderModuleHelper::getModuleData(shaderInfo, codeBuffer, moduleData);
+
+  ResourcesNodes resourceNodes = {};
+  std::vector<ResourceNodeData> inputSymbolInfo;
+  std::vector<ResourceNodeData> outputSymbolInfo;
+  std::vector<ResourceNodeData> uniformBufferInfo;
+  std::vector<ResourceNodeData> storageBufferInfo;
+  std::vector<ResourceNodeData> textureSymbolInfo;
+  std::vector<ResourceNodeData> imageSymbolInfo;
+  std::vector<ResourceNodeData> atomicCounterSymbolInfo;
+  std::vector<ResourceNodeData> defaultUniformSymbolInfo;
+  if (shaderInfo->options.pipelineOptions.buildResourcesDataForShaderModule) {
+    buildShaderModuleResourceUsage(shaderInfo, resourceNodes, inputSymbolInfo, outputSymbolInfo, uniformBufferInfo,
+                                   storageBufferInfo, textureSymbolInfo, imageSymbolInfo, atomicCounterSymbolInfo,
+                                   defaultUniformSymbolInfo);
+
+    allocSize += sizeof(ResourcesNodes);
+    allocSize += inputSymbolInfo.size() * sizeof(ResourceNodeData);
+    allocSize += outputSymbolInfo.size() * sizeof(ResourceNodeData);
+    allocSize += uniformBufferInfo.size() * sizeof(ResourceNodeData);
+    allocSize += storageBufferInfo.size() * sizeof(ResourceNodeData);
+    allocSize += textureSymbolInfo.size() * sizeof(ResourceNodeData);
+    allocSize += imageSymbolInfo.size() * sizeof(ResourceNodeData);
+    allocSize += atomicCounterSymbolInfo.size() * sizeof(ResourceNodeData);
+    allocSize += defaultUniformSymbolInfo.size() * sizeof(ResourceNodeData);
+  }
+
+  uint8_t *allocBuf =
+      static_cast<uint8_t *>(shaderInfo->pfnOutputAlloc(shaderInfo->pInstance, shaderInfo->pUserData, allocSize));
   if (!allocBuf)
     return Result::ErrorOutOfMemory;
 
-  ShaderModuleData *moduleData = reinterpret_cast<ShaderModuleData *>(allocBuf);
-  *moduleData = {};
-  MutableArrayRef<unsigned> codeBuffer(allocBuf + sizeof(ShaderModuleData) / sizeof(*allocBuf),
-                                       codeSize / sizeof(*allocBuf));
+  uint8_t *bufferWritePtr = allocBuf;
+  ShaderModuleData *pShaderModuleData = nullptr;
+  ResourcesNodes *pResourcesNodes = nullptr;
 
-  memcpy(moduleData->hash, &hash, sizeof(hash));
-  Result result = ShaderModuleHelper::getModuleData(shaderInfo, codeBuffer, *moduleData);
-  shaderOut->pModuleData = moduleData;
+  memcpy(bufferWritePtr, &moduleData, sizeof(moduleData));
+  pShaderModuleData = reinterpret_cast<ShaderModuleData *>(bufferWritePtr);
+  bufferWritePtr += sizeof(ShaderModuleData);
 
-  if (moduleData->binType == BinaryType::Spirv && cl::EnablePipelineDump) {
+  memcpy(bufferWritePtr, codeBuffer.data(), codeBuffer.size() * sizeof(unsigned));
+  pShaderModuleData->binCode.pCode = bufferWritePtr;
+  bufferWritePtr += codeBuffer.size() * sizeof(unsigned);
+
+  if (shaderInfo->options.pipelineOptions.buildResourcesDataForShaderModule) {
+    memcpy(bufferWritePtr, &resourceNodes, sizeof(ResourcesNodes));
+    pResourcesNodes = reinterpret_cast<ResourcesNodes *>(bufferWritePtr);
+    pShaderModuleData->usage.pResources = pResourcesNodes;
+    bufferWritePtr += sizeof(ResourcesNodes);
+
+    memcpy(bufferWritePtr, inputSymbolInfo.data(), inputSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pInputInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += inputSymbolInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, outputSymbolInfo.data(), outputSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pOutputInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += outputSymbolInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, uniformBufferInfo.data(), uniformBufferInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pUniformBufferInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += uniformBufferInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, storageBufferInfo.data(), storageBufferInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pShaderStorageInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += storageBufferInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, textureSymbolInfo.data(), textureSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pTexturesInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += textureSymbolInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, imageSymbolInfo.data(), imageSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pImagesInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += imageSymbolInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, atomicCounterSymbolInfo.data(), atomicCounterSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pAtomicCounterInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += atomicCounterSymbolInfo.size() * sizeof(ResourceNodeData);
+
+    memcpy(bufferWritePtr, defaultUniformSymbolInfo.data(), defaultUniformSymbolInfo.size() * sizeof(ResourceNodeData));
+    pResourcesNodes->pDefaultUniformInfo = reinterpret_cast<ResourceNodeData *>(bufferWritePtr);
+    bufferWritePtr += defaultUniformSymbolInfo.size() * sizeof(ResourceNodeData);
+  }
+
+  shaderOut->pModuleData = pShaderModuleData;
+
+  if (moduleData.binType == BinaryType::Spirv && cl::EnablePipelineDump) {
     // Dump the original input binary, since the offline tool will re-run BuildShaderModule
     PipelineDumper::DumpSpirvBinary(cl::PipelineDumpDir.c_str(), &shaderInfo->shaderBin, &hash);
   }
 
   return result;
+}
+
+// =====================================================================================================================
+// Get resource node data info from spriv variable
+//
+// @param spvVar : Spriv variable
+// @param [out] symbolInfo : Resource node data info
+// @return: Whether symbol is builtIn
+static bool getSymbolInfoFromSpvVariable(const SPIRVVariable *spvVar, ResourceNodeData *symbolInfo) {
+  uint32_t arraySize = 1;
+  SPIRVWord location = 0;
+  SPIRVWord binding = 0;
+  BasicType basicType = BasicType::Unknown;
+
+  SPIRVWord builtIn = false;
+  bool isBuiltIn = spvVar->hasDecorate(DecorationBuiltIn, 0, &builtIn);
+  spvVar->hasDecorate(DecorationLocation, 0, &location);
+  spvVar->hasDecorate(DecorationBinding, 0, &binding);
+
+  SPIRVType *varElemTy = spvVar->getType()->getPointerElementType();
+  while (varElemTy->isTypeArray()) {
+    arraySize = varElemTy->getArrayLength();
+    varElemTy = varElemTy->getArrayElementType();
+  }
+  if (varElemTy->getOpCode() == OpTypeStruct) {
+    for (uint32_t i = 0; i < arraySize; i++) {
+      if (isBuiltIn)
+        break;
+      isBuiltIn = varElemTy->hasMemberDecorate(i, DecorationBuiltIn, 0, &builtIn);
+    }
+  }
+  if (varElemTy->getOpCode() == OpTypeMatrix)
+    varElemTy = varElemTy->getMatrixColumnType();
+  if (varElemTy->getOpCode() == OpTypeVector)
+    varElemTy = varElemTy->getVectorComponentType();
+
+  switch (varElemTy->getOpCode()) {
+  case OpTypeInt: {
+    bool isSigned = reinterpret_cast<SPIRVTypeInt *>(varElemTy)->isSigned();
+    switch (varElemTy->getIntegerBitWidth()) {
+    case 8:
+      basicType = isSigned ? BasicType::Int8 : BasicType::Uint8;
+      break;
+    case 16:
+      basicType = isSigned ? BasicType::Int16 : BasicType::Uint16;
+      break;
+    case 32:
+      basicType = isSigned ? BasicType::Int : BasicType::Uint;
+      break;
+    case 64:
+      basicType = isSigned ? BasicType::Int64 : BasicType::Uint64;
+      break;
+    }
+    break;
+  }
+  case OpTypeFloat: {
+    switch (varElemTy->getFloatBitWidth()) {
+    case 16:
+      basicType = BasicType::Float16;
+      break;
+    case 32:
+      basicType = BasicType::Float;
+      break;
+    case 64:
+      basicType = BasicType::Double;
+      break;
+    }
+    break;
+  }
+  default: {
+    break;
+  }
+  }
+
+  symbolInfo->arraySize = arraySize;
+  symbolInfo->location = location;
+  symbolInfo->binding = binding;
+  symbolInfo->basicType = basicType;
+
+  return isBuiltIn;
+}
+
+// =====================================================================================================================
+// Get sampler array size in default uniform struct
+//
+// @param spvStruct : Spriv default uniform struct type
+// @return: Sampler array size in this struct
+static unsigned getSamplerArraySizeInSpvStruct(const SPIRVType *spvStruct) {
+  assert(spvStruct->isTypeStruct());
+
+  unsigned memberCount = spvStruct->getStructMemberCount();
+  unsigned samplerArraySize = 0;
+
+  for (unsigned memberIdx = 0; memberIdx < memberCount; memberIdx++) {
+    SPIRVType *memberTy = spvStruct->getStructMemberType(memberIdx);
+
+    if (memberTy->isTypeSampledImage()) {
+      samplerArraySize += 1;
+    } else if (memberTy->isTypeArray()) {
+      unsigned arraySize = 1;
+      while (memberTy->isTypeArray()) {
+        arraySize = memberTy->getArrayLength();
+        memberTy = memberTy->getArrayElementType();
+      }
+      if (memberTy->isTypeSampledImage()) {
+        samplerArraySize += arraySize;
+      } else if (memberTy->isTypeStruct()) {
+        samplerArraySize += (arraySize * getSamplerArraySizeInSpvStruct(memberTy));
+      }
+    } else if (memberTy->isTypeStruct()) {
+      samplerArraySize *= getSamplerArraySizeInSpvStruct(memberTy);
+    }
+  }
+
+  return samplerArraySize;
+}
+
+// =====================================================================================================================
+// Parse the spirv binary to build the resource node data for buffers and opaque types, the resource node data will be
+// returned to client driver together with other info of ShaderModuleUsage
+//
+// @param shaderInfo : Input shader info, including spirv binary
+// @param [out] resourcesNodes : Output of resource usage
+// @param [out] inputSymbolInfos : Output of input symbol infos
+// @param [out] outputSymbolInfo : Output of output symbol infos
+// @param [out] uniformBufferInfo : Output of uniform buffer infos
+// @param [out] storageBufferInfo : Output of shader storage buffer infos
+// @param [out] textureSymbolInfo : Output of texture symbol infos
+// @param [out] imageSymbolInfo : Output of image symbol infos
+// @param [out] atomicCounterSymbolInfo : Output of atomic counter symbol infos
+// @param [out] defaultUniformSymbolInfo : Output of default uniform symbol infos
+void Compiler::buildShaderModuleResourceUsage(
+    const ShaderModuleBuildInfo *shaderInfo, Vkgc::ResourcesNodes &resourcesNodes,
+    std::vector<ResourceNodeData> &inputSymbolInfo, std::vector<ResourceNodeData> &outputSymbolInfo,
+    std::vector<ResourceNodeData> &uniformBufferInfo, std::vector<ResourceNodeData> &storageBufferInfo,
+    std::vector<ResourceNodeData> &textureSymbolInfo, std::vector<ResourceNodeData> &imageSymbolInfo,
+    std::vector<ResourceNodeData> &atomicCounterSymbolInfo, std::vector<ResourceNodeData> &defaultUniformSymbolInfo) {
+  // Parse the SPIR-V stream.
+  std::string spirvCode(static_cast<const char *>(shaderInfo->shaderBin.pCode), shaderInfo->shaderBin.codeSize);
+  std::istringstream spirvStream(spirvCode);
+  std::unique_ptr<SPIRVModule> module(SPIRVModule::createSPIRVModule());
+  spirvStream >> *module;
+
+  ShaderStage shaderStage = shaderInfo->entryStage;
+
+  // Find the entry target.
+  SPIRVEntryPoint *entryPoint = nullptr;
+  SPIRVFunction *func = nullptr;
+  for (unsigned i = 0, funcCount = module->getNumFunctions(); i < funcCount; ++i) {
+    func = module->getFunction(i);
+    entryPoint = module->getEntryPoint(func->getId());
+    if (entryPoint && entryPoint->getExecModel() == convertToExecModel(shaderStage) &&
+        entryPoint->getName() == shaderInfo->pEntryTarget)
+      break;
+    func = nullptr;
+  }
+  if (!entryPoint)
+    return;
+
+  // Process resources
+  auto inOuts = entryPoint->getInOuts();
+  std::vector<ResourceNodeData> inputSymbolWithArrayInfo;
+  for (auto varId : ArrayRef<SPIRVWord>(inOuts.first, inOuts.second)) {
+    auto var = static_cast<SPIRVVariable *>(module->getValue(varId));
+
+    if (var->getStorageClass() == StorageClassInput) {
+      if (shaderStage == ShaderStageVertex) {
+        ResourceNodeData inputSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &inputSymbol))
+          inputSymbolWithArrayInfo.push_back(inputSymbol);
+      }
+    } else if (var->getStorageClass() == StorageClassOutput) {
+      ResourceNodeData outputSymbol = {};
+      if (!getSymbolInfoFromSpvVariable(var, &outputSymbol))
+        outputSymbolInfo.push_back(outputSymbol);
+    }
+  }
+
+  if (shaderInfo->entryStage == ShaderStage::ShaderStageVertex) {
+    size_t inputSymbolSize = inputSymbolWithArrayInfo.size();
+    for (size_t i = 0; i < inputSymbolSize; i++) {
+      auto symbol = inputSymbolWithArrayInfo[i];
+      inputSymbolInfo.push_back(symbol);
+
+      for (uint32_t ite = 1; ite < symbol.arraySize; ite++) {
+        ResourceNodeData elemSymbolInfo = symbol;
+        elemSymbolInfo.location = symbol.location + ite;
+        inputSymbolInfo.push_back(elemSymbolInfo);
+      }
+    }
+  }
+
+  for (unsigned i = 0, varCount = module->getNumVariables(); i < varCount; ++i) {
+    SPIRVVariable *var = module->getVariable(i);
+    SPIRVType *varElemTy = var->getType()->getPointerElementType();
+    while (varElemTy->isTypeArray())
+      varElemTy = varElemTy->getArrayElementType();
+
+    switch (var->getStorageClass()) {
+    case StorageClassUniform: {
+      if (varElemTy->hasDecorate(DecorationBlock)) {
+        ResourceNodeData uniformBufferSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &uniformBufferSymbol))
+          uniformBufferInfo.push_back(uniformBufferSymbol);
+      } else {
+        ResourceNodeData shaderStorageSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &shaderStorageSymbol))
+          storageBufferInfo.push_back(shaderStorageSymbol);
+      }
+    } break;
+    case StorageClassStorageBuffer: {
+      ResourceNodeData shaderStorageSymbol = {};
+      if (!getSymbolInfoFromSpvVariable(var, &shaderStorageSymbol))
+        storageBufferInfo.push_back(shaderStorageSymbol);
+    } break;
+    case StorageClassUniformConstant: {
+      if (varElemTy->isTypeImage()) {
+        ResourceNodeData imageSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &imageSymbol)) {
+          SPIRVTypeImage *imageType = static_cast<SPIRVTypeImage *>(varElemTy);
+          imageSymbol.isTexelBuffer = imageType->getDescriptor().Dim == spv::DimBuffer;
+          imageSymbolInfo.push_back(imageSymbol);
+        }
+      } else if (varElemTy->isTypeSampledImage()) {
+        ResourceNodeData textureSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &textureSymbol)) {
+          SPIRVTypeSampledImage *sampledImageType = static_cast<SPIRVTypeSampledImage *>(varElemTy);
+          SPIRVTypeImage *imageType = sampledImageType->getImageType();
+          textureSymbol.isTexelBuffer = imageType->getDescriptor().Dim == spv::DimBuffer;
+          textureSymbolInfo.push_back(textureSymbol);
+        }
+      } else {
+        ResourceNodeData defaultUniformSymbol = {};
+        if (!getSymbolInfoFromSpvVariable(var, &defaultUniformSymbol))
+          defaultUniformSymbolInfo.push_back(defaultUniformSymbol);
+        // Process image sampler in default uniform
+        if (varElemTy->isTypeStruct()) {
+          ResourceNodeData textureSymbol = {};
+          textureSymbol.location = defaultUniformSymbol.location;
+          textureSymbol.arraySize = getSamplerArraySizeInSpvStruct(varElemTy) * defaultUniformSymbol.arraySize;
+          textureSymbol.isDefaultUniformSampler = true;
+          textureSymbolInfo.push_back(textureSymbol);
+        }
+      }
+    } break;
+    case StorageClassAtomicCounter: {
+      ResourceNodeData atomicCounterSymbol = {};
+      if (!getSymbolInfoFromSpvVariable(var, &atomicCounterSymbol))
+        atomicCounterSymbolInfo.push_back(atomicCounterSymbol);
+    } break;
+    default:
+      break;
+    }
+  }
+
+  resourcesNodes.inputInfoCount = inputSymbolInfo.size();
+  resourcesNodes.outputInfoCount = outputSymbolInfo.size();
+  resourcesNodes.uniformBufferInfoCount = uniformBufferInfo.size();
+  resourcesNodes.shaderStorageInfoCount = storageBufferInfo.size();
+  resourcesNodes.textureInfoCount = textureSymbolInfo.size();
+  resourcesNodes.imageInfoCount = imageSymbolInfo.size();
+  resourcesNodes.atomicCounterInfoCount = atomicCounterSymbolInfo.size();
+  resourcesNodes.defaultUniformInfoCount = defaultUniformSymbolInfo.size();
 }
 
 // =====================================================================================================================
@@ -651,8 +993,8 @@ Result Compiler::buildGraphicsShaderStage(const GraphicsPipelineBuildInfo *pipel
 
   MetroHash::Hash cacheHash = {};
   MetroHash::Hash pipelineHash = {};
-  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, true, stage);
-  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false, true, stage);
+  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, stage);
+  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false, stage);
 
   // Compile
   GraphicsContext graphicsContext(m_gfxIp, pipelineInfo, &pipelineHash, &cacheHash);
@@ -860,8 +1202,8 @@ Result Compiler::buildGraphicsPipelineWithElf(const GraphicsPipelineBuildInfo *p
 
   MetroHash::Hash cacheHash = {};
   MetroHash::Hash pipelineHash = {};
-  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, false);
-  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false, false);
+  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true);
+  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false);
 
   std::optional<CacheAccessor> cacheAccessor;
   if (cl::CacheFullPipelines) {
@@ -971,12 +1313,15 @@ Result Compiler::buildUnlinkedShaderInternal(Context *context, ArrayRef<const Pi
 
   // Check the cache for the relocatable shader for this stage.
   MetroHash::Hash cacheHash = {};
+  auto caches = getInternalCaches();
   if (context->getPipelineType() == PipelineType::Graphics) {
     auto pipelineInfo = reinterpret_cast<const GraphicsPipelineBuildInfo *>(context->getPipelineBuildInfo());
-    cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, true, stage);
+    cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, stage);
   } else {
     auto pipelineInfo = reinterpret_cast<const ComputePipelineBuildInfo *>(context->getPipelineBuildInfo());
-    cacheHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, true, true);
+    cacheHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, true);
+    // we have pipeline cache for compute pipeline, Per stage cache is not needed for compute pipeline.
+    caches = {};
   }
   // Note that this code updates m_pipelineHash of the pipeline context. It must be restored.
   context->getPipelineContext()->setHashForCacheLookUp(cacheHash);
@@ -991,7 +1336,7 @@ Result Compiler::buildUnlinkedShaderInternal(Context *context, ArrayRef<const Pi
   });
 
   Result result = Result::Success;
-  CacheAccessor cacheAccessor(context, cacheHash, getInternalCaches());
+  CacheAccessor cacheAccessor(context, cacheHash, caches);
   if (cacheAccessor.isInCache()) {
     BinaryData elfBin = cacheAccessor.getElfFromCache();
     auto data = reinterpret_cast<const char *>(elfBin.pCode);
@@ -1245,7 +1590,8 @@ Result Compiler::buildPipelineInternal(Context *context, ArrayRef<const Pipeline
       }
 
       // If this is TCS, set inputVertices from patchControlPoints in the pipeline state.
-      if (entryStage == ShaderStageTessControl)
+      if (entryStage == ShaderStageTessControl ||
+          (entryStage == ShaderStageTessEval && shaderInfo[ShaderStageTessControl]->pModuleData == nullptr))
         context->getPipelineContext()->setTcsInputVertices(modules[shaderIndex]);
     }
 
@@ -1620,8 +1966,7 @@ Result Compiler::buildGraphicsPipelineWithPartPipelines(Context *context,
         ShaderStage stage = shaderInfoEntry->entryStage;
         if (shaderInfoEntry->pModuleData && isShaderStageInMask(stage, partStageMask)) {
           // This is a shader to include in this part pipeline. Add the shader code and options to the hash.
-          PipelineDumper::updateHashForPipelineShaderInfo(stage, shaderInfoEntry, /*isCacheHash=*/true, &hasher,
-                                                          /*isRelocatableShader=*/false);
+          PipelineDumper::updateHashForPipelineShaderInfo(stage, shaderInfoEntry, /*isCacheHash=*/true, &hasher);
         }
       }
     }
@@ -1750,8 +2095,8 @@ Result Compiler::BuildGraphicsPipeline(const GraphicsPipelineBuildInfo *pipeline
 
   MetroHash::Hash cacheHash = {};
   MetroHash::Hash pipelineHash = {};
-  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true, false);
-  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false, false);
+  cacheHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, true);
+  pipelineHash = PipelineDumper::generateHashForGraphicsPipeline(pipelineInfo, false);
 
   if (result == Result::Success && EnableOuts()) {
     LLPC_OUTS("===============================================================================\n");
@@ -1883,8 +2228,8 @@ Result Compiler::BuildComputePipeline(const ComputePipelineBuildInfo *pipelineIn
 
   MetroHash::Hash cacheHash = {};
   MetroHash::Hash pipelineHash = {};
-  cacheHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, true, false);
-  pipelineHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, false, false);
+  cacheHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, true);
+  pipelineHash = PipelineDumper::generateHashForComputePipeline(pipelineInfo, false);
 
   if (result == Result::Success && EnableOuts()) {
     const ShaderModuleData *moduleData = reinterpret_cast<const ShaderModuleData *>(pipelineInfo->cs.pModuleData);
@@ -2886,7 +3231,7 @@ void Compiler::buildShaderCacheHash(Context *context, unsigned stageMask, ArrayR
     MetroHash64 hasher;
 
     // Update common shader info
-    PipelineDumper::updateHashForPipelineShaderInfo(stage, shaderInfo, true, &hasher, false);
+    PipelineDumper::updateHashForPipelineShaderInfo(stage, shaderInfo, true, &hasher);
     hasher.Update(pipelineInfo->iaState.deviceIndex);
 
     PipelineDumper::updateHashForResourceMappingInfo(context->getResourceMapping(), context->getPipelineLayoutApiHash(),
@@ -2913,15 +3258,14 @@ void Compiler::buildShaderCacheHash(Context *context, unsigned stageMask, ArrayR
 
   // Add additional pipeline state to final hasher
   if (stageMask & getLgcShaderStageMask(ShaderStageFragment)) {
-    PipelineDumper::updateHashForPipelineOptions(pipelineOptions, &fragmentHasher, true, false, UnlinkedStageFragment);
-    PipelineDumper::updateHashForFragmentState(pipelineInfo, &fragmentHasher, false);
+    PipelineDumper::updateHashForPipelineOptions(pipelineOptions, &fragmentHasher, true, UnlinkedStageFragment);
+    PipelineDumper::updateHashForFragmentState(pipelineInfo, &fragmentHasher);
     fragmentHasher.Finalize(fragmentHash->bytes);
   }
 
   if (stageMask & ~getLgcShaderStageMask(ShaderStageFragment)) {
-    PipelineDumper::updateHashForPipelineOptions(pipelineOptions, &nonFragmentHasher, true, false,
-                                                 UnlinkedStageVertexProcess);
-    PipelineDumper::updateHashForNonFragmentState(pipelineInfo, true, &nonFragmentHasher, false);
+    PipelineDumper::updateHashForPipelineOptions(pipelineOptions, &nonFragmentHasher, true, UnlinkedStageVertexProcess);
+    PipelineDumper::updateHashForNonFragmentState(pipelineInfo, true, &nonFragmentHasher);
     nonFragmentHasher.Finalize(nonFragmentHash->bytes);
   }
 }

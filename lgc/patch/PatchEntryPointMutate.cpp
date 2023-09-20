@@ -171,7 +171,7 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   m_userDataUsage.clear();
 
   // Fix up shader input uses to use entry args.
-  shaderInputs.fixupUses(*m_module, m_pipelineState);
+  shaderInputs.fixupUses(*m_module, m_pipelineState, isComputeWithCalls());
 
   m_cpsShaderInputCache.clear();
   return true;
@@ -187,8 +187,15 @@ static void splitIntoI32(const DataLayout &layout, IRBuilder<> &builder, ArrayRe
       StructType *structTy = cast<StructType>(xType);
       for (unsigned idx = 0; idx < structTy->getNumElements(); idx++)
         splitIntoI32(layout, builder, builder.CreateExtractValue(x, idx), output);
-    } else if (isa<ArrayType>(xType)) {
-      llvm_unreachable("Array type not supported yet.");
+    } else if (auto *arrayTy = dyn_cast<ArrayType>(xType)) {
+      auto *elemTy = arrayTy->getElementType();
+      assert(layout.getTypeSizeInBits(elemTy) == 32 && "array of non-32bit type not supported");
+      for (unsigned idx = 0; idx < arrayTy->getNumElements(); idx++) {
+        auto *elem = builder.CreateExtractValue(x, idx);
+        if (!elemTy->isIntegerTy())
+          elem = builder.CreateBitCast(elem, builder.getInt32Ty());
+        output.push_back(elem);
+      }
     } else if (auto *vecTy = dyn_cast<FixedVectorType>(xType)) {
       Type *scalarTy = vecTy->getElementType();
       assert((scalarTy->getPrimitiveSizeInBits() & 0x3) == 0);
@@ -1548,10 +1555,17 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
       specialUserDataArgs.push_back(
           UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.fs.viewIndex));
     }
+
     if (userDataUsage->isSpecialUserDataUsed(UserDataMapping::ColorExportAddr)) {
       assert(m_pipelineState->isUnlinked() && m_pipelineState->getOptions().enableColorExportShader);
       specialUserDataArgs.push_back(
           UserDataArg(builder.getInt32Ty(), "colorExpAddr", UserDataMapping::ColorExportAddr));
+    }
+
+    if (m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs.runAtSampleRate &&
+        (m_pipelineState->isUnlinked() || m_pipelineState->getRasterizerState().dynamicSampleInfo)) {
+      specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "sampleInfo", UserDataMapping::SampleInfo,
+                                                &intfData->entryArgIdxs.fs.sampleInfo));
     }
   }
 

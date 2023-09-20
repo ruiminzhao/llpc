@@ -33,6 +33,7 @@
 #include "vkgcBase.h"
 #include "vulkan.h"
 #include <cassert>
+#include <optional>
 #include <tuple>
 
 // Confliction of Xlib and LLVM headers
@@ -48,7 +49,7 @@
 #define LLPC_INTERFACE_MAJOR_VERSION 66
 
 /// LLPC minor interface version.
-#define LLPC_INTERFACE_MINOR_VERSION 0
+#define LLPC_INTERFACE_MINOR_VERSION 1
 
 #ifndef LLPC_CLIENT_INTERFACE_MAJOR_VERSION
 #error LLPC client version is not defined
@@ -79,11 +80,17 @@
 //  %Version History
 //  | %Version | Change Description                                                                                    |
 //  | -------- | ----------------------------------------------------------------------------------------------------- |
-//  |     66.0 | Rename noContract in PipelineShaderOptions to noContractOpDot
+//  |     66.1 | Add forwardPropagateNoContract and backwardPropagateNoContract to PipelineShaderOptions               |
+//  |     66.0 | Rename noContract in PipelineShaderOptions to noContractOpDot                                         |
 //  |     65.1 | Add disableSampleMask to PipelineOptions                                                              |
 //  |     65.0 | Remove updateDescInElf                                                                                |
+//  |     64.2 | Add dynamicSampleInfo to GraphicsPipelineBuildInfo::rsState                                           |
+//  |     64.1 | Add disableTruncCoordForGather to PipelineOptions.                                                    |
 //  |     64.0 | Add enableColorExportShader to GraphicsPipelineBuildInfo.                                             |
-//  |     63.0 | Add Atomic Counter, its default descriptor and map its concreteType to Buffer.                        |
+//  |     63.3 | Add TesssellationLevel to iaState                                                                     |
+//  |     63.2 | Add vertex64BitsAttribSingleLoc to PipelineOptions                                                    |
+//  |     63.1 | Add forceDisableStreamOut and forceEnablePrimStats to ApiXfbOutData                                   |
+//  |     63.0 | Add Atomic Counter, its default descriptor and map its concertType to Buffer.                         |
 //  |     62.1 | Add ApiXfbOutData GraphicsPipelineBuildInfo                                                           |
 //  |     62.0 | Default to the compiler getting the GPURT library directly, and move shader library info into RtState |
 //  |     61.16| Add replaceSetWithResourceType to PipelineOptions                                                     |
@@ -214,6 +221,20 @@ static const unsigned MaxTextureCoords = 8;
 class IShaderCache;
 class ICache;
 class EntryHandle;
+
+// Hide operator bool to safe-guard against accidents.
+struct optional_bool : private std::optional<bool> {
+  optional_bool() = default;
+  optional_bool(const optional_bool &rhs) = default;
+  optional_bool &operator=(const optional_bool &rhs) = default;
+  optional_bool &operator=(bool rhs) {
+    std::optional<bool>::operator=(rhs);
+    return *this;
+  }
+  using std::optional<bool>::has_value;
+  using std::optional<bool>::value;
+  using std::optional<bool>::value_or;
+};
 
 /// Enumerates result codes of LLPC operations.
 enum class Result : int {
@@ -443,9 +464,6 @@ struct ResourceMappingNode {
       unsigned strideInDwords; ///< Stride of elements in a descriptor array (used for mutable descriptors)
                                ///  a stride of zero will use the type of the node to determine the stride
 #endif
-      unsigned reserv0;
-      unsigned reserv1;
-      unsigned reserv2;
     } srdRange;
     /// Info for hierarchical nodes (DescriptorTableVaPtr)
     struct {
@@ -569,8 +587,13 @@ struct PipelineOptions {
   bool internalRtShaders;                         ///< Whether this pipeline has internal raytracing shaders
   unsigned forceNonUniformResourceIndexStageMask; ///< Mask of the stage to force using non-uniform resource index.
   bool reserved16;
-  bool replaceSetWithResourceType; ///< For OGL only, replace 'set' with resource type during spirv translate
-  bool disableSampleMask;          ///< For OGL only, disabled if framebuffer doesn't attach multisample texture
+  bool replaceSetWithResourceType;        ///< For OGL only, replace 'set' with resource type during spirv translate
+  bool disableSampleMask;                 ///< For OGL only, disabled if framebuffer doesn't attach multisample texture
+  bool buildResourcesDataForShaderModule; ///< For OGL only, build resources usage data while building shader module
+  bool disableTruncCoordForGather;        ///< If set, trunc_coord of sampler srd is disabled for gather4
+  bool enableCombinedTexture;             ///< For OGL only, use the 'set' for DescriptorCombinedTexture
+                                          ///< for sampled images and samplers
+  bool vertex64BitsAttribSingleLoc;       ///< For OGL only, dvec3/dvec4 vertex attrib only consumes 1 location.
 };
 
 /// Prototype of allocator for output data buffer, used in shader-specific operations.
@@ -587,10 +610,14 @@ enum class BinaryType : unsigned {
 
 /// Represents resource node data
 struct ResourceNodeData {
-  ResourceMappingNodeType type; ///< Type of this resource mapping node
-  unsigned set;                 ///< ID of descriptor set
-  unsigned binding;             ///< ID of descriptor binding
-  unsigned arraySize;           ///< Element count for arrayed binding
+  ResourceMappingNodeType type;     ///< Type of this resource mapping node
+  unsigned set;                     ///< ID of descriptor set
+  unsigned binding;                 ///< ID of descriptor binding
+  unsigned arraySize;               ///< Element count for arrayed binding
+  unsigned location;                ///< ID of resource location
+  unsigned isTexelBuffer;           ///< TRUE if it is ImageBuffer or TextureBuffer
+  unsigned isDefaultUniformSampler; ///< TRUE if it's sampler image in default uniform struct
+  BasicType basicType;              ///< Type of the variable or element
 };
 
 /// Represents the information of one shader entry in ShaderModuleExtraData
@@ -601,6 +628,26 @@ struct ShaderModuleEntryData {
   unsigned resNodeDataCount;             ///< Resource node data count
   const ResourceNodeData *pResNodeDatas; ///< Resource node data array
   unsigned pushConstSize;                ///< Push constant size in byte
+};
+
+/// Represents the shader resources
+struct ResourcesNodes {
+  ResourceNodeData *pInputInfo;
+  uint32_t inputInfoCount;
+  ResourceNodeData *pOutputInfo;
+  uint32_t outputInfoCount;
+  ResourceNodeData *pUniformBufferInfo;
+  uint32_t uniformBufferInfoCount;
+  ResourceNodeData *pShaderStorageInfo;
+  uint32_t shaderStorageInfoCount;
+  ResourceNodeData *pTexturesInfo;
+  uint32_t textureInfoCount;
+  ResourceNodeData *pImagesInfo;
+  uint32_t imageInfoCount;
+  ResourceNodeData *pAtomicCounterInfo;
+  uint32_t atomicCounterInfoCount;
+  ResourceNodeData *pDefaultUniformInfo;
+  uint32_t defaultUniformInfoCount;
 };
 
 /// Represents usage info of a shader module
@@ -621,6 +668,7 @@ struct ShaderModuleUsage {
   bool useShadingRate;         ///< Whether shading rate is used
   bool useSampleInfo;          ///< Whether gl_SamplePosition or InterpolateAtSample are used
   bool useClipVertex;          ///< Whether gl_useClipVertex is used
+  ResourcesNodes *pResources;  ///< Resource node for buffers and opaque types
 };
 
 /// Represents common part of shader module data
@@ -851,6 +899,12 @@ struct PipelineShaderOptions {
 
   /// Disable to emulate DX's readfirst lane workaround in BIL
   bool disableReadFirstLaneWorkaround;
+
+  /// Application workaround: back propagate NoContraction decoration to all inputs to a NoContraction operation.
+  bool backwardPropagateNoContract;
+
+  /// Application workaround: forward propagate NoContraction decoration to any related FAdd operation.
+  bool forwardPropagateNoContract;
 };
 
 /// Represents YCbCr sampler meta data in resource descriptor
@@ -1153,8 +1207,16 @@ struct XfbOutInfo {
 
 /// Represents the transform feedback data filled by API interface
 struct ApiXfbOutData {
-  XfbOutInfo *pXfbOutInfos; ///< An array of XfbOutInfo iterms
-  unsigned numXfbOutInfo;   ///< Count of XfbOutInfo iterms
+  XfbOutInfo *pXfbOutInfos;   ///< An array of XfbOutInfo iterms
+  unsigned numXfbOutInfo;     ///< Count of XfbOutInfo iterms
+  bool forceDisableStreamOut; ///< Force to disable stream out XFB outputs
+  bool forceEnablePrimStats;  ///< Force to enable counting generated primitives
+};
+
+/// Represents the tessellation level passed from driver API
+struct TessellationLevel {
+  float inner[2]; ///< Inner tessellation level
+  float outer[4]; ///< Outer tessellation level
 };
 
 /// Represents info to build a graphics pipeline.
@@ -1190,6 +1252,7 @@ struct GraphicsPipelineBuildInfo {
     bool enableMultiView;          ///< Whether to enable multi-view support
     bool useVertexBufferDescArray; ///< Whether vertex buffer descriptors are in a descriptor array binding instead of
                                    ///< the VertexBufferTable
+    TessellationLevel *tessLevel;  ///< Tessellation level passed from driver
   } iaState;                       ///< Input-assembly state
 
   struct {
@@ -1209,6 +1272,7 @@ struct GraphicsPipelineBuildInfo {
     unsigned samplePatternIdx;    ///< Index into the currently bound MSAA sample pattern table that
                                   ///  matches the sample pattern used by the rasterizer when rendering
                                   ///  with this pipeline.
+    unsigned dynamicSampleInfo;   ///< Dynamic sampling is enabled.
     unsigned rasterStream;        ///< Which vertex stream to rasterize
     VkProvokingVertexModeEXT provokingVertexMode; ///< Specifies which vertex of a primitive is the _provoking
                                                   ///  vertex_, this impacts which vertex's "flat" VS outputs

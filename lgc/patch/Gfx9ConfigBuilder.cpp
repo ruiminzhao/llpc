@@ -885,6 +885,7 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
   const auto &xfbStrides = m_pipelineState->getXfbBufferStrides();
   const auto &streamXfbBuffers = m_pipelineState->getStreamXfbBuffers();
   const bool enableXfb = m_pipelineState->enableXfb();
+  const bool enablePrimStats = m_pipelineState->enablePrimStats();
   if (shaderStage == ShaderStageCopyShader) {
     // NOTE: For copy shader, usually we use fixed number of user data registers.
     // But in some cases, we may change user data registers, we use variable to keep user sgpr count here
@@ -893,10 +894,10 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
     setNumAvailSgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxSgprsAvailable);
     setNumAvailVgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxVgprsAvailable);
 
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN, streamXfbBuffers[0] > 0);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, streamXfbBuffers[1] > 0);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, streamXfbBuffers[2] > 0);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, streamXfbBuffers[3] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN, enablePrimStats || streamXfbBuffers[0] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, enablePrimStats || streamXfbBuffers[1] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, enablePrimStats || streamXfbBuffers[2] > 0);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, enablePrimStats || streamXfbBuffers[3] > 0);
     SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, RAST_STREAM, m_pipelineState->getRasterizerState().rasterStream);
   } else {
     const auto &shaderOptions = m_pipelineState->getShaderOptions(shaderStage);
@@ -912,10 +913,10 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
       SET_REG_GFX9_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR_MSB, userSgprMsb);
     }
 
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN, enableXfb);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, false);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, false);
-    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, false);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_0_EN, enablePrimStats || enableXfb);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_1_EN, enablePrimStats);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_2_EN, enablePrimStats);
+    SET_REG_FIELD(&config->vsRegs, VGT_STRMOUT_CONFIG, STREAMOUT_3_EN, enablePrimStats);
 
     setNumAvailSgprs(Util::Abi::HardwareStage::Vs, resUsage->numSgprsAvailable);
     setNumAvailVgprs(Util::Abi::HardwareStage::Vs, resUsage->numVgprsAvailable);
@@ -1627,19 +1628,6 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
                              fragmentMode.postDepthCoverage);
   }
 
-  unsigned depthExpFmt = EXP_FORMAT_ZERO;
-  if (builtInUsage.sampleMask)
-    depthExpFmt = EXP_FORMAT_32_ABGR;
-  else if (builtInUsage.fragStencilRef)
-    depthExpFmt = EXP_FORMAT_32_GR;
-  else if (builtInUsage.fragDepth)
-    depthExpFmt = EXP_FORMAT_32_R;
-  SET_REG_FIELD(&config->psRegs, SPI_SHADER_Z_FORMAT, Z_EXPORT_FORMAT, depthExpFmt);
-
-  unsigned cbShaderMask = resUsage->inOutUsage.fs.cbShaderMask;
-  cbShaderMask = resUsage->inOutUsage.fs.isNullFs ? 0 : cbShaderMask;
-  SET_REG(&config->psRegs, CB_SHADER_MASK, cbShaderMask);
-
   const auto waveSize = m_pipelineState->getShaderWaveSize(shaderStage);
   SET_REG_GFX10_PLUS_FIELD(&config->psRegs, SPI_PS_IN_CONTROL, PS_W32_EN, (waveSize == 32));
 
@@ -1971,17 +1959,20 @@ void ConfigBuilder::buildCsRegConfig(ShaderStage shaderStage, CsRegConfig *confi
   SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TRAP_PRESENT, shaderOptions.trapPresent);
   SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, USER_SGPR, intfData->userDataCount);
 
-  Function *attribFunc = nullptr;
+  Function *entryFunc = nullptr;
   for (Function &func : *m_module) {
-    // Only entrypoint and amd_gfx functions may have the function attribute for workgroup id.
-    if (isShaderEntryPoint(&func) || (func.getCallingConv() == CallingConv::AMDGPU_Gfx)) {
-      attribFunc = &func;
+    // Only entrypoint compute shader may have the function attribute for workgroup id optimization.
+    if (isShaderEntryPoint(&func)) {
+      entryFunc = &func;
       break;
     }
   }
-  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_X_EN, !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-x"));
-  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_Y_EN, !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-y"));
-  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_Z_EN, !attribFunc->hasFnAttribute("amdgpu-no-workgroup-id-z"));
+  bool hasWorkgroupIdX = !entryFunc || !entryFunc->hasFnAttribute("amdgpu-no-workgroup-id-x");
+  bool hasWorkgroupIdY = !entryFunc || !entryFunc->hasFnAttribute("amdgpu-no-workgroup-id-y");
+  bool hasWorkgroupIdZ = !entryFunc || !entryFunc->hasFnAttribute("amdgpu-no-workgroup-id-z");
+  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_X_EN, hasWorkgroupIdX);
+  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_Y_EN, hasWorkgroupIdY);
+  SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TGID_Z_EN, hasWorkgroupIdZ);
   SET_REG_FIELD(config, COMPUTE_PGM_RSRC2, TG_SIZE_EN, true);
 
   // 0 = X, 1 = XY, 2 = XYZ

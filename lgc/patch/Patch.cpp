@@ -54,6 +54,7 @@
 #include "lgc/patch/PatchResourceCollect.h"
 #include "lgc/patch/PatchSetupTargetFeatures.h"
 #include "lgc/patch/PatchWorkarounds.h"
+#include "lgc/patch/TcsPassthroughShader.h"
 #include "lgc/patch/VertexFetch.h"
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
@@ -116,7 +117,7 @@ namespace lgc {
 // @param optLevel : The optimization level uses to adjust the aggressiveness of
 //                   passes and which passes to add.
 void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, Timer *patchTimer, Timer *optTimer,
-                      Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, CodeGenOpt::Level optLevel) {
+                      Pipeline::CheckShaderCacheFunc checkShaderCacheFunc, uint32_t optLevel) {
   // Start timer for patching passes.
   if (patchTimer)
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
@@ -132,6 +133,10 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, T
 
   passMgr.addPass(IPSCCPPass());
   passMgr.addPass(LowerDebugPrintf());
+
+  if (pipelineState->hasShaderStage(ShaderStageVertex) && !pipelineState->hasShaderStage(ShaderStageTessControl) &&
+      pipelineState->hasShaderStage(ShaderStageTessEval))
+    passMgr.addPass(TcsPassthroughShader());
 
   passMgr.addPass(PatchNullFragShader());
   passMgr.addPass(PatchResourceCollect()); // also removes inactive/unused resources
@@ -335,7 +340,7 @@ void Patch::registerPasses(PassBuilder &passBuilder) {
 // @param [in/out] passMgr : Pass manager to add passes to
 // @param optLevel : The optimization level uses to adjust the aggressiveness of
 //                   passes and which passes to add.
-void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level optLevel) {
+void Patch::addOptimizationPasses(lgc::PassManager &passMgr, uint32_t optLevel) {
   LLPC_OUTS("PassManager optimization level = " << optLevel << "\n");
 
   passMgr.addPass(ForceFunctionAttrsPass());
@@ -378,6 +383,7 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
   fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm2), true));
   fpm.addPass(LoopUnrollPass(
       LoopUnrollOptions(optLevel).setPeeling(true).setRuntime(false).setUpperBound(false).setPartial(false)));
+  fpm.addPass(SROAPass(SROAOptions::ModifyCFG));
 #if LLVM_MAIN_REVISION && LLVM_MAIN_REVISION < 464212
   // Old version of the code
   fpm.addPass(ScalarizerPass());
@@ -402,6 +408,7 @@ void Patch::addOptimizationPasses(lgc::PassManager &passMgr, CodeGenOpt::Level o
                                   .needCanonicalLoops(true)
                                   .sinkCommonInsts(true)));
   fpm.addPass(LoopUnrollPass(LoopUnrollOptions(optLevel)));
+  fpm.addPass(SROAPass(SROAOptions::ModifyCFG));
   // uses UniformityAnalysis
   fpm.addPass(PatchReadFirstLane());
   fpm.addPass(InstCombinePass(instCombineOpt));
