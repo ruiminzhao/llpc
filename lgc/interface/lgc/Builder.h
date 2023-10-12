@@ -110,6 +110,11 @@ public:
     m_data.bits.component = component;
   }
 
+  bool isDualSourceBlendDynamic() const { return m_data.bits.dualSourceBlendDynamic; }
+  void setDualSourceBlendDynamic(bool dualSourceBlendDynamic = true) {
+    m_data.bits.dualSourceBlendDynamic = dualSourceBlendDynamic;
+  }
+
 private:
   union {
     struct {
@@ -125,6 +130,7 @@ private:
                                  //    whole array or of an element with a variable index.
       unsigned perPrimitive : 1; // Mesh shader output: whether it is a per-primitive output
       unsigned component : 2;    // Component offset, specifying which components within a location is consumed
+      unsigned dualSourceBlendDynamic : 1; // Fs output: whether it's dynamic dual source blend output
     } bits;
     unsigned u32All;
   } m_data;
@@ -822,6 +828,13 @@ public:
   // @param value : Input value
   // @param instName : Name to give instruction(s)
   llvm::Value *CreateCountLeadingSignBits(llvm::Value *value, const llvm::Twine &instName = "");
+
+  // Create "msad" (Masked Sum of Absolute Differences) operation , returning an 32-bit integer of msad result.
+  //
+  // @param src : Contains 4 packed 8-bit unsigned integers in 32 bits.
+  // @param ref : Contains 4 packed 8-bit unsigned integers in 32 bits.
+  // @param accum : A 32-bit unsigned integer, providing an existing accumulation.
+  llvm::Value *CreateMsad4(llvm::Value *src, llvm::Value *ref, llvm::Value *accum, const llvm::Twine &instName = "");
 
   // Create "fmix" operation, returning ( 1 - A ) * X + A * Y. Result would be FP scalar or vector value.
   // Returns scalar, if and only if "pX", "pY" and "pA" are all scalars.
@@ -1544,27 +1557,28 @@ public:
   llvm::Value *CreateSubgroupClusteredExclusive(GroupArithOp groupArithOp, llvm::Value *const value,
                                                 llvm::Value *const clusterSize, const llvm::Twine &instName = "");
 
-  // Create a subgroup quad broadcast.
+  // Create a quad broadcast.
   //
   // @param value : The value to broadcast
   // @param index : The index within the quad to broadcast from
+  // @param inWQM : Whether it's in whole quad mode
   // @param instName : Name to give instruction(s)
-  llvm::Value *CreateSubgroupQuadBroadcast(llvm::Value *const value, llvm::Value *const index,
+  llvm::Value *CreateSubgroupQuadBroadcast(llvm::Value *const value, llvm::Value *const index, bool inWQM = true,
                                            const llvm::Twine &instName = "");
 
-  // Create a subgroup quad swap horizontal.
+  // Create a quad swap horizontal.
   //
   // @param value : The value to swap
   // @param instName : Name to give instruction(s)
   llvm::Value *CreateSubgroupQuadSwapHorizontal(llvm::Value *const value, const llvm::Twine &instName = "");
 
-  // Create a subgroup quad swap vertical.
+  // Create a quad swap vertical.
   //
   // @param value : The value to swap
   // @param instName : Name to give instruction(s)
   llvm::Value *CreateSubgroupQuadSwapVertical(llvm::Value *const value, const llvm::Twine &instName = "");
 
-  // Create a subgroup quad swap diagonal.
+  // Create a quad swap diagonal.
   //
   // @param value : The value to swap
   // @param instName : Name to give instruction(s)

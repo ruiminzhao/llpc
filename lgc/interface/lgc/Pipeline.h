@@ -123,15 +123,18 @@ static const char SampleShadingMetaName[] = "lgc.sample.shading";
 union Options {
   unsigned u32All[34];
   struct {
-    uint64_t hash[2];                    // Pipeline hash to set in ELF PAL metadata
-    unsigned includeDisassembly;         // If set, the disassembly for all compiled shaders will be included
-                                         //   in the pipeline ELF.
-    unsigned reconfigWorkgroupLayout;    // If set, allows automatic workgroup reconfigure to take place on
-                                         //   compute shaders.
-    bool forceCsThreadIdSwizzling;       // Force rearranges threadId within group into blocks of 8*8 or 8*4.
-    unsigned overrideThreadGroupSizeX;   // Override value for thread group size.X
-    unsigned overrideThreadGroupSizeY;   // Override value for thread group size.Y
-    unsigned overrideThreadGroupSizeZ;   // Override value for thread group size.Z
+    uint64_t hash[2];                 // Pipeline hash to set in ELF PAL metadata
+    unsigned includeDisassembly;      // If set, the disassembly for all compiled shaders will be included
+                                      //   in the pipeline ELF.
+    unsigned reconfigWorkgroupLayout; // If set, allows automatic workgroup reconfigure to take place on
+                                      //   compute shaders.
+    bool forceCsThreadIdSwizzling;    // Force rearranges threadId within group into blocks of 8*8 or 8*4.
+
+    // Unused members, kept in place to keep LLVM IR metadata stable.
+    unsigned unused0;
+    unsigned unused1;
+    unsigned unused2;
+
     unsigned includeIr;                  // If set, the IR for all compiled shaders will be included in the
                                          //   pipeline ELF.
     unsigned nggFlags;                   // Flags to control NGG (NggFlag* values ored together)
@@ -170,6 +173,7 @@ union Options {
     bool disableSampleMask;       // Disable export of sample mask from PS
     bool reserved20;
     RayTracingIndirectMode rtIndirectMode; // Ray tracing indirect mode
+    bool enablePrimGeneratedQuery;         // Whether to enable primitive generated counter
   };
 };
 static_assert(sizeof(Options) == sizeof(Options::u32All));
@@ -190,7 +194,7 @@ struct ColorExportInfo {
 // Note: new fields must be added to the end of this structure to maintain test compatibility.
 // The front-end should zero-initialize this with "= {}" in case future changes add new fields.
 union ShaderOptions {
-  unsigned u32All[32];
+  unsigned u32All[34];
   struct {
     uint64_t hash[2];     // Shader hash to set in ELF PAL metadata
     unsigned trapPresent; // Indicates a trap handler will be present when this pipeline is executed,
@@ -265,14 +269,10 @@ union ShaderOptions {
     // Attempt to scalarize waterfall descriptor loads.
     bool scalarizeWaterfallLoads;
 
-    /// Override value for ThreadGroupSizeX
-    unsigned overrideShaderThreadGroupSizeX;
-
-    /// Override value for ThreadGroupSizeY
-    unsigned overrideShaderThreadGroupSizeY;
-
-    /// Override value for ThreadGroupSizeZ
-    unsigned overrideShaderThreadGroupSizeZ;
+    // Unused members, kept in place to keep LLVM IR metadata stable.
+    unsigned unused0;
+    unsigned unused1;
+    unsigned unused2;
 
     // When there is a valid "feedback loop" in renderpass, lateZ needs to be enabled
     // In Vulkan a "feedback loop" is described as a subpass where there is at least
@@ -288,6 +288,8 @@ union ShaderOptions {
 
     /// Aggressively mark shader loads as invariant (where it is safe to do so).
     InvariantLoadsOption aggressiveInvariantLoads;
+
+    bool reserved;
   };
 };
 static_assert(sizeof(ShaderOptions) == sizeof(ShaderOptions::u32All));
@@ -386,6 +388,7 @@ enum BufDataFormat {
   BufDataFormat5_6_5_1_Bgra,
   BufDataFormat1_5_6_5,
   BufDataFormat5_9_9_9,
+  BufDataFormat8_A
 };
 
 // Numeric format of vertex buffer entry. These match the GFX9 hardware encoding.
@@ -398,6 +401,7 @@ enum BufNumFormat {
   BufNumFormatSint = 5,
   BufNumFormatSnorm_Ogl = 6,
   BufNumFormatFloat = 7,
+  BufNumFormatFixed = 8,
   // Extra formats not in GFX9 hardware encoding:
   BufNumFormatSrgb,
   BufNumFormatOther,
@@ -454,8 +458,9 @@ struct ColorExportFormat {
 
 // Struct to pass to SetColorExportState
 struct ColorExportState {
-  unsigned alphaToCoverageEnable; // Enable alpha to coverage
-  unsigned dualSourceBlendEnable; // Blend state bound at draw time will use a dual source blend mode
+  unsigned alphaToCoverageEnable;        // Enable alpha to coverage
+  unsigned dualSourceBlendEnable;        // Blend state bound at draw time will use a dual source blend mode
+  unsigned dynamicDualSourceBlendEnable; // Dynamic dual source blend enable
 };
 
 // Struct to pass to SetInputAssemblyState.
@@ -634,6 +639,7 @@ struct FragmentShaderMode {
   unsigned earlyFragmentTests;
   unsigned postDepthCoverage;
   unsigned earlyAndLatFragmentTests;
+  unsigned innerCoverage;
   ConservativeDepth conservativeDepth;
   ConservativeDepth conservativeStencilFront;
   ConservativeDepth conservativeStencilBack;
@@ -653,6 +659,7 @@ struct ComputeShaderMode {
   unsigned workgroupSizeX;    // X dimension of workgroup size. 0 is taken to be 1
   unsigned workgroupSizeY;    // Y dimension of workgroup size. 0 is taken to be 1
   unsigned workgroupSizeZ;    // Z dimension of workgroup size. 0 is taken to be 1
+  unsigned subgroupSize;      // Override for the wave size if it is non-zero
   DerivativeMode derivatives; // derivativeMode for computeShader
 };
 
@@ -668,15 +675,14 @@ enum class PipelineLink : unsigned {
 struct FsOutInfo {
   unsigned hwColorTarget; // HW color output index
   unsigned location;      // Output location in resource layout
-  bool isSigned;          // Whether is signed
+  unsigned isSigned;      // Whether is signed
   char typeName[8];       // Output data type Name, like v3f32
 };
 
 // Represents shader meta data
 struct FragmentOutputs {
-  FsOutInfo *fsOutInfos;   // The color export information.
+  unsigned discard;        // Whether this fragment shader has kill enabled.
   unsigned fsOutInfoCount; // The number of color exports.
-  bool discard;            // Whether this fragment shader has kill enabled.
 };
 
 // =====================================================================================================================

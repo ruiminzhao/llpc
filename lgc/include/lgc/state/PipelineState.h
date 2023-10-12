@@ -284,7 +284,7 @@ public:
   // Accessors for color export state
   const ColorExportFormat &getColorExportFormat(unsigned location);
   const bool hasColorExportFormats() { return !m_colorExportFormats.empty(); }
-  const ColorExportState &getColorExportState() { return m_colorExportState; }
+  ColorExportState &getColorExportState() { return m_colorExportState; }
 
   // Accessors for pipeline state
   unsigned getDeviceIndex() const { return m_deviceIndex; }
@@ -397,7 +397,8 @@ public:
   bool enableXfb() const { return m_xfbStateMetadata.enableXfb; }
 
   // Check if we need count primitives if XFB is disabled
-  bool enablePrimStats() const { return m_xfbStateMetadata.enablePrimStats; }
+  // NOTE: The old interface m_xfbStateMetadata.enablePrimStats will be removed later
+  bool enablePrimStats() const { return m_options.enablePrimGeneratedQuery || m_xfbStateMetadata.enablePrimStats; }
 
   // Get transform feedback strides
   const std::array<unsigned, MaxTransformFeedbackBuffers> &getXfbBufferStrides() const {

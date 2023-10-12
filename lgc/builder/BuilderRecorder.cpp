@@ -168,6 +168,8 @@ StringRef BuilderRecorder::getCallName(BuilderOpcode opcode) {
     return "count.leading.sign.bits";
   case BuilderOpcode::FMix:
     return "fmix";
+  case BuilderOpcode::Msad4:
+    return "msad4";
   case BuilderOpcode::LoadBufferDesc:
     return "load.buffer.desc";
   case BuilderOpcode::GetDescStride:
@@ -254,8 +256,6 @@ StringRef BuilderRecorder::getCallName(BuilderOpcode opcode) {
     return "image.get.lod";
   case BuilderOpcode::ImageBvhIntersectRay:
     return "image.bvh.intersect.ray";
-  case BuilderOpcode::Reserved2:
-    return "reserved2";
   case BuilderOpcode::GetWaveSize:
     return "get.wave.size";
   case BuilderOpcode::GetSubgroupSize:
@@ -1027,6 +1027,16 @@ Value *Builder::CreateFindSMsb(Value *value, const Twine &instName) {
 // @param instName : Name to give instruction(s)
 Value *Builder::CreateCountLeadingSignBits(Value *value, const Twine &instName) {
   return record(BuilderOpcode::CountLeadingSignBits, value->getType(), value, instName);
+}
+
+// =====================================================================================================================
+// Create "msad" (Masked Sum of Absolute Differences) operation , returning an 32-bit integer of msad result.
+//
+// @param ref : Contains 4 packed 8-bit unsigned integers in 32 bits.
+// @param src : Contains 4 packed 8-bit unsigned integers in 32 bits.
+// @param accum : A 32-bit unsigned integer, providing an existing accumulation.
+Value *Builder::CreateMsad4(Value *src, Value *ref, Value *accum, const Twine &instName) {
+  return record(BuilderOpcode::Msad4, src->getType(), {src, ref, accum}, instName);
 }
 
 // =====================================================================================================================
@@ -1854,9 +1864,10 @@ Value *Builder::CreateSubgroupClusteredExclusive(GroupArithOp groupArithOp, Valu
 //
 // @param value : The value to broadcast
 // @param index : The index within the quad to broadcast from
+// @param inWQM : Whether it's in whole quad mode
 // @param instName : Name to give instruction(s)
-Value *Builder::CreateSubgroupQuadBroadcast(Value *const value, Value *const index, const Twine &instName) {
-  return record(BuilderOpcode::SubgroupQuadBroadcast, value->getType(), {value, index}, instName);
+Value *Builder::CreateSubgroupQuadBroadcast(Value *const value, Value *const index, bool inWQM, const Twine &instName) {
+  return record(BuilderOpcode::SubgroupQuadBroadcast, value->getType(), {value, index, getInt1(inWQM)}, instName);
 }
 
 // =====================================================================================================================
@@ -2005,6 +2016,7 @@ Instruction *Builder::record(BuilderOpcode opcode, Type *resultTy, ArrayRef<Valu
     case BuilderOpcode::FaceForward:
     case BuilderOpcode::FindSMsb:
     case BuilderOpcode::CountLeadingSignBits:
+    case BuilderOpcode::Msad4:
     case BuilderOpcode::Fma:
     case BuilderOpcode::FpTruncWithRounding:
     case BuilderOpcode::Fract:

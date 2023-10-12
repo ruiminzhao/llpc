@@ -1215,6 +1215,27 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
           // and "BuiltInSubgroupXXXMask" share the same numeric values.
           inOutValue = m_builder->CreateBitCast(inOutValue, FixedVectorType::get(inOutTy, 2));
           inOutValue = m_builder->CreateExtractElement(inOutValue, uint64_t(0));
+        } else if (builtIn == lgc::BuiltInFragCoord) {
+          auto buildInfo = static_cast<const Vkgc::GraphicsPipelineBuildInfo *>(m_context->getPipelineBuildInfo());
+          if (buildInfo->originUpperLeft !=
+              static_cast<const ShaderModuleData *>(buildInfo->fs.pModuleData)->usage.originUpperLeft) {
+            unsigned offset = 0;
+            auto winSize = getUniformConstantEntryByLocation(m_context, m_shaderStage,
+                                                             Vkgc::GlCompatibilityUniformLocation::FrameBufferSize);
+            if (winSize) {
+              offset = winSize->offset;
+              Value *bufferDesc =
+                  m_builder->CreateLoadBufferDesc(Vkgc::InternalDescriptorSetId, Vkgc::ConstantBuffer0Binding,
+                                                  m_builder->getInt32(0), lgc::Builder::BufferFlagNonConst);
+              // Layout is {width, height}, so the offset of height is added sizeof(float).
+              Value *winHeightPtr =
+                  m_builder->CreateConstInBoundsGEP1_32(m_builder->getInt8Ty(), bufferDesc, offset + sizeof(float));
+              auto winHeight = m_builder->CreateLoad(m_builder->getFloatTy(), winHeightPtr);
+              auto fragCoordY = m_builder->CreateExtractElement(inOutValue, 1);
+              fragCoordY = m_builder->CreateFSub(winHeight, fragCoordY);
+              inOutValue = m_builder->CreateInsertElement(inOutValue, fragCoordY, 1);
+            }
+          }
         }
         if (inOutValue->getType()->isIntegerTy(1)) {
           // Convert i1 to i32.
@@ -1425,6 +1446,9 @@ void SpirvLowerGlobal::addCallInstForOutputExport(Value *outputValue, Constant *
                               cast<ConstantInt>(locOffset)->getZExtValue(), outputInfo);
     }
 
+    if (m_context->getPipelineContext()->getUseDualSourceBlend()) {
+      outputInfo.setDualSourceBlendDynamic(true);
+    }
     m_builder->CreateWriteGenericOutput(outputValue, location, locOffset, elemIdx, maxLocOffset, outputInfo,
                                         vertexOrPrimitiveIdx);
   }
@@ -1816,7 +1840,6 @@ void SpirvLowerGlobal::lowerBufferBlock() {
       // Check if our block is an array of blocks.
       if (global.getValueType()->isArrayTy()) {
         Type *const elementType = global.getValueType()->getArrayElementType();
-        Type *const blockType = elementType->getPointerTo(global.getAddressSpace());
 
         // We need to run over the users of the global, find the GEPs, and add a load for each.
         for (User *const user : global.users()) {
@@ -1950,7 +1973,6 @@ void SpirvLowerGlobal::lowerBufferBlock() {
                 bufferFlags |= lgc::Builder::BufferFlagWritten;
 
               Value *bufferDescs[2] = {nullptr};
-              Value *bitCasts[2] = {nullptr};
               unsigned descSets[2] = {descSet, 0};
               unsigned bindings[2] = {binding, 0};
               GlobalVariable *globals[2] = {&global, nullptr};
@@ -1982,11 +2004,7 @@ void SpirvLowerGlobal::lowerBufferBlock() {
                   auto descPtr = m_builder->CreateGetDescPtr(descTy, descTy, descSet, binding);
                   auto stride = m_builder->CreateGetDescStride(descTy, descTy, descSet, binding);
                   auto index = m_builder->CreateMul(blockIndex, stride);
-                  Value *castDescPtr = m_builder->CreateBitCast(
-                      descPtr,
-                      m_builder->getInt8Ty()->getPointerTo(cast<PointerType>(descPtr->getType())->getAddressSpace()));
-                  Value *indexedDescPtr = m_builder->CreateGEP(m_builder->getInt8Ty(), castDescPtr, index);
-                  bufferDescs[idx] = m_builder->CreateBitCast(indexedDescPtr, descPtr->getType());
+                  bufferDescs[idx] = m_builder->CreateGEP(m_builder->getInt8Ty(), descPtr, index);
                 } else {
                   bufferDescs[idx] =
                       m_builder->CreateLoadBufferDesc(descSets[idx], bindings[idx], blockIndex, bufferFlags);
@@ -1994,15 +2012,13 @@ void SpirvLowerGlobal::lowerBufferBlock() {
                 // If the global variable is a constant, the data it points to is invariant.
                 if (global.isConstant())
                   m_builder->CreateInvariantStart(bufferDescs[idx]);
-
-                bitCasts[idx] = m_builder->CreateBitCast(bufferDescs[idx], blockType);
               }
 
               Value *newSelect = nullptr;
               if (select)
-                newSelect = m_builder->CreateSelect(select->getCondition(), bitCasts[0], bitCasts[1]);
+                newSelect = m_builder->CreateSelect(select->getCondition(), bufferDescs[0], bufferDescs[1]);
 
-              Value *base = newSelect ? newSelect : bitCasts[0];
+              Value *base = newSelect ? newSelect : bufferDescs[0];
               // If zero-index elimination removed leading zeros from OldGEP indices then we need to use OldGEP Source
               // type as a Source type for newGEP. In other cases use global variable array element type.
               Type *newGetElemType = gepsLeadingZerosEliminated ? getElemPtr->getSourceElementType() : elementType;
@@ -2059,8 +2075,6 @@ void SpirvLowerGlobal::lowerBufferBlock() {
         if (global.isConstant())
           m_builder->CreateInvariantStart(bufferDesc);
 
-        Value *const bitCast = m_builder->CreateBitCast(bufferDesc, global.getType());
-
         SmallVector<Instruction *, 8> usesToReplace;
 
         for (User *const user : global.users()) {
@@ -2077,11 +2091,11 @@ void SpirvLowerGlobal::lowerBufferBlock() {
           usesToReplace.push_back(inst);
         }
 
-        Value *newLoadPtr = bitCast;
+        Value *newLoadPtr = bufferDesc;
         if (atomicCounterMD) {
           SmallVector<Value *, 8> indices;
           indices.push_back(m_builder->getInt32(atomicCounterMeta.offset));
-          newLoadPtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bitCast, indices);
+          newLoadPtr = m_builder->CreateInBoundsGEP(m_builder->getInt8Ty(), bufferDesc, indices);
         }
 
         for (Instruction *const use : usesToReplace)

@@ -188,11 +188,15 @@ private:
 
   void handleContinuationStackIsGlobal(Function &Func);
 
+  void handleGetFuncAddr(Function &Func);
+
   void handleAmdInternalFunc(Function &Func);
 
   void handleUnrematerializableCandidates();
 
   void collectDriverFunctions();
+
+  void handleGetUninitialized(Function &Func);
 
   // Copy the payload content between global payload and local payload.
   // Excludes the stack pointer or hit attributes which may also reside in
@@ -288,6 +292,11 @@ private:
   SmallVector<Function *> Awaits;
   SmallVector<Function *> RestoreSystemDatas;
   SmallVector<Value *> EntriesWithPayloadTypeMetadata;
+
+  // We specialize certain intrinsics that lead to suspend-points (TraceRay,
+  // CallShader, ReportHit) based on the payload or hit attribute type.
+  // We store these types (either payload or hit attribute) here for later use.
+  DenseMap<Function *, Type *> PayloadOrAttrTypesForSpecializedFunctions;
 };
 
 } // namespace llvm

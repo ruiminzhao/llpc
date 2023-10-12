@@ -682,7 +682,8 @@ static void createNestedStructHierarchyRecursively(
     Node.LifetimeClass = Node.Children[0].LifetimeClass;
 }
 
-static void dumpPAQTree(StructType *PayloadType, const PAQNode &Node) {
+[[maybe_unused]] static void dumpPAQTree(StructType *PayloadType,
+                                         const PAQNode &Node) {
   // print for testing
   llvm::dbgs() << "PAQ qualifiers for payload struct " << PayloadType->getName()
                << ":\n";
@@ -937,7 +938,7 @@ checkSerializationLayout(const PAQSerializationLayout &Layout,
 //       structs. If at some point we also use inner nodes in serialization
 //       structs, we should also check consistency between a node and its
 //       ancestors (i.e. parent structs).
-static void checkTraceRaySerializationInfoImpl(
+[[maybe_unused]] static void checkTraceRaySerializationInfoImpl(
     ArrayRef<const PAQSerializationLayout *> Layouts,
     const SmallDenseMap<const PAQNode *, const PAQNode *> &EquivalentNodes,
     const DataLayout &DL) {
@@ -1012,7 +1013,7 @@ static void checkTraceRaySerializationInfoImpl(
 // HitGroupLayouts in TraceRaySerializationInfo are not checked.
 // However, if HitGroupLayout is non-null, its consistency with the
 // other layouts will be checked as well.
-static void checkTraceRaySerializationInfo(
+[[maybe_unused]] static void checkTraceRaySerializationInfo(
     const PAQTraceRaySerializationInfo &TraceRaySerializationInfo,
     const DataLayout &DL,
     const PAQHitGroupLayoutInfo *HitGroupLayout = nullptr) {
@@ -1655,13 +1656,16 @@ PAQTraceRaySerializationInfo::create(Module &M,
   // Some serialization structs include storage for committed hit attributes.
   // Because we do not know whether intersection shaders are part of the
   // pipeline or not, let alone the maximum size of occurring attribute types,
-  // we need to be pessimistic and assume the largest size allowed by the API.
-  // SystemData provides some storage for attributes (currently 2 registers),
-  // which leaves 6 registers in the payload storage.
-  // A whole-pipeline analysis should allow to eliminate these registers,
-  // e.g. in case no intersection shaders are present.
+  // we need to be pessimistic and assume the maximum possible hit attribute
+  // size as specified by the app, obtained from
+  // PAQConfig.MaxHitAttributeByteCount. SystemData provides some storage for
+  // attributes (currently 2 registers), which leaves 6 registers in the payload
+  // storage. A whole-pipeline analysis should allow to eliminate these
+  // registers, e.g. in case no intersection shaders are present.
   assert(PAQConfig.MaxHitAttributeByteCount <= GlobalMaxHitAttributeBytes);
-  const uint64_t InlineHitAttrBytes = getInlineHitAttrsBytes(M);
+  const uint32_t MaxInlineHitAttrBytes = getInlineHitAttrsBytes(M);
+  const uint32_t InlineHitAttrBytes =
+      std::min(MaxInlineHitAttrBytes, PAQConfig.MaxHitAttributeByteCount);
   const uint64_t PayloadHitAttrI32s = divideCeil(
       PAQConfig.MaxHitAttributeByteCount - InlineHitAttrBytes, RegisterBytes);
 
@@ -1782,7 +1786,7 @@ PAQHitGroupLayoutInfo PAQTraceRaySerializationInfo::createHitGroupLayoutInfo(
   return HitGroupLayoutInfo;
 }
 
-static void
+[[maybe_unused]] static void
 checkCallShaderSerializationInfo(const PAQCallShaderSerializationInfo &Info,
                                  const DataLayout &DL) {
   checkSerializationLayout(Info.CallShaderSerializationLayout, DL);
