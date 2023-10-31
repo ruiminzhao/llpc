@@ -121,7 +121,7 @@ static const char SampleShadingMetaName[] = "lgc.sample.shading";
 // The front-end should zero-initialize a struct with "= {}" in case future changes add new fields.
 // Note: new fields must be added to the end of this structure to maintain test compatibility.
 union Options {
-  unsigned u32All[34];
+  unsigned u32All[36];
   struct {
     uint64_t hash[2];                 // Pipeline hash to set in ELF PAL metadata
     unsigned includeDisassembly;      // If set, the disassembly for all compiled shaders will be included
@@ -171,7 +171,7 @@ union Options {
                                   // meta data.
     bool fragCoordUsesInterpLoc;  // Determining fragCoord use InterpLoc
     bool disableSampleMask;       // Disable export of sample mask from PS
-    bool reserved20;
+    unsigned reserved20;
     RayTracingIndirectMode rtIndirectMode; // Ray tracing indirect mode
     bool enablePrimGeneratedQuery;         // Whether to enable primitive generated counter
   };
@@ -454,6 +454,7 @@ struct ColorExportFormat {
   unsigned blendEnable;          // Blend will be enabled for this target at draw time
   unsigned blendSrcAlphaToColor; // Whether source alpha is blended to color channels for this target
                                  //  at draw time
+  unsigned channelWriteMask;     // Write mask to specify destination channels
 };
 
 // Struct to pass to SetColorExportState
@@ -463,12 +464,20 @@ struct ColorExportState {
   unsigned dynamicDualSourceBlendEnable; // Dynamic dual source blend enable
 };
 
+// MultiView supporting mode
+enum class MultiViewMode : unsigned {
+  Disable = 0, // Disabled
+  Simple = 1,  // Current Vulkan behavior, i.e. RT layer set to view index, viewport index set by shader
+  PerView = 2, // Both RT layer and viewport index set by shader (with shader output defaulting to 0),
+               // offset by a base that's taken from the ViewId userdata
+};
+
 // Struct to pass to SetInputAssemblyState.
 struct InputAssemblyState {
   PrimitiveType primitiveType;       // Primitive type
   unsigned disableVertexReuse;       // Disable reusing vertex shader output for indexed draws
   unsigned switchWinding;            // Whether to reverse vertex ordering for tessellation
-  unsigned enableMultiView;          // Whether to enable multi-view support
+  MultiViewMode multiView;           // MultiView mode
   unsigned useVertexBufferDescArray; // Whether vertex buffer descriptors are in a descriptor array binding instead of
                                      // the VertexBufferTable
 };

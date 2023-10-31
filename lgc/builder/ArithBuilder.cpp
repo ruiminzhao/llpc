@@ -407,7 +407,8 @@ Value *BuilderImpl::CreateATan(Value *yOverX, const Twine &instName) {
   Value *outsideBound = CreateSelect(CreateFCmpOGT(absX, one), one, zero);
   result = CreateFMul(outsideBound, result);
   result = CreateFAdd(partialResult, result);
-  return CreateFMul(result, CreateFSign(yOverX));
+  result = CreateFMul(result, CreateFSign(yOverX));
+  return CreateSelect(CreateIsNaN(yOverX), ConstantFP::getNaN(yOverX->getType()), result);
 }
 
 // =====================================================================================================================
@@ -452,9 +453,9 @@ Value *BuilderImpl::CreateATan2(Value *y, Value *x, const Twine &instName) {
   Value *result = CreateATan(yOverX);
   Value *addP1 = CreateFAdd(result, p1);
   result = CreateSelect(CreateFCmpOLT(x, zero), addP1, result);
-  result = CreateSelect(CreateFCmpONE(x, zero), result, p0);
+  result = CreateSelect(CreateFCmpUNE(x, zero), result, p0);
   Value *zeroOrPi = CreateSelect(CreateFCmpOGT(x, zero), zero, getPi(x->getType()));
-  result = CreateSelect(CreateFCmpONE(y, zero), result, zeroOrPi, instName);
+  result = CreateSelect(CreateFCmpUNE(y, zero), result, zeroOrPi, instName);
   return result;
 }
 
@@ -513,6 +514,18 @@ Value *BuilderImpl::CreateTanh(Value *x, const Twine &instName) {
   Value *doubleSinh = CreateFSub(exp, expNeg);
   Value *doubleCosh = CreateFAdd(exp, expNeg);
   Value *result = fDivFast(doubleSinh, doubleCosh);
+
+  if (!getFastMathFlags().noInfs()) {
+    // NOTE: If the fast math flags might have INFs, we should check the special case when the input is +INF or -INF.
+    // According to the limit of tanh(x), we have following definitions:
+    //                  / 1.0, when x -> +INF
+    //   lim(tanh(x)) =
+    //                  \ -1.0, when x -> -INF
+    Value *one = ConstantFP::get(x->getType(), 1.0);
+    Value *isInf = CreateIsInf(x);
+    result = CreateSelect(isInf, CreateCopySign(one, x), result);
+  }
+
   result->setName(instName);
   return result;
 }
@@ -816,13 +829,13 @@ Value *BuilderImpl::CreateNormalizeVector(Value *x, const Twine &instName) {
   Value *dot = CreateDotProduct(x, x);
   Value *sqrt = CreateSqrt(dot);
   Value *rsq = CreateFDiv(ConstantFP::get(sqrt->getType(), 1.0), sqrt);
-  // We use fmul.legacy for float so that a zero vector is normalized to a zero vector,
-  // rather than NaNs. We must scalarize it ourselves.
-  Value *result = scalarize(x, [this, rsq](Value *x) -> Value * {
-    if (rsq->getType()->isFloatTy())
-      return CreateIntrinsic(Intrinsic::amdgcn_fmul_legacy, {}, {x, rsq});
-    return CreateFMul(x, rsq);
-  });
+  if (x->getType()->getScalarType()->isFloatTy()) {
+    // Make sure a FP32 zero vector is normalized to a FP32 zero vector, rather than NaNs.
+    auto zero = ConstantFP::get(getFloatTy(), 0.0);
+    auto isZeroDot = CreateFCmpOEQ(dot, zero);
+    rsq = CreateSelect(isZeroDot, zero, rsq);
+  }
+  Value *result = scalarize(x, [this, rsq](Value *x) -> Value * { return CreateFMul(x, rsq); });
   result->setName(instName);
   return result;
 }
@@ -1243,6 +1256,23 @@ Value *BuilderImpl::CreateMsad4(Value *src, Value *ref, Value *accum, const Twin
   Value *result = scalarize(src, ref, accum, [this](Value *src, Value *ref, Value *accum) {
     return CreateIntrinsic(src->getType(), Intrinsic::amdgcn_msad_u8, {src, ref, accum});
   });
+  result->setName(instName);
+  return result;
+}
+
+// =====================================================================================================================
+// Create "fdot2" operation, returning a float result of the sum of dot2 of 2 half vec2 and a float scalar.
+//
+// @param a : Vector of 2xhalf A.
+// @param b : Vector of 2xhalf B.
+// @param scalar : A float scalar.
+// @param clamp : Whether the accumulation result should be clamped.
+Value *BuilderImpl::CreateFDot2(Value *a, Value *b, Value *scalar, Value *clamp, const Twine &instName) {
+  assert(a->getType()->getScalarType()->isHalfTy() && b->getType()->getScalarType()->isHalfTy());
+  assert(scalar->getType()->isFloatTy());
+  assert(clamp->getType()->isIntegerTy() && clamp->getType()->getIntegerBitWidth() == 1);
+
+  Value *result = CreateIntrinsic(scalar->getType(), Intrinsic::amdgcn_fdot2, {a, b, scalar, clamp});
   result->setName(instName);
   return result;
 }

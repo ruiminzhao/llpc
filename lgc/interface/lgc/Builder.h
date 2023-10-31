@@ -160,10 +160,11 @@ public:
                               //  descriptor entry, rather than DescriptorBuffer/DescriptorBufferCompact
     BufferFlagNonConst = 8,   // Non-const buffer: Find a DescriptorBuffer/DescriptorBufferCompact descriptor
                               //  entry, rather than DescriptorConstBuffer/DescriptorConstBufferCompact/InlineBuffer
-    BufferFlagShaderResource = 16,  // Flag to find a Descriptor Resource
-    BufferFlagSampler = 32,         // Flag to find Descriptor Sampler
-    BufferFlagAddress = 64,         // Flag to return an i64 address of the descriptor
-    BufferFlagAttachedCounter = 128 // Flag to return the counter buffer descriptor attached to the main buffer.
+    BufferFlagShaderResource = 16,   // Flag to find a Descriptor Resource
+    BufferFlagSampler = 32,          // Flag to find Descriptor Sampler
+    BufferFlagAddress = 64,          // Flag to return an i64 address of the descriptor
+    BufferFlagAttachedCounter = 128, // Flag to return the counter buffer descriptor attached to the main buffer.
+    BufferFlagForceRawView = 256     // Flag to convert the buffer descriptor to raw view.
   };
 
   // Get the type of a built-in -- static edition of the method below, so you can use it without a BuilderDefs object.
@@ -836,6 +837,15 @@ public:
   // @param accum : A 32-bit unsigned integer, providing an existing accumulation.
   llvm::Value *CreateMsad4(llvm::Value *src, llvm::Value *ref, llvm::Value *accum, const llvm::Twine &instName = "");
 
+  // Create "fdot2" operation, returning an 32-bit float result of the sum of dot2 of 2 half vec2 and a float scalar.
+  //
+  // @param a : Vector of 2xhalf A.
+  // @param b : Vector of 2xhalf B.
+  // @param scalar : A float scalar.
+  // @param clamp : Whether the accumulation result should be clamped.
+  llvm::Value *CreateFDot2(llvm::Value *a, llvm::Value *b, llvm::Value *scalar, llvm::Value *clamp,
+                           const llvm::Twine &instName = "");
+
   // Create "fmix" operation, returning ( 1 - A ) * X + A * Y. Result would be FP scalar or vector value.
   // Returns scalar, if and only if "pX", "pY" and "pA" are all scalars.
   // Returns vector, if "pX" and "pY" are vector but "pA" is a scalar, under such condition, "pA" will be splatted.
@@ -1422,7 +1432,7 @@ public:
   // @param value : The value to read from the chosen rotated lane to all active lanes.
   // @param delta : The delta/offset added to lane id.
   // @param clusterSize : The cluster size if exists.
-  // @param instName : Name to give instruction.
+  // @param instName : Name to give final instruction.
   llvm::Value *CreateSubgroupRotate(llvm::Value *const value, llvm::Value *const delta, llvm::Value *const clusterSize,
                                     const llvm::Twine &instName = "");
 

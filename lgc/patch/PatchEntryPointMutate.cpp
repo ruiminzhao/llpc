@@ -260,11 +260,13 @@ static Value *mergeDwordsIntoVector(IRBuilder<> &builder, ArrayRef<Value *> inpu
 // @param asCpsReferenceOp: the instruction
 void PatchEntryPointMutate::lowerAsCpsReference(cps::AsContinuationReferenceOp &asCpsReferenceOp) {
   IRBuilder<> builder(&asCpsReferenceOp);
-  auto *ref = builder.CreatePtrToInt(asCpsReferenceOp.getFn(), builder.getInt32Ty());
 
   Function &callee = cast<Function>(*asCpsReferenceOp.getFn());
   auto level = cps::getCpsLevelFromFunction(callee);
-  ref = builder.CreateOr(ref, (uint64_t)level);
+
+  // Use GEP since that is easier for the backend to combine into a relocation fixup.
+  Value *ref = builder.CreateConstGEP1_32(builder.getInt8Ty(), asCpsReferenceOp.getFn(), static_cast<uint32_t>(level));
+  ref = builder.CreatePtrToInt(ref, builder.getInt32Ty());
 
   asCpsReferenceOp.replaceAllUsesWith(ref);
 }
@@ -402,8 +404,6 @@ bool PatchEntryPointMutate::lowerCpsOps(Function *func, ShaderInputs *shaderInpu
   //      ret void
   unsigned waveSize = m_pipelineState->getShaderWaveSize(m_shaderStage);
   Type *waveMaskTy = builder.getIntNTy(waveSize);
-  auto *chainBlock = BasicBlock::Create(func->getContext(), "chain.block", func);
-  auto *retBlock = BasicBlock::Create(func->getContext(), "ret.block", func);
   // For continufy based continuation, the vgpr list: LocalInvocationId, vcr, vsp, ...
   unsigned vcrIndexInVgpr = shaderInputs ? 1 : 0;
   auto *vcr = builder.CreateExtractValue(vgprArg, vcrIndexInVgpr);
@@ -437,13 +437,21 @@ bool PatchEntryPointMutate::lowerCpsOps(Function *func, ShaderInputs *shaderInpu
     execMask = builder.CreateUnaryIntrinsic(Intrinsic::amdgcn_wwm, execMask);
   }
 
-  auto *isNullTarget = builder.CreateICmpEQ(targetVcr, builder.getInt32(0));
-  builder.CreateCondBr(isNullTarget, retBlock, chainBlock);
+  BasicBlock *chainBlock = nullptr;
+  // We only need to insert the return block if there is any return in original function, otherwise we just insert
+  // everything in the tail block.
+  if (!retInstrs.empty()) {
+    chainBlock = BasicBlock::Create(func->getContext(), "chain.block", func);
+    auto *retBlock = BasicBlock::Create(func->getContext(), "ret.block", func);
+    auto *isNullTarget = builder.CreateICmpEQ(targetVcr, builder.getInt32(0));
+    builder.CreateCondBr(isNullTarget, retBlock, chainBlock);
 
-  builder.SetInsertPoint(retBlock);
-  builder.CreateRetVoid();
+    builder.SetInsertPoint(retBlock);
+    builder.CreateRetVoid();
+  }
 
-  builder.SetInsertPoint(chainBlock);
+  if (chainBlock)
+    builder.SetInsertPoint(chainBlock);
   // Mask off metadata bits and setup jump target.
   Value *addr32 = builder.CreateAnd(targetVcr, builder.getInt32(~0x3fu));
   AddressExtender addressExtender(func);
@@ -1453,21 +1461,21 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
 
     // NOTE: The user data to emulate gl_ViewIndex is somewhat common. To make it consistent for GFX9
     // merged shader, we place it prior to any other special user data.
-    if (m_pipelineState->getInputAssemblyState().enableMultiView) {
+    if (m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable) {
       unsigned *argIdx = nullptr;
       auto userDataValue = UserDataMapping::ViewId;
       switch (m_shaderStage) {
       case ShaderStageVertex:
-        argIdx = &entryArgIdxs.vs.viewIndex;
+        argIdx = &entryArgIdxs.vs.viewId;
         break;
       case ShaderStageTessControl:
-        argIdx = &entryArgIdxs.tcs.viewIndex;
+        argIdx = &entryArgIdxs.tcs.viewId;
         break;
       case ShaderStageTessEval:
-        argIdx = &entryArgIdxs.tes.viewIndex;
+        argIdx = &entryArgIdxs.tes.viewId;
         break;
       case ShaderStageGeometry:
-        argIdx = &entryArgIdxs.gs.viewIndex;
+        argIdx = &entryArgIdxs.gs.viewId;
         break;
       default:
         llvm_unreachable("Unexpected shader stage");
@@ -1565,9 +1573,9 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
       specialUserDataArgs.push_back(UserDataArg(builder.getInt32Ty(), "drawIndex", UserDataMapping::DrawIndex,
                                                 &intfData->entryArgIdxs.mesh.drawIndex));
     }
-    if (m_pipelineState->getInputAssemblyState().enableMultiView) {
+    if (m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable) {
       specialUserDataArgs.push_back(
-          UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.mesh.viewIndex));
+          UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.mesh.viewId));
     }
     specialUserDataArgs.push_back(UserDataArg(FixedVectorType::get(builder.getInt32Ty(), 3), "meshTaskDispatchDims",
                                               UserDataMapping::MeshTaskDispatchDims,
@@ -1581,12 +1589,12 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
                                                 &intfData->entryArgIdxs.mesh.pipeStatsBuf));
     }
   } else if (m_shaderStage == ShaderStageFragment) {
-    if (m_pipelineState->getInputAssemblyState().enableMultiView &&
+    if (m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable &&
         m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs.viewIndex) {
       // NOTE: Only add special user data of view index when multi-view is enabled and gl_ViewIndex is used in fragment
       // shader.
       specialUserDataArgs.push_back(
-          UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.fs.viewIndex));
+          UserDataArg(builder.getInt32Ty(), "viewId", UserDataMapping::ViewId, &intfData->entryArgIdxs.fs.viewId));
     }
 
     if (userDataUsage->isSpecialUserDataUsed(UserDataMapping::ColorExportAddr)) {

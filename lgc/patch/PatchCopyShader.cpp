@@ -511,7 +511,7 @@ void PatchCopyShader::exportOutput(unsigned streamId, BuilderBase &builder) {
   if (builtInUsage.viewportIndex)
     builtInPairs.push_back(std::make_pair(BuiltInViewportIndex, builder.getInt32Ty()));
 
-  if (m_pipelineState->getInputAssemblyState().enableMultiView)
+  if (m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable)
     builtInPairs.push_back(std::make_pair(BuiltInViewIndex, builder.getInt32Ty()));
 
   if (builtInUsage.primitiveShadingRate)
@@ -603,6 +603,9 @@ Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, u
         {Attribute::Speculatable, Attribute::ReadOnly, Attribute::WillReturn});
   }
 
+  // NOTE: NGG with GS must have been handled. Here we only handle pre-GFX11 generations with legacy pipeline.
+  assert(m_pipelineState->getTargetInfo().getGfxIpVersion().major < 11);
+
   if (m_pipelineState->isGsOnChip()) {
     assert(m_lds);
 
@@ -614,10 +617,8 @@ Value *PatchCopyShader::loadValueFromGsVsRing(Type *loadTy, unsigned location, u
   }
 
   CoherentFlag coherent = {};
-  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 11) {
-    coherent.bits.glc = true;
-    coherent.bits.slc = true;
-  }
+  coherent.bits.glc = true;
+  coherent.bits.slc = true;
 
   Value *loadValue = PoisonValue::get(loadTy);
 

@@ -1561,6 +1561,11 @@ template <typename T> void ConfigBuilder::buildPsRegConfig(ShaderStage shaderSta
     SET_REG_GFX9_FIELD(&config->psRegs, SPI_SHADER_PGM_RSRC2_PS, USER_SGPR_MSB, userSgprMsb);
   }
 
+  if (intfData->entryArgIdxs.fs.provokingVtxInfo != 0) {
+    assert(m_gfxIp >= GfxIpVersion({10, 3}));
+    SET_REG_GFX10_3_PLUS_EXCLUSIVE_FIELD(&config->psRegs, SPI_SHADER_PGM_RSRC1_PS, LOAD_PROVOKING_VTX, true);
+  }
+
   if (m_gfxIp.major >= 11) {
     // Pixel wait sync+
     SET_REG_GFX11_FIELD(&config->psRegs, SPI_SHADER_PGM_RSRC4_PS, IMAGE_OP, resUsage->useImageOp);
@@ -1864,7 +1869,7 @@ template <typename T> void ConfigBuilder::buildMeshRegConfig(ShaderStage shaderS
   SET_REG_FIELD(&config->meshRegs, GE_NGG_SUBGRP_CNTL, PRIM_AMP_FACTOR, calcFactor.primAmpFactor);
   SET_REG_FIELD(&config->meshRegs, GE_NGG_SUBGRP_CNTL, THDS_PER_SUBGRP, calcFactor.primAmpFactor);
 
-  const bool enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
+  const bool enableMultiView = m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable;
   bool hasPrimitivePayload =
       builtInUsage.layer || builtInUsage.viewportIndex || builtInUsage.primitiveShadingRate || enableMultiView;
   if (m_gfxIp.major < 11)
@@ -2166,7 +2171,9 @@ template <typename T> void ConfigBuilder::setupPaSpecificRegisters(T *config) {
       expCount = resUsage->inOutUsage.expCount;
     }
 
-    useLayer = useLayer || m_pipelineState->getInputAssemblyState().enableMultiView;
+    useLayer = useLayer || m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable;
+    if (m_pipelineState->getInputAssemblyState().multiView == MultiViewMode::PerView)
+      useViewportIndex = true;
 
     if (usePrimitiveId) {
       SET_REG_FIELD(config, VGT_PRIMITIVEID_EN, PRIMITIVEID_EN, true);

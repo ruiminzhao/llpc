@@ -30,12 +30,12 @@
  */
 #include "llpcSpirvLowerGlobal.h"
 #include "SPIRVInternal.h"
-#include "lgcrt/LgcRtDialect.h"
 #include "llpcContext.h"
 #include "llpcDebug.h"
 #include "llpcRayTracingContext.h"
 #include "llpcSpirvLowerUtil.h"
 #include "lgc/LgcDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llvm-dialects/Dialect/Visitor.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/IR/Constant.h"
@@ -270,7 +270,6 @@ bool SpirvLowerGlobal::runImpl(Module &module) {
   lowerUniformConstants();
   lowerAliasedVal();
   lowerShaderRecordBuffer();
-
   cleanupReturnBlock();
 
   return true;
@@ -1195,6 +1194,7 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
         inOutInfo.setInterpLoc(interpLoc);
 
         if (builtIn == lgc::BuiltInBaryCoord || builtIn == lgc::BuiltInBaryCoordNoPerspKHR) {
+          inOutInfo.setInterpMode(InterpModeCustom);
           if (inOutInfo.getInterpLoc() == InterpLocUnknown)
             inOutInfo.setInterpLoc(inOutMeta.InterpLoc);
           return m_builder->CreateReadBaryCoord(builtIn, inOutInfo, auxInterpValue);
@@ -1252,6 +1252,8 @@ Value *SpirvLowerGlobal::addCallInstForInOutImport(Type *inOutTy, unsigned addrS
       elemIdx = !elemIdx ? m_builder->getInt32(idx) : m_builder->CreateAdd(elemIdx, m_builder->getInt32(idx));
 
       lgc::InOutInfo inOutInfo;
+      inOutInfo.setComponent(inOutMeta.Component);
+
       if (!locOffset)
         locOffset = m_builder->getInt32(0);
 
@@ -2419,9 +2421,14 @@ void SpirvLowerGlobal::addCallInstForXfbOutput(const ShaderInOutMetadata &output
                                                unsigned xfbBufferAdjust, unsigned xfbOffsetAdjust, unsigned locOffset,
                                                lgc::InOutInfo outputInfo) {
   assert(m_shaderStage == m_lastVertexProcessingStage);
-  auto pipelineBuildInfo = static_cast<const Vkgc::GraphicsPipelineBuildInfo *>(m_context->getPipelineBuildInfo());
   DenseMap<unsigned, Vkgc::XfbOutInfo> *locXfbMapPtr = outputMeta.IsBuiltIn ? &m_builtInXfbMap : &m_genericXfbMap;
-  if (pipelineBuildInfo->apiXfbOutData.forceDisableStreamOut || (locXfbMapPtr->empty() && !outputMeta.IsXfb))
+  bool hasXfbMetadata = m_entryPoint->getMetadata(lgc::XfbStateMetadataName);
+  bool hasXfbOut = hasXfbMetadata && (!locXfbMapPtr->empty() || outputMeta.IsXfb);
+#if LLPC_CLIENT_INTERFACE_MAJOR_VERSION < 70
+  auto pipelineBuildInfo = static_cast<const Vkgc::GraphicsPipelineBuildInfo *>(m_context->getPipelineBuildInfo());
+  hasXfbOut &= !pipelineBuildInfo->apiXfbOutData.forceDisableStreamOut;
+#endif
+  if (!hasXfbOut)
     return;
 
   // If the XFB info is specified from API interface so we try to retrieve the info from m_locXfbMap. Otherwise, the XFB

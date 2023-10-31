@@ -231,6 +231,10 @@ public:
   // Create "Masked Sum of Absolute Differences" operation.
   llvm::Value *CreateMsad4(llvm::Value *src, llvm::Value *ref, llvm::Value *accum, const llvm::Twine &instName = "");
 
+  // Create fdot2_f16 + f32 operation.
+  llvm::Value *CreateFDot2(llvm::Value *a, llvm::Value *b, llvm::Value *scalar, llvm::Value *clamp,
+                           const llvm::Twine &instName = "");
+
   // Create "fmix" operation.
   llvm::Value *createFMix(llvm::Value *x, llvm::Value *y, llvm::Value *a, const llvm::Twine &instName = "");
 
@@ -542,6 +546,9 @@ private:
 
   // Reorder the barycoord
   llvm::Value *normalizeBaryCoord(llvm::Value *ijCoord);
+
+  // Get provoking vertex value
+  void getProvokingVertexInfo(llvm::Value **isOne, llvm::Value **isTwo);
 
   // Read and directly handle certain built-ins that are common between shader stages
   llvm::Value *readCommonBuiltIn(BuiltInKind builtIn, llvm::Type *resultTy, const llvm::Twine &instName = "");

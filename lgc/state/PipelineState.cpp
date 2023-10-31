@@ -1212,7 +1212,7 @@ void PipelineState::recordColorExportState(Module *module) {
 
     // The color export formats named metadata node's operands are:
     // - N metadata nodes for N color targets, each one containing
-    // { dfmt, nfmt, blendEnable, blendSrcAlphaToColor }
+    // { dfmt, nfmt, blendEnable, blendSrcAlphaToColor, channelWriteMask }
     for (const ColorExportFormat &target : m_colorExportFormats)
       exportFormatsMetaNode->addOperand(getArrayOfInt32MetaNode(getContext(), target, /*atLeastOneValue=*/true));
   }
@@ -1247,10 +1247,6 @@ void PipelineState::readColorExportState(Module *module) {
 void PipelineState::setGraphicsState(const InputAssemblyState &iaState, const RasterizerState &rsState) {
   m_inputAssemblyState = iaState;
   m_rasterizerState = rsState;
-
-  const auto &fragmentMode = getShaderModes()->getFragmentShaderMode();
-  if (fragmentMode.innerCoverage)
-    m_rasterizerState.innerCoverage = 1;
 }
 
 // =====================================================================================================================
@@ -1311,6 +1307,11 @@ void PipelineState::readGraphicsState(Module *module) {
   auto nameMeta = module->getNamedMetadata(SampleShadingMetaName);
   if (nameMeta)
     m_rasterizerState.perSampleShading |= 1;
+
+  // fragmentMode is updated after ShaderModes::readModesFromPipeline()
+  const auto &fragmentMode = getShaderModes()->getFragmentShaderMode();
+  if (fragmentMode.innerCoverage)
+    m_rasterizerState.innerCoverage = 1;
 }
 
 // =====================================================================================================================
