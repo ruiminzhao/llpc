@@ -105,13 +105,14 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
   SmallVector<const char *, 16> argNames;
 
   const auto gfxIp = m_pipelineState->getTargetInfo().getGfxIpVersion();
+  (void(gfxIp)); // Unused
   if (!m_pipelineState->getNggControl()->enableNgg) {
     // Create type of new function with fixed HW layout:
     //
     //   void copyShader(
     //     i32 inreg globalTable,
-    //     i32 inreg streamOutTable (GFX6-GFX8) / esGsLdsSize (GFX9+),
-    //     i32 inreg esGsLdsSize (GFX6-GFX8) / streamOutTable (GFX9+),
+    //     i32 inreg esGsLdsSize (GFX9+),
+    //     i32 inreg streamOutTable (GFX9+),
     //     i32 inreg streamOutInfo,
     //     i32 inreg streamOutWriteIndex,
     //     i32 inreg streamOutOffset0,
@@ -120,11 +121,14 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
     //     i32 inreg streamOutOffset3,
     //     i32 vertexOffset)
     //
+
     argTys = {int32Ty, int32Ty, int32Ty, int32Ty, int32Ty, int32Ty, int32Ty, int32Ty, int32Ty, int32Ty};
+
     argInReg = {true, true, true, true, true, true, true, true, true, false};
+    // clang-format off
     argNames = {"globalTable",
-                gfxIp.major <= 8 ? "streamOutTable" : "esGsLdsSize",
-                gfxIp.major <= 8 ? "esGsLdsSize" : "streamOutTable",
+                "esGsLdsSize",
+                "streamOutTable",
                 "streamOutInfo",
                 "streamOutWriteIndex",
                 "streamOutOffset0",
@@ -132,6 +136,7 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
                 "streamOutOffset2",
                 "streamOutOffset3",
                 "vertexOffset"};
+    // clang-format on
   } else {
     // If NGG, the copy shader is not a real HW VS and will be incorporated into NGG primitive shader finally. Thus,
     // the argument definitions are decided by compiler not by HW. We could have such variable layout (not fixed with
@@ -195,20 +200,14 @@ bool PatchCopyShader::runImpl(Module &module, PipelineShadersResult &pipelineSha
 
   auto intfData = m_pipelineState->getShaderInterfaceData(ShaderStageCopyShader);
 
-  if (m_pipelineState->getTargetInfo().getGfxIpVersion().major <= 8) {
-    // For GFX6 ~ GFX8, streamOutTable SGPR index value should be less than esGsLdsSize
-    intfData->userDataUsage.gs.copyShaderEsGsLdsSize = 2;
-    intfData->userDataUsage.gs.copyShaderStreamOutTable = 1;
+  if (!m_pipelineState->getNggControl()->enableNgg) {
+    // For GFX9+, streamOutTable SGPR index value should be greater than esGsLdsSize
+    intfData->userDataUsage.gs.copyShaderEsGsLdsSize = 1;
+    intfData->userDataUsage.gs.copyShaderStreamOutTable = 2;
   } else {
-    if (!m_pipelineState->getNggControl()->enableNgg) {
-      // For GFX9+, streamOutTable SGPR index value should be greater than esGsLdsSize
-      intfData->userDataUsage.gs.copyShaderEsGsLdsSize = 1;
-      intfData->userDataUsage.gs.copyShaderStreamOutTable = 2;
-    } else {
-      // If NGG, both esGsLdsSize and streamOutTable are not used
-      intfData->userDataUsage.gs.copyShaderEsGsLdsSize = InvalidValue;
-      intfData->userDataUsage.gs.copyShaderStreamOutTable = InvalidValue;
-    }
+    // If NGG, both esGsLdsSize and streamOutTable are not used
+    intfData->userDataUsage.gs.copyShaderEsGsLdsSize = InvalidValue;
+    intfData->userDataUsage.gs.copyShaderStreamOutTable = InvalidValue;
   }
 
   if (!m_pipelineState->getNggControl()->enableNgg) {

@@ -70,6 +70,7 @@ StringRef ColorExportShader::getString() {
     constexpr uint32_t estimatedTypeSize = 10;
     uint32_t sizeEstimate = (sizeof(ColorExportInfo) + estimatedTypeSize) * m_exports.size();
     sizeEstimate += sizeof(m_killEnabled);
+    sizeEstimate += sizeof(ColorExportState) + MaxColorTargets * sizeof(ColorExportFormat);
     m_shaderString.reserve(sizeEstimate);
 
     for (ColorExportInfo colorExportInfo : m_exports) {
@@ -82,6 +83,13 @@ StringRef ColorExportShader::getString() {
       m_shaderString += getTypeName(colorExportInfo.ty);
     }
     m_shaderString += StringRef(reinterpret_cast<const char *>(&m_killEnabled), sizeof(m_killEnabled));
+
+    const ColorExportState *colorExportState = &m_pipelineState->getColorExportState();
+    m_shaderString += StringRef(reinterpret_cast<const char *>(colorExportState), sizeof(*colorExportState));
+    for (unsigned location = 0; location < MaxColorTargets; ++location) {
+      const ColorExportFormat *colorExportFormat = &m_pipelineState->getColorExportFormat(location);
+      m_shaderString += StringRef(reinterpret_cast<const char *>(colorExportFormat), sizeof(*colorExportFormat));
+    }
   }
   return m_shaderString;
 }
@@ -108,14 +116,19 @@ Module *ColorExportShader::generate() {
     values[m_exports[idx].hwColorTarget] = colorExportFunc->getArg(idx);
   }
 
+  PalMetadata palMetadata{m_pipelineState, m_pipelineState->useRegisterFieldFormat()};
+
   bool dummyExport = m_lgcContext->getTargetInfo().getGfxIpVersion().major < 10 || m_killEnabled;
-  fragColorExport.generateExportInstructions(m_exports, values, dummyExport, builder);
+  fragColorExport.generateExportInstructions(m_exports, values, dummyExport, &palMetadata, builder);
 
   if (m_pipelineState->getOptions().enableColorExportShader) {
     builder.CreateIntrinsic(Intrinsic::amdgcn_endpgm, {}, {});
     builder.CreateUnreachable();
     ret->eraseFromParent();
   }
+
+  palMetadata.updateDbShaderControl();
+  palMetadata.record(colorExportFunc->getParent());
 
   return colorExportFunc->getParent();
 }
@@ -166,5 +179,4 @@ Function *ColorExportShader::createColorExportFunc() {
 //
 // @param [in/out] outStream : The PAL metadata object in which to update the color format.
 void ColorExportShader::updatePalMetadata(PalMetadata &palMetadata) {
-  palMetadata.updateDbShaderControl();
 }

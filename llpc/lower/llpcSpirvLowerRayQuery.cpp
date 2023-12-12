@@ -1265,7 +1265,7 @@ void SpirvLowerRayQuery::initGlobalVariable() {
 unsigned SpirvLowerRayQuery::generateTraceRayStaticId() {
   Util::MetroHash64 hasher;
   hasher.Update(m_nextTraceRayId++);
-  hasher.Update(m_module->getName());
+  hasher.Update(m_module->getName().bytes_begin(), m_module->getName().size());
 
   MetroHash::Hash hash = {};
   hasher.Finalize(hash.bytes);
@@ -1321,7 +1321,6 @@ Value *SpirvLowerRayQuery::createGetInstanceNodeAddr(Value *instNodePtr, Value *
   Value *BvhAddr = PoisonValue::get(FixedVectorType::get(Type::getInt32Ty(*m_context), 2));
   BvhAddr = m_builder->CreateInsertElement(BvhAddr, BvhAddrLo, uint64_t(0));
   BvhAddr = m_builder->CreateInsertElement(BvhAddr, BvhAddrHi, 1);
-
   // Mask out the node offset
   auto nodeOffsetMask = m_builder->getInt32(0xFFFFFFF8u);
   // Shift left by 3 to make it 64B aligned address

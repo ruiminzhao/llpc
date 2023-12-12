@@ -630,6 +630,8 @@ PreservedAnalyses SpirvLowerRayTracing::run(Module &module, ModuleAnalysisManage
                               .add(&SpirvLowerRayTracing::visitInstanceInclusionMaskOp)
                               .add(&SpirvLowerRayTracing::visitShaderIndexOp)
                               .add(&SpirvLowerRayTracing::visitShaderRecordBufferOp)
+                              .add(&SpirvLowerRayTracing::visitStackReadOp)
+                              .add(&SpirvLowerRayTracing::visitStackWriteOp)
                               .build();
 
     visitor.visit(*this, *m_module);
@@ -1990,6 +1992,7 @@ SmallSet<unsigned, 4> SpirvLowerRayTracing::getShaderExtraInputParams(ShaderStag
     params.insert(TraceParam::TCurrent);
     params.insert(TraceParam::Kind);
     params.insert(TraceParam::DuplicateAnyHit);
+    params.insert(TraceParam::RayFlags);
     break;
   default:
     break;
@@ -2572,6 +2575,28 @@ void SpirvLowerRayTracing::visitGetRayStaticId(lgc::GpurtGetRayStaticIdOp &inst)
 
   m_callsToLower.push_back(&inst);
   m_funcsToLower.insert(inst.getCalledFunction());
+}
+
+// =====================================================================================================================
+// Visits "lgc.gpurt.stack.read" instructions
+//
+// @param inst : The instruction
+void SpirvLowerRayTracing::visitStackReadOp(lgc::GpurtStackReadOp &inst) {
+  // NOTE: If RayQuery is used inside intersection or any-hit shaders, where we already holding a traversal stack for
+  // TraceRay, perform the stack operations for this RayQuery in an extra stack space.
+  if ((m_shaderStage == ShaderStageRayTracingIntersect) || (m_shaderStage == ShaderStageRayTracingAnyHit))
+    inst.setUseExtraStack(true);
+}
+
+// =====================================================================================================================
+// Visits "lgc.gpurt.stack.write" instructions
+//
+// @param inst : The instruction
+void SpirvLowerRayTracing::visitStackWriteOp(lgc::GpurtStackWriteOp &inst) {
+  // NOTE: If RayQuery is used inside intersection or any-hit shaders, where we already holding a traversal stack for
+  // TraceRay, perform the stack operations for this RayQuery in an extra stack space.
+  if ((m_shaderStage == ShaderStageRayTracingIntersect) || (m_shaderStage == ShaderStageRayTracingAnyHit))
+    inst.setUseExtraStack(true);
 }
 
 // =====================================================================================================================

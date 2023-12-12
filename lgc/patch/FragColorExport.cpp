@@ -144,10 +144,15 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
   case EXP_FORMAT_32_R:
   case EXP_FORMAT_32_GR:
   case EXP_FORMAT_32_ABGR: {
-    if (expFmt == EXP_FORMAT_32_GR && compCount >= 2)
-      compCount = 2;
-    else if (expFmt != EXP_FORMAT_32_ABGR)
+    if (expFmt == EXP_FORMAT_32_R) {
       compCount = 1;
+      channelWriteMask = 0x1;
+    } else if (expFmt == EXP_FORMAT_32_GR) {
+      compCount = compCount >= 2 ? 2 : 1;
+      channelWriteMask = 0x3;
+    } else {
+      channelWriteMask = 0xF;
+    }
 
     for (unsigned idx = 0; idx < compCount; ++idx) {
       unsigned compMask = 1 << idx;
@@ -159,6 +164,7 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
     break;
   }
   case EXP_FORMAT_32_AR: {
+    channelWriteMask = 0x9;
     if (1 & channelWriteMask) {
       exports[0] = convertToFloat(comps[0], signedness, builder);
       exportMask = 1;
@@ -177,6 +183,7 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
   case EXP_FORMAT_FP16_ABGR: {
     const unsigned compactCompCount = (compCount + 1) / 2;
     exports[0] = exports[1] = undefFloat16x2;
+    exportMask = compCount > 2 ? 0xF : 0x3;
     // convert to half type
     if (bitWidth <= 16) {
       output = convertToHalf(output, signedness, builder);
@@ -184,12 +191,8 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
       // re-pack
       for (unsigned idx = 0; idx < compactCompCount; ++idx) {
         unsigned origIdx = 2 * idx;
-        unsigned compMask = (1 << origIdx) | (1 << (origIdx + 1));
-        if (compMask & channelWriteMask) {
-          exports[idx] = builder.CreateInsertElement(undefFloat16x2, comps[origIdx], builder.getInt32(0));
-          exports[idx] = builder.CreateInsertElement(exports[idx], comps[origIdx + 1], builder.getInt32(1));
-          exportMask |= compMask;
-        }
+        exports[idx] = builder.CreateInsertElement(undefFloat16x2, comps[origIdx], builder.getInt32(0));
+        exports[idx] = builder.CreateInsertElement(exports[idx], comps[origIdx + 1], builder.getInt32(1));
       }
     } else {
       if (outputTy->isIntOrIntVectorTy())
@@ -200,12 +203,8 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
 
       for (unsigned idx = 0; idx < compactCompCount; ++idx) {
         unsigned origIdx = 2 * idx;
-        unsigned compMask = (1 << origIdx) | (1 << (origIdx + 1));
-        if (compMask & channelWriteMask) {
-          exports[idx] = builder.CreateIntrinsic(FixedVectorType::get(builder.getHalfTy(), 2),
-                                                 Intrinsic::amdgcn_cvt_pkrtz, {comps[origIdx], comps[origIdx + 1]});
-          exportMask |= compMask;
-        }
+        exports[idx] = builder.CreateIntrinsic(FixedVectorType::get(builder.getHalfTy(), 2),
+                                               Intrinsic::amdgcn_cvt_pkrtz, {comps[origIdx], comps[origIdx + 1]});
       }
     }
     break;
@@ -229,15 +228,11 @@ Value *FragColorExport::handleColorExportInstructions(Value *output, unsigned hw
 
     const unsigned compactCompCount = (compCount + 1) / 2;
     exports[0] = exports[1] = undefFloat16x2;
+    exportMask = compCount > 2 ? 0xF : 0x3;
     for (unsigned idx = 0; idx < compactCompCount; idx++) {
-      unsigned origIdx = 2 * idx;
-      unsigned compMask = (1 << origIdx) | (1 << (origIdx + 1));
-      if (compMask & channelWriteMask) {
-        Value *packedComps = builder.CreateIntrinsic(FixedVectorType::get(builder.getInt16Ty(), 2), cvtIntrinsic,
-                                                     {comps[2 * idx], comps[2 * idx + 1]});
-        exports[idx] = builder.CreateBitCast(packedComps, FixedVectorType::get(builder.getHalfTy(), 2));
-        exportMask |= compMask;
-      }
+      Value *packedComps = builder.CreateIntrinsic(FixedVectorType::get(builder.getInt16Ty(), 2), cvtIntrinsic,
+                                                   {comps[2 * idx], comps[2 * idx + 1]});
+      exports[idx] = builder.CreateBitCast(packedComps, FixedVectorType::get(builder.getHalfTy(), 2));
     }
     break;
   }
@@ -480,7 +475,8 @@ bool LowerFragColorExport::runImpl(Module &module, PipelineShadersResult &pipeli
   FragColorExport fragColorExport(m_context, m_pipelineState);
   bool dummyExport =
       (m_pipelineState->getTargetInfo().getGfxIpVersion().major < 10 || m_resUsage->builtInUsage.fs.discard);
-  fragColorExport.generateExportInstructions(m_info, m_exportValues, dummyExport, builder);
+  fragColorExport.generateExportInstructions(m_info, m_exportValues, dummyExport, m_pipelineState->getPalMetadata(),
+                                             builder);
   return !m_info.empty() || dummyExport;
 }
 
@@ -863,9 +859,10 @@ Value *FragColorExport::dualSourceSwizzle(BuilderBase &builder) {
 // @param info : The color export information for each color export in no particular order.
 // @param values : The values that are to be exported.  Indexed by the hw color target.
 // @param exportFormat : The export format for each color target. Indexed by the hw color target.
+// @param [out] palMetadata : The PAL metadata that will be extended with relevant information.
 // @param builder : The builder object that will be used to create new instructions.
 void FragColorExport::generateExportInstructions(ArrayRef<ColorExportInfo> info, ArrayRef<Value *> values,
-                                                 bool dummyExport, BuilderBase &builder) {
+                                                 bool dummyExport, PalMetadata *palMetadata, BuilderBase &builder) {
   SmallVector<ExportFormat> finalExportFormats;
   Value *lastExport = nullptr;
 
@@ -919,22 +916,37 @@ void FragColorExport::generateExportInstructions(ArrayRef<ColorExportInfo> info,
     else if (depthMask & 0x1)
       depthExpFmt = (depthMask & 0x8) ? EXP_FORMAT_32_AR : EXP_FORMAT_32_R;
 
-    m_pipelineState->getPalMetadata()->setSpiShaderZFormat(depthExpFmt);
+    palMetadata->setSpiShaderZFormat(depthExpFmt);
     info = info.drop_front(1);
+  }
+
+  // Record each color buffer's export info for broadcasting
+  llvm::SmallVector<ColorExportInfo, 8> broadCastInfo;
+  if (m_pipelineState->getOptions().enableFragColor) {
+    auto &expInfo = info[0];
+    assert(expInfo.ty != nullptr);
+
+    for (unsigned location = 0; location < MaxColorTargets; ++location) {
+      if (m_pipelineState->getColorExportFormat(location).dfmt != BufDataFormatInvalid)
+        broadCastInfo.push_back({0, location, expInfo.isSigned, expInfo.ty});
+    }
   }
 
   // Now do color exports by color buffer.
   unsigned hwColorExport = 0;
+  auto finalExpInfo = m_pipelineState->getOptions().enableFragColor ? ArrayRef<ColorExportInfo>(broadCastInfo) : info;
   for (unsigned location = 0; location < MaxColorTargets; ++location) {
-    auto infoIt = llvm::find_if(info, [&](const ColorExportInfo &info) { return info.location == location; });
-    if (infoIt == info.end())
+    auto infoIt = llvm::find_if(finalExpInfo,
+                                [&](const ColorExportInfo &finalExpInfo) { return finalExpInfo.location == location; });
+    if (infoIt == finalExpInfo.end())
       continue;
 
     assert(infoIt->hwColorTarget < MaxColorTargets);
-
     auto expFmt = static_cast<ExportFormat>(m_pipelineState->computeExportFormat(infoIt->ty, location));
-    const unsigned channelWriteMask = m_pipelineState->getColorExportFormat(location).channelWriteMask;
-    if (expFmt != EXP_FORMAT_ZERO && channelWriteMask != 0) {
+    unsigned channelWriteMask = m_pipelineState->getColorExportFormat(location).channelWriteMask;
+    bool needExpInst = (expFmt != EXP_FORMAT_ZERO) &&
+                       (channelWriteMask > 0 || m_pipelineState->getColorExportState().alphaToCoverageEnable);
+    if (needExpInst) {
       lastExport = handleColorExportInstructions(values[infoIt->hwColorTarget], hwColorExport, builder, expFmt,
                                                  infoIt->isSigned, channelWriteMask);
       finalExportFormats.push_back(expFmt);
@@ -957,8 +969,8 @@ void FragColorExport::generateExportInstructions(ArrayRef<ColorExportInfo> info,
   if (lastExport)
     FragColorExport::setDoneFlag(lastExport, builder);
 
-  m_pipelineState->getPalMetadata()->updateSpiShaderColFormat(finalExportFormats);
-  m_pipelineState->getPalMetadata()->updateCbShaderMask(info);
+  palMetadata->updateSpiShaderColFormat(finalExportFormats);
+  palMetadata->updateCbShaderMask(info);
 }
 
 // =====================================================================================================================

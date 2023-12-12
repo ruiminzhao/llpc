@@ -887,10 +887,7 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
   const bool enableXfb = m_pipelineState->enableXfb();
   const bool enablePrimStats = m_pipelineState->enablePrimStats();
   if (shaderStage == ShaderStageCopyShader) {
-    // NOTE: For copy shader, usually we use fixed number of user data registers.
-    // But in some cases, we may change user data registers, we use variable to keep user sgpr count here
-    auto copyShaderUserSgprCount = lgc::CopyShaderUserSgprCount;
-    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR, copyShaderUserSgprCount);
+    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR, lgc::CopyShaderUserSgprCount);
     setNumAvailSgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxSgprsAvailable);
     setNumAvailVgprs(Util::Abi::HardwareStage::Vs, m_pipelineState->getTargetInfo().getGpuProperty().maxVgprsAvailable);
 
@@ -956,9 +953,7 @@ template <typename T> void ConfigBuilder::buildVsRegConfig(ShaderStage shaderSta
       SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT, 2);
     }
 
-    if (m_pipelineState->isTessOffChip()) {
-      SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN, true);
-    }
+    SET_REG_FIELD(&config->vsRegs, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN, true);
   }
 
   setupPaSpecificRegisters(&config->vsRegs);
@@ -1019,7 +1014,6 @@ void ConfigBuilder::buildLsHsRegConfig(ShaderStage shaderStage1, ShaderStage sha
   SET_REG_FIELD(&config->lsHsRegs, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR, userDataCount);
 
   const auto &calcFactor = tcsResUsage->inOutUsage.tcs.calcFactor;
-  assert(m_pipelineState->isTessOffChip()); // Must be off-chip on GFX9+
 
   const unsigned ldsSizeDwordGranularityShift =
       m_pipelineState->getTargetInfo().getGpuProperty().ldsSizeDwordGranularityShift;
@@ -2058,10 +2052,7 @@ void ConfigBuilder::setupVgtTfParam(LsHsRegConfig *config) {
   SET_REG_FIELD(config, VGT_TF_PARAM, TYPE, primType);
   SET_REG_FIELD(config, VGT_TF_PARAM, PARTITIONING, partition);
   SET_REG_FIELD(config, VGT_TF_PARAM, TOPOLOGY, topology);
-
-  if (m_pipelineState->isTessOffChip()) {
-    SET_REG_FIELD(config, VGT_TF_PARAM, DISTRIBUTION_MODE, TRAPEZOIDS);
-  }
+  SET_REG_FIELD(config, VGT_TF_PARAM, DISTRIBUTION_MODE, TRAPEZOIDS);
 }
 
 // =====================================================================================================================

@@ -256,12 +256,6 @@ Value *BuilderImpl::CreateFMod(Value *dividend, Value *divisor, const Twine &ins
 // @param c : The value to add to the product of A and B
 // @param instName : Name to give instruction(s)
 Value *BuilderImpl::CreateFma(Value *a, Value *b, Value *c, const Twine &instName) {
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major <= 8) {
-    // Pre-GFX9 version: Use fmul and fadd.
-    Value *fmul = CreateFMul(a, b);
-    return CreateFAdd(fmul, c, instName);
-  }
-
   // GFX9+ version: Use fma.
   return CreateIntrinsic(Intrinsic::fma, a->getType(), {a, b, c}, nullptr, instName);
 }
@@ -423,6 +417,7 @@ Value *BuilderImpl::CreateATan2(Value *y, Value *x, const Twine &instName) {
   //
   // p0 = sgn(y) * PI/2
   // p1 = sgn(y) * PI
+  // p2 = copysign(PI, y)
   // atanyox = atan(yox)
   //
   // if (y != 0.0)
@@ -431,7 +426,7 @@ Value *BuilderImpl::CreateATan2(Value *y, Value *x, const Twine &instName) {
   //     else
   //         atan(y, x) = p0
   // else
-  //     atan(y, x) = (x > 0.0) ? 0 : PI
+  //     atan(y, x) = (x > 0.0) ? 0 : p2
 
   Constant *zero = Constant::getNullValue(y->getType());
   Constant *one = ConstantFP::get(y->getType(), 1.0);
@@ -442,6 +437,15 @@ Value *BuilderImpl::CreateATan2(Value *y, Value *x, const Twine &instName) {
   Value *signY = CreateFSign(y);
   Value *p0 = CreateFMul(signY, getPiByTwo(signY->getType()));
   Value *p1 = CreateFMul(signY, getPi(signY->getType()));
+  Value *p2 = getPi(x->getType());
+  if (!getFastMathFlags().noSignedZeros()) {
+    // NOTE: According to the definition of atan(y, x), we might take the sign of y into consideration and follow such
+    // computation:
+    //                / -PI, when y = -0.0 and x < 0
+    //   atan(y, x) =
+    //                \ PI, when y = 0.0 and x < 0
+    p2 = CreateCopySign(p2, y);
+  }
 
   Value *absXEqualsAbsY = CreateFCmpOEQ(absX, absY);
   // oneIfEqual to (x == y) ? 1.0 : -1.0
@@ -454,7 +458,7 @@ Value *BuilderImpl::CreateATan2(Value *y, Value *x, const Twine &instName) {
   Value *addP1 = CreateFAdd(result, p1);
   result = CreateSelect(CreateFCmpOLT(x, zero), addP1, result);
   result = CreateSelect(CreateFCmpUNE(x, zero), result, p0);
-  Value *zeroOrPi = CreateSelect(CreateFCmpOGT(x, zero), zero, getPi(x->getType()));
+  Value *zeroOrPi = CreateSelect(CreateFCmpOGT(x, zero), zero, p2);
   result = CreateSelect(CreateFCmpUNE(y, zero), result, zeroOrPi, instName);
   return result;
 }
@@ -829,13 +833,23 @@ Value *BuilderImpl::CreateNormalizeVector(Value *x, const Twine &instName) {
   Value *dot = CreateDotProduct(x, x);
   Value *sqrt = CreateSqrt(dot);
   Value *rsq = CreateFDiv(ConstantFP::get(sqrt->getType(), 1.0), sqrt);
+  Value *result = nullptr;
   if (x->getType()->getScalarType()->isFloatTy()) {
     // Make sure a FP32 zero vector is normalized to a FP32 zero vector, rather than NaNs.
-    auto zero = ConstantFP::get(getFloatTy(), 0.0);
-    auto isZeroDot = CreateFCmpOEQ(dot, zero);
-    rsq = CreateSelect(isZeroDot, zero, rsq);
+    if (!getFastMathFlags().noSignedZeros() || !getFastMathFlags().noInfs() || !getFastMathFlags().noNaNs()) {
+      // When NSZ, NoInfs, or NoNaNs is not specified, we avoid using fmul_legacy since it is not IEEE compliant.
+      auto zero = ConstantFP::get(getFloatTy(), 0.0);
+      auto isZeroDot = CreateFCmpOEQ(dot, zero);
+      rsq = CreateSelect(isZeroDot, zero, rsq);
+      result = scalarize(x, [this, rsq](Value *x) -> Value * { return CreateFMul(x, rsq); });
+    } else {
+      result = scalarize(x, [this, rsq](Value *x) -> Value * {
+        return CreateIntrinsic(Intrinsic::amdgcn_fmul_legacy, {}, {x, rsq});
+      });
+    }
+  } else {
+    result = scalarize(x, [this, rsq](Value *x) -> Value * { return CreateFMul(x, rsq); });
   }
-  Value *result = scalarize(x, [this, rsq](Value *x) -> Value * { return CreateFMul(x, rsq); });
   result->setName(instName);
   return result;
 }
@@ -935,11 +949,6 @@ Value *BuilderImpl::CreateFClamp(Value *x, Value *minVal, Value *maxVal, const T
     result = min;
   }
 
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
-
   result->setName(instName);
   return result;
 }
@@ -957,11 +966,6 @@ Value *BuilderImpl::CreateFMin(Value *value1, Value *value2, const Twine &instNa
   min->setFastMathFlags(getFastMathFlags());
   Value *result = min;
 
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
-
   result->setName(instName);
   return result;
 }
@@ -978,11 +982,6 @@ Value *BuilderImpl::CreateFMax(Value *value1, Value *value2, const Twine &instNa
   CallInst *max = CreateMaxNum(value1, value2);
   max->setFastMathFlags(getFastMathFlags());
   Value *result = max;
-
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
 
   result->setName(instName);
   return result;
@@ -1004,11 +1003,6 @@ Value *BuilderImpl::CreateFMin3(Value *value1, Value *value2, Value *value3, con
   min2->setFastMathFlags(getFastMathFlags());
   Value *result = min2;
 
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
-
   result->setName(instName);
   return result;
 }
@@ -1028,11 +1022,6 @@ Value *BuilderImpl::CreateFMax3(Value *value1, Value *value2, Value *value3, con
   CallInst *max2 = CreateMaxNum(max1, value3);
   max2->setFastMathFlags(getFastMathFlags());
   Value *result = max2;
-
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
 
   result->setName(instName);
   return result;
@@ -1069,11 +1058,6 @@ Value *BuilderImpl::CreateFMid3(Value *value1, Value *value2, Value *value3, con
     max2->setFastMathFlags(getFastMathFlags());
     result = max2;
   }
-
-  // Before GFX9, fmed/fmin/fmax do not honor the hardware FP mode wanting flush denorms. So we need to
-  // canonicalize the result here.
-  if (getPipelineState()->getTargetInfo().getGfxIpVersion().major < 9)
-    result = canonicalize(result);
 
   result->setName(instName);
   return result;

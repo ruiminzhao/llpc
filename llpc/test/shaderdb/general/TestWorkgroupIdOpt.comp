@@ -21,14 +21,15 @@ void main()
 // CHECK-NEXT:    [[TMP0:%.*]] = call i64 @llvm.amdgcn.s.getpc()
 // CHECK-NEXT:    [[TMP1:%.*]] = and i64 [[TMP0]], -4294967296
 // CHECK-NEXT:    [[TMP2:%.*]] = zext i32 [[USERDATA0]] to i64
-// CHECK-NEXT:    [[TMP3:%.*]] = or i64 [[TMP1]], [[TMP2]]
+// CHECK-NEXT:    [[TMP3:%.*]] = or {{(disjoint )?}}i64 [[TMP1]], [[TMP2]]
 // CHECK-NEXT:    [[TMP4:%.*]] = inttoptr i64 [[TMP3]] to ptr addrspace(4)
 // CHECK-NEXT:    [[TMP5:%.*]] = load <4 x i32>, ptr addrspace(4) [[TMP4]], align 16
 // CHECK-NEXT:    call void @llvm.amdgcn.raw.buffer.store.i32(i32 [[WORKGROUPID1]], <4 x i32> [[TMP5]], i32 0, i32 0, i32 0)
 // CHECK-NEXT:    ret void
 //
 //.
-// CHECK: attributes #[[ATTR0]] = { nounwind memory(readwrite) "amdgpu-flat-work-group-size"="256,256" "amdgpu-memory-bound"="false" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-unroll-threshold"="700" "amdgpu-wave-limiter"="false" "amdgpu-work-group-info-arg-no"="3" "denormal-fp-math-f32"="preserve-sign" "target-features"=",+wavefrontsize64,+cumode,+enable-flat-scratch" }
-// CHECK: attributes #[[ATTR1:[0-9]+]] = { nounwind willreturn memory(none) }
+// CHECK: attributes #[[ATTR0]] = { nounwind memory(readwrite) "amdgpu-flat-work-group-size"="256,256" "amdgpu-memory-bound"="false" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-prealloc-sgpr-spill-vgprs" "amdgpu-unroll-threshold"="700" "amdgpu-wave-limiter"="false" "amdgpu-work-group-info-arg-no"="3" "denormal-fp-math-f32"="preserve-sign" "target-features"=",+wavefrontsize64,+cumode,+enable-flat-scratch" }
+// CHECK: attributes #[[ATTR1:[0-9]+]] = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+// CHECK: attributes #[[ATTR2:[0-9]+]] = { nounwind willreturn memory(none) }
 // CHECK: attributes #[[ATTR3:[0-9]+]] = { nocallback nofree nosync nounwind willreturn memory(write) }
 //.

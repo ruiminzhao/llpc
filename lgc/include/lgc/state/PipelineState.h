@@ -238,6 +238,8 @@ public:
   // Record pipeline state into IR metadata of specified module.
   void record(llvm::Module *module);
 
+  void recordExceptPalMetadata(llvm::Module *module);
+
   // Print pipeline state
   void print(llvm::raw_ostream &out) const;
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
@@ -293,15 +295,11 @@ public:
   const RasterizerState &getRasterizerState() const { return m_rasterizerState; }
   const DepthStencilState &getDepthStencilState() const { return m_depthStencilState; }
 
-  // Determine whether to use off-chip tessellation mode
-  bool isTessOffChip();
-
   // Set GS on-chip mode
   void setGsOnChip(bool gsOnChip) { m_gsOnChip = gsOnChip; }
 
   // Checks whether GS on-chip mode is enabled
-  // NOTE: GS on-chip mode has different meaning for GFX6~8 and GFX9: on GFX6~8, GS on-chip mode means ES -> GS ring
-  // and GS -> VS ring are both on-chip; on GFX9, ES -> GS ring is always on-chip, GS on-chip mode means GS -> VS
+  // NOTE: on GFX9, ES -> GS ring is always on-chip, GS on-chip mode means GS -> VS
   // ring is on-chip.
   bool isGsOnChip() const { return m_gsOnChip; }
 

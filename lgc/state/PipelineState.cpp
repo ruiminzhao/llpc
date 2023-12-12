@@ -52,7 +52,7 @@ static cl::opt<bool> EnableTessOffChip("enable-tess-offchip", cl::desc("Enable t
 
 // -enable-row-export: enable row export for mesh shader
 static cl::opt<bool> EnableRowExport("enable-row-export", cl::desc("Enable row export for mesh shader"),
-                                     cl::init(false));
+                                     cl::init(true));
 
 cl::opt<bool> UseRegisterFieldFormat("use-register-field-format", cl::desc("Use register field format in pipeline ELF"),
                                      cl::init(true));
@@ -111,6 +111,7 @@ static unsigned getMaxComponentBitCount(BufDataFormat dfmt) {
     return 11;
   case BufDataFormat16:
   case BufDataFormat16_16:
+  case BufDataFormat16_16_16:
   case BufDataFormat16_16_16_16:
     return 16;
   case BufDataFormat32:
@@ -178,6 +179,7 @@ static unsigned getNumChannels(BufDataFormat dfmt) {
   case BufDataFormat8_8_8_Bgr:
   case BufDataFormat10_11_11:
   case BufDataFormat11_11_10:
+  case BufDataFormat16_16_16:
   case BufDataFormat32_32_32:
   case BufDataFormat64_64_64:
   case BufDataFormat5_6_5:
@@ -435,14 +437,25 @@ void PipelineState::clear(Module *module) {
 //
 // @param [in/out] module : Module to record the IR metadata in
 void PipelineState::record(Module *module) {
+  recordExceptPalMetadata(module);
+  if (m_palMetadata)
+    m_palMetadata->record(module);
+}
+
+// =====================================================================================================================
+// Record pipeline state except for PAL metadata into IR metadata of specified module.
+//
+// TODO: This method shouldn't exist. It is a temporary workaround to the fact that the entire main pipeline state
+//       leaks into glue shader compilation, but we mustn't have all associated PAL metadata in the glue shader ELF.
+//
+// @param [in/out] module : Module to record the IR metadata in
+void PipelineState::recordExceptPalMetadata(Module *module) {
   recordOptions(module);
   recordUserDataNodes(module);
   recordDeviceIndex(module);
   recordVertexInputDescriptions(module);
   recordColorExportState(module);
   recordGraphicsState(module);
-  if (m_palMetadata)
-    m_palMetadata->record(module);
 }
 
 // =====================================================================================================================
@@ -1321,13 +1334,6 @@ unsigned PipelineState::getNumPatchControlPoints() const {
 }
 
 // =====================================================================================================================
-// Determine whether to use off-chip tessellation mode
-bool PipelineState::isTessOffChip() {
-  // For GFX9+, always enable tessellation off-chip mode
-  return EnableTessOffChip || getLgcContext()->getTargetInfo().getGfxIpVersion().major >= 9;
-}
-
-// =====================================================================================================================
 // Gets wave size for the specified shader stage
 //
 // NOTE: Need to be called after PatchResourceCollect pass, so usage of subgroupSize is confirmed.
@@ -1612,7 +1618,6 @@ InterfaceData *PipelineState::getShaderInterfaceData(ShaderStage shaderStage) {
 // @param location : Location
 unsigned PipelineState::computeExportFormat(Type *outputTy, unsigned location) {
   const ColorExportFormat *colorExportFormat = &getColorExportFormat(location);
-  auto gpuWorkarounds = &getTargetInfo().getGpuWorkarounds();
   unsigned outputMask = outputTy->isVectorTy() ? (1 << cast<FixedVectorType>(outputTy)->getNumElements()) - 1 : 1;
   const auto cbState = &getColorExportState();
   // NOTE: Alpha-to-coverage only takes effect for outputs from color target 0.
@@ -1660,10 +1665,7 @@ unsigned PipelineState::computeExportFormat(Type *outputTy, unsigned location) {
   } else if (((isUnormFormat || isSnormFormat) && maxCompBitCount <= 10) || (isFloatFormat && maxCompBitCount <= 16) ||
              (isSrgbFormat && maxCompBitCount == 8))
     expFmt = EXP_FORMAT_FP16_ABGR;
-  else if (isSintFormat &&
-           (maxCompBitCount == 16 ||
-            (!static_cast<bool>(gpuWorkarounds->gfx6.cbNoLt16BitIntClamp) && maxCompBitCount < 16)) &&
-           !enableAlphaToCoverage) {
+  else if (isSintFormat && (maxCompBitCount == 16 || maxCompBitCount < 16) && !enableAlphaToCoverage) {
     // NOTE: On some hardware, the CB will not properly clamp its input if the shader export format is "UINT16"
     // "SINT16" and the CB format is less than 16 bits per channel. On such hardware, the workaround is picking
     // an appropriate 32-bit export format. If this workaround isn't necessary, then we can choose this higher
@@ -1671,10 +1673,7 @@ unsigned PipelineState::computeExportFormat(Type *outputTy, unsigned location) {
     expFmt = EXP_FORMAT_SINT16_ABGR;
   } else if (isSnormFormat && maxCompBitCount == 16 && !blendEnabled)
     expFmt = EXP_FORMAT_SNORM16_ABGR;
-  else if (isUintFormat &&
-           (maxCompBitCount == 16 ||
-            (!static_cast<bool>(gpuWorkarounds->gfx6.cbNoLt16BitIntClamp) && maxCompBitCount < 16)) &&
-           !enableAlphaToCoverage) {
+  else if (isUintFormat && (maxCompBitCount == 16 || maxCompBitCount < 16) && !enableAlphaToCoverage) {
     // NOTE: On some hardware, the CB will not properly clamp its input if the shader export format is "UINT16"
     // "SINT16" and the CB format is less than 16 bits per channel. On such hardware, the workaround is picking
     // an appropriate 32-bit export format. If this workaround isn't necessary, then we can choose this higher

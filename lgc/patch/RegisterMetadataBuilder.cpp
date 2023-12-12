@@ -248,7 +248,6 @@ void RegisterMetadataBuilder::buildLsHsRegisters() {
   getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::LsVgprCompCnt] = lsVgprCompCnt;
 
   // Set LDS_SIZE of SPI_SHADER_PGM_RSRC2_HS
-  assert(m_pipelineState->isTessOffChip()); // Must be off-chip on GFX9+
   unsigned ldsSizeInDwords = calcFactor.tessOnChipLdsSize;
   ldsSizeInDwords += calcFactor.rayQueryLdsStackSize;
 
@@ -743,8 +742,7 @@ void RegisterMetadataBuilder::buildHwVsRegisters() {
     else
       getGraphicsRegNode()[Util::Abi::GraphicsRegisterMetadataKey::VsVgprCompCnt] = 2;
 
-    if (m_pipelineState->isTessOffChip())
-      getHwShaderNode(Util::Abi::HardwareStage::Vs)[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = true;
+    getHwShaderNode(Util::Abi::HardwareStage::Vs)[Util::Abi::HardwareStageMetadataKey::OffchipLdsEn] = true;
   }
 }
 
@@ -1068,8 +1066,6 @@ void RegisterMetadataBuilder::buildShaderExecutionRegisters(Util::Abi::HardwareS
   unsigned sgprLimits = 0;
   unsigned vgprLimits = 0;
   if (apiStage1 == ShaderStageCopyShader) {
-    // NOTE: For copy shader, usually we use fixed number of user data registers.
-    // But in some cases, we may change user data registers, we use variable to keep user sgpr count here
     userDataCount = lgc::CopyShaderUserSgprCount;
     sgprLimits = m_pipelineState->getTargetInfo().getGpuProperty().maxSgprsAvailable;
     vgprLimits = m_pipelineState->getTargetInfo().getGpuProperty().maxVgprsAvailable;
@@ -1565,8 +1561,7 @@ void RegisterMetadataBuilder::setVgtTfParam() {
   vgtTfParam[Util::Abi::VgtTfParamMetadataKey::Type] = primType;
   vgtTfParam[Util::Abi::VgtTfParamMetadataKey::Partitioning] = partition;
   vgtTfParam[Util::Abi::VgtTfParamMetadataKey::Topology] = topology;
-  if (m_pipelineState->isTessOffChip())
-    vgtTfParam[Util::Abi::VgtTfParamMetadataKey::DistributionMode] = TRAPEZOIDS;
+  vgtTfParam[Util::Abi::VgtTfParamMetadataKey::DistributionMode] = TRAPEZOIDS;
 }
 
 // =====================================================================================================================

@@ -111,6 +111,12 @@ enum class RayTracingIndirectMode : unsigned {
   Continuations = 3,          // Continuations flow that based on LowerRaytracingPipeline pass
 };
 
+// Enumerate feature flags for CPS.
+enum CpsFlag : unsigned {
+  CpsNoFlag = 0,
+  CpsFlagStackInGlobalMem = 1 << 0, // Put stack in global memory instead of scratch.
+};
+
 // Value for shadowDescriptorTable pipeline option.
 static const unsigned ShadowDescriptorTableDisable = ~0U;
 
@@ -121,7 +127,7 @@ static const char SampleShadingMetaName[] = "lgc.sample.shading";
 // The front-end should zero-initialize a struct with "= {}" in case future changes add new fields.
 // Note: new fields must be added to the end of this structure to maintain test compatibility.
 union Options {
-  unsigned u32All[36];
+  unsigned u32All[40];
   struct {
     uint64_t hash[2];                 // Pipeline hash to set in ELF PAL metadata
     unsigned includeDisassembly;      // If set, the disassembly for all compiled shaders will be included
@@ -172,8 +178,15 @@ union Options {
     bool fragCoordUsesInterpLoc;  // Determining fragCoord use InterpLoc
     bool disableSampleMask;       // Disable export of sample mask from PS
     unsigned reserved20;
-    RayTracingIndirectMode rtIndirectMode; // Ray tracing indirect mode
-    bool enablePrimGeneratedQuery;         // Whether to enable primitive generated counter
+    RayTracingIndirectMode rtIndirectMode;   // Ray tracing indirect mode
+    bool enablePrimGeneratedQuery;           // Whether to enable primitive generated counter
+    bool enableFragColor;                    // If enabled, do frag color broadcast
+    bool useSoftwareVertexBufferDescriptors; // Use software vertex buffer descriptors to structure SRD.
+    unsigned cpsFlags;                       // CPS feature flags
+    unsigned rtBoxSortHeuristicMode;         // Ray tracing box sort heuristic mode
+    unsigned rtStaticPipelineFlags;          // Ray tracing static pipeline flags
+    unsigned rtTriCompressMode;              // Ray tracing triangle compression mode
+    bool useGpurt;                           // Whether GPURT is used
   };
 };
 static_assert(sizeof(Options) == sizeof(Options::u32All));
@@ -388,7 +401,8 @@ enum BufDataFormat {
   BufDataFormat5_6_5_1_Bgra,
   BufDataFormat1_5_6_5,
   BufDataFormat5_9_9_9,
-  BufDataFormat8_A
+  BufDataFormat8_A,
+  BufDataFormat16_16_16
 };
 
 // Numeric format of vertex buffer entry. These match the GFX9 hardware encoding.
@@ -407,14 +421,10 @@ enum BufNumFormat {
   BufNumFormatOther,
 };
 
-// Rate of vertex input. This encodes both the "rate" (none/vertex/instance), and, for "instance",
-// the divisor that determines how many instances share the same vertex buffer element.
+// Rate of vertex input
 enum VertexInputRate {
-  VertexInputRateVertex = ~0,  // Vertex buffer has one element per vertex
-  VertexInputRateNone = 0,     // Vertex buffer has one element shared between all instances
+  VertexInputRateVertex = 0,   // Vertex buffer has one element per vertex
   VertexInputRateInstance = 1, // Vertex buffer has one element per instance
-                               // Other value N means vertex buffer has one element per N instances;
-                               //  N is the divisor.
 };
 
 // Structure for a vertex input
@@ -429,6 +439,7 @@ struct VertexInputDescription {
   BufDataFormat dfmt; // Data format of input; one of the BufDataFormat* values
   BufNumFormat nfmt;  // Numeric format of input; one of the BufNumFormat* values
   unsigned inputRate; // Vertex input rate for the binding
+  unsigned divisor;   // Instance divisor
 };
 
 // Represents assistant info for each vertex attribute in uber fetch shader

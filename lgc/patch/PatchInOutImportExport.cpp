@@ -30,7 +30,6 @@
  ***********************************************************************************************************************
  */
 #include "lgc/patch/PatchInOutImportExport.h"
-#include "Gfx6Chip.h"
 #include "Gfx9Chip.h"
 #include "lgc/Builder.h"
 #include "lgc/BuiltIns.h"
@@ -372,18 +371,11 @@ void PatchInOutImportExport::processShader() {
       calcFactor.outPatchSize = outPatchSize;
       calcFactor.inPatchSize = inPatchSize;
 
-      // NOTE: Tess factors are always stored to on-chip LDS first. Then, they are store to TF buffer and on-chip LDS
-      // or off-chip LDS buffer (which will be loaded by TES).
-      if (m_pipelineState->isTessOffChip()) {
-        calcFactor.offChip.outPatchStart = 0;
-        calcFactor.offChip.patchConstStart = calcFactor.offChip.outPatchStart + outPatchTotalSize;
-
-        calcFactor.onChip.tessFactorStart = inPatchTotalSize;
-      } else {
-        calcFactor.onChip.outPatchStart = inPatchTotalSize;
-        calcFactor.onChip.patchConstStart = calcFactor.onChip.outPatchStart + outPatchTotalSize;
-        calcFactor.onChip.tessFactorStart = calcFactor.onChip.patchConstStart + patchConstTotalSize;
-      }
+      // NOTE: Tess factors are always stored to on-chip LDS first. Then, they are store to TF buffer and off-chip
+      // LDS buffer (which will be loaded by TES).
+      calcFactor.offChip.outPatchStart = 0;
+      calcFactor.offChip.patchConstStart = calcFactor.offChip.outPatchStart + outPatchTotalSize;
+      calcFactor.onChip.tessFactorStart = inPatchTotalSize;
 
       calcFactor.tessFactorStride = tessFactorStride;
       calcFactor.tessOnChipLdsSize = calcFactor.onChip.tessFactorStart + tessFactorTotalSize;
@@ -431,16 +423,12 @@ void PatchInOutImportExport::processShader() {
       LLPC_OUTS("Output vertex count: " << outVertexCount << "\n");
       LLPC_OUTS("Output vertex stride: " << calcFactor.outVertexStride << "\n");
       LLPC_OUTS("Output patch size (in dwords): " << outPatchSize << "\n");
-      LLPC_OUTS("Output patch start: " << (m_pipelineState->isTessOffChip() ? calcFactor.offChip.outPatchStart
-                                                                            : calcFactor.onChip.outPatchStart)
-                                       << (m_pipelineState->isTessOffChip() ? " (LDS buffer)" : "(LDS)") << "\n");
+      LLPC_OUTS("Output patch start: " << calcFactor.offChip.outPatchStart << " (LDS buffer)\n");
       LLPC_OUTS("Output patch total size (in dwords): " << outPatchTotalSize << "\n");
       LLPC_OUTS("\n");
       LLPC_OUTS("Patch constant count: " << patchConstCount << "\n");
       LLPC_OUTS("Patch constant size (in dwords): " << calcFactor.patchConstSize << "\n");
-      LLPC_OUTS("Patch constant start: " << (m_pipelineState->isTessOffChip() ? calcFactor.offChip.patchConstStart
-                                                                              : calcFactor.onChip.patchConstStart)
-                                         << (m_pipelineState->isTessOffChip() ? " (LDS buffer)" : "(LDS)") << "\n");
+      LLPC_OUTS("Patch constant start: " << calcFactor.offChip.patchConstStart << " (LDS buffer)\n");
       LLPC_OUTS("Patch constant total size (in dwords): " << patchConstTotalSize << "\n");
       LLPC_OUTS("\n");
       LLPC_OUTS("Tess factor start: " << calcFactor.onChip.tessFactorStart << " (LDS)\n");
@@ -1431,18 +1419,6 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       addExportInstForBuiltInOutput(m_edgeFlag, BuiltInEdgeFlag, insertPos);
     }
 
-    if (m_gfxIp.major <= 8 && (useLayer || enableMultiView)) {
-      if (enableMultiView) {
-        assert(m_viewIndex);
-        addExportInstForBuiltInOutput(m_viewIndex, BuiltInViewIndex, insertPos);
-      }
-
-      if (useLayer) {
-        assert(m_layer);
-        addExportInstForBuiltInOutput(m_layer, BuiltInLayer, insertPos);
-      }
-    }
-
     // Export gl_Layer and gl_ViewportIndex before entry-point returns
     if (m_gfxIp.major >= 9 && (useLayer || useViewportIndex || enableMultiView)) {
       Value *viewportIndex = nullptr;
@@ -1619,7 +1595,7 @@ Value *PatchInOutImportExport::patchTesGenericInputImport(Type *inputTy, unsigne
   assert(compIdx);
 
   auto ldsOffset = calcLdsOffsetForTesInput(inputTy, location, locOffset, compIdx, vertexIdx, builder);
-  return readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
+  return readValueFromLds(true, inputTy, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -1767,9 +1743,10 @@ Value *PatchInOutImportExport::performFsParameterLoad(BuilderBase &builder, Valu
     compValue = builder.CreateIntrinsic(Intrinsic::amdgcn_mov_dpp, builder.getInt32Ty(),
                                         {compValue, builder.getInt32(static_cast<unsigned>(dppCtrl)),
                                          builder.getInt32(15), builder.getInt32(15), builder.getTrue()});
-    // NOTE: Make mov_dpp and its source instructions run in WQM to make sure the mov_dpp could fetch
-    // correct data from possible inactive lanes.
-    compValue = builder.CreateIntrinsic(Intrinsic::amdgcn_wqm, builder.getInt32Ty(), compValue);
+    // NOTE: mov_dpp must run in strict WQM to access lanes potentially inactive with normal exec/WQM.
+    // lds_param_load always runs in strict WQM, but exec/WQM may not match this due to discards or divergence.
+    // Ideally we would use the FI bit on the mov_dpp, but there is currently no backend support.
+    compValue = builder.CreateIntrinsic(Intrinsic::amdgcn_strict_wqm, builder.getInt32Ty(), compValue);
     compValue = builder.CreateBitCast(compValue, builder.getFloatTy());
   } else {
     Value *args[] = {
@@ -1975,7 +1952,7 @@ Value *PatchInOutImportExport::patchTcsGenericOutputImport(Type *outputTy, unsig
                                                            Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(compIdx);
   auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, builder);
-  return readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
+  return readValueFromLds(true, outputTy, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -2028,7 +2005,7 @@ void PatchInOutImportExport::patchTcsGenericOutputExport(Value *output, unsigned
   assert(compIdx);
   Type *outputTy = output->getType();
   auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, builder);
-  writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
+  writeValueToLds(true, output, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -2242,7 +2219,7 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
     const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
     auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
+    input = readValueFromLds(true, inputTy, ldsOffset, builder);
 
     break;
   }
@@ -2254,7 +2231,7 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
     const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
     auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, nullptr, vertexIdx, builder);
-    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
+    input = readValueFromLds(true, inputTy, ldsOffset, builder);
 
     break;
   }
@@ -2271,12 +2248,12 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
       for (unsigned i = 0; i < inputTy->getArrayNumElements(); ++i) {
         auto elemIdx = builder.getInt32(i);
         auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        auto elem = readValueFromLds(true, elemTy, ldsOffset, builder);
         input = builder.CreateInsertValue(input, elem, {i});
       }
     } else {
       auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
+      input = readValueFromLds(true, inputTy, ldsOffset, builder);
     }
 
     break;
@@ -2319,12 +2296,12 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
       for (unsigned i = 0; i < inputTy->getArrayNumElements(); ++i) {
         auto elemIdx = builder.getInt32(i);
         auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        auto elem = readValueFromLds(true, elemTy, ldsOffset, builder);
         input = builder.CreateInsertValue(input, elem, {i});
       }
     } else {
       auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
+      input = readValueFromLds(true, inputTy, ldsOffset, builder);
     }
 
     break;
@@ -2483,22 +2460,31 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
                                             {ancillary, builder.getInt32(8), builder.getInt32(4)});
 
     Value *sampleMaskIn = sampleCoverage;
+
+    // RunAtSampleRate is used to identify whether fragment shader run at sample rate, which will
+    // be set from API side. PixelShaderSamples is used to controls the pixel shader execution rate,
+    // which will be set when compile shader.
+    // There is a special case when vkCreateGraphicsPipelines but not set sampleRate, but compiling shader
+    // will ask to set runAtSampleRate, this case is valid but current code will cause hang.
+    // So in this case, it will not use broadcast sample mask.
     if (m_pipelineState->getRasterizerState().perSampleShading || builtInUsage.runAtSampleRate) {
       unsigned baseMask = 1;
       if (!builtInUsage.sampleId) {
-        // Fix the failure for multisample_shader_builtin.sample_mask cases "gl_SampleMaskIn" should contain one
-        // or multiple covered sample bit.
-        // (1) If the 4 samples is divided into 2 sub invocation groups, broadcast sample mask bit <0, 1>
-        // to sample <2, 3>.
-        // (2) If the 8 samples is divided into 2 sub invocation groups, broadcast sample mask bit <0, 1>
-        // to sample <2, 3>, then re-broadcast sample mask bit <0, 1, 2, 3> to sample <4, 5, 6, 7>.
-        // (3) If the 8 samples is divided into 4 sub invocation groups, patch to broadcast sample mask bit
-        // <0, 1, 2, 3> to sample <4, 5, 6, 7>.
-
-        unsigned baseMaskSamples = m_pipelineState->getRasterizerState().pixelShaderSamples;
-        while (baseMaskSamples < m_pipelineState->getRasterizerState().numSamples) {
-          baseMask |= baseMask << baseMaskSamples;
-          baseMaskSamples *= 2;
+        if (m_pipelineState->getRasterizerState().pixelShaderSamples != 0) {
+          // Only broadcast sample mask when the value has already been set
+          // Fix the failure for multisample_shader_builtin.sample_mask cases "gl_SampleMaskIn" should contain one
+          // or multiple covered sample bit.
+          // (1) If the 4 samples is divided into 2 sub invocation groups, broadcast sample mask bit <0, 1>
+          // to sample <2, 3>.
+          // (2) If the 8 samples is divided into 2 sub invocation groups, broadcast sample mask bit <0, 1>
+          // to sample <2, 3>, then re-broadcast sample mask bit <0, 1, 2, 3> to sample <4, 5, 6, 7>.
+          // (3) If the 8 samples is divided into 4 sub invocation groups, patch to broadcast sample mask bit
+          // <0, 1, 2, 3> to sample <4, 5, 6, 7>.
+          unsigned baseMaskSamples = m_pipelineState->getRasterizerState().pixelShaderSamples;
+          while (baseMaskSamples < m_pipelineState->getRasterizerState().numSamples) {
+            baseMask |= baseMask << baseMaskSamples;
+            baseMaskSamples *= 2;
+          }
         }
       }
 
@@ -2828,7 +2814,7 @@ Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsig
     unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
     auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-    output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
+    output = readValueFromLds(true, outputTy, ldsOffset, builder);
 
     break;
   }
@@ -2854,12 +2840,12 @@ Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsig
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
         auto elemIdx = builder.getInt32(i);
         auto ldsOffset = calcLdsOffsetForTcsOutput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        auto elem = readValueFromLds(true, elemTy, ldsOffset, builder);
         output = builder.CreateInsertValue(output, elem, {i});
       }
     } else {
       auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-      output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
+      output = readValueFromLds(true, outputTy, ldsOffset, builder);
     }
 
     break;
@@ -3027,12 +3013,8 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
 
     // NOTE: Only last vertex processing shader stage has to export the value of gl_ViewportIndex.
     if (!m_hasTs && !m_hasGs) {
-      if (m_gfxIp.major <= 8)
-        addExportInstForBuiltInOutput(output, builtInId, insertPos);
-      else {
-        // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
-        m_viewportIndex = output;
-      }
+      // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
+      m_viewportIndex = output;
     } else if (m_hasTs) {
       assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
       unsigned loc = builtInOutLocMap.find(builtInId)->second;
@@ -3109,7 +3091,7 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
     unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
     auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-    writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
+    writeValueToLds(true, output, ldsOffset, builder);
 
     break;
   }
@@ -3130,11 +3112,11 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
         auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
         auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
         auto ldsOffset = calcLdsOffsetForTcsOutput(elem->getType(), loc, nullptr, elemIdx, vertexIdx, builder);
-        writeValueToLds(m_pipelineState->isTessOffChip(), elem, ldsOffset, builder);
+        writeValueToLds(true, elem, ldsOffset, builder);
       }
     } else {
       auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
-      writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
+      writeValueToLds(true, output, ldsOffset, builder);
     }
 
     break;
@@ -3175,12 +3157,12 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
         for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
           auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, builder.getInt32(i), nullptr, builder);
           auto elem = builder.CreateExtractValue(output, {i});
-          writeValueToLds(m_pipelineState->isTessOffChip(), elem, ldsOffset, builder);
+          writeValueToLds(true, elem, ldsOffset, builder);
         }
       } else {
         // Handle a single element of tessLevelOuter array
         auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, nullptr, builder);
-        writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
+        writeValueToLds(true, output, ldsOffset, builder);
       }
     }
 
@@ -3285,12 +3267,8 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
 
     // NOTE: Only last vertex processing shader stage has to export the value of gl_ViewportIndex.
     if (!m_hasGs) {
-      if (m_gfxIp.major <= 8)
-        addExportInstForBuiltInOutput(output, builtInId, insertPos);
-      else {
-        // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
-        m_viewportIndex = output;
-      }
+      // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
+      m_viewportIndex = output;
     } else {
       assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
       unsigned loc = builtInOutLocMap.find(builtInId)->second;
@@ -3544,13 +3522,8 @@ void PatchInOutImportExport::patchCopyShaderBuiltInOutputExport(Value *output, u
     break;
   }
   case BuiltInViewportIndex: {
-    if (m_gfxIp.major <= 8)
-      addExportInstForBuiltInOutput(output, builtInId, insertPos);
-    else {
-      // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
-      m_viewportIndex = output;
-    }
-
+    // NOTE: The export of gl_ViewportIndex is delayed and is done before entry-point returns.
+    m_viewportIndex = output;
     break;
   }
   case BuiltInPrimitiveShadingRate: {
@@ -3655,10 +3628,6 @@ unsigned PatchInOutImportExport::combineBufferStore(const std::vector<Value *> &
   // Start from 4-component combination
   unsigned compCount = 4;
   for (; compCount > 0; compCount--) {
-    // GFX6 does not support 3-component combination
-    if (m_gfxIp.major == 6 && compCount == 3)
-      continue;
-
     if (startIdx + compCount <= storeValues.size()) {
       funcName += getTypeName(storeTys[compCount - 1]);
       Value *storeValue = nullptr;
@@ -3716,10 +3685,6 @@ unsigned PatchInOutImportExport::combineBufferLoad(std::vector<Value *> &loadVal
   // 4-component combination
   unsigned compCount = 4;
   for (; compCount > 0; compCount--) {
-    // GFX6 does not support 3-component combination
-    if (m_gfxIp.major == 6 && compCount == 3)
-      continue;
-
     if (startIdx + compCount <= loadValues.size()) {
       funcName += getTypeName(loadTyps[compCount - 1]);
 
@@ -4569,11 +4534,8 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigne
   const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs;
   const auto &calcFactor = inOutUsage.calcFactor;
 
-  auto outPatchStart =
-      m_pipelineState->isTessOffChip() ? calcFactor.offChip.outPatchStart : calcFactor.onChip.outPatchStart;
-
-  auto patchConstStart =
-      m_pipelineState->isTessOffChip() ? calcFactor.offChip.patchConstStart : calcFactor.onChip.patchConstStart;
+  auto outPatchStart = calcFactor.offChip.outPatchStart;
+  auto patchConstStart = calcFactor.offChip.patchConstStart;
 
   // attribOffset = (location + locOffset) * 4 + compIdx * bitWidth / 32
   Value *attribOffset = builder.getInt32(location);
@@ -4641,11 +4603,8 @@ Value *PatchInOutImportExport::calcLdsOffsetForTesInput(Type *inputTy, unsigned 
 
   const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
 
-  auto outPatchStart =
-      m_pipelineState->isTessOffChip() ? calcFactor.offChip.outPatchStart : calcFactor.onChip.outPatchStart;
-
-  auto patchConstStart =
-      m_pipelineState->isTessOffChip() ? calcFactor.offChip.patchConstStart : calcFactor.onChip.patchConstStart;
+  auto outPatchStart = calcFactor.offChip.outPatchStart;
+  auto patchConstStart = calcFactor.offChip.patchConstStart;
 
   const auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(m_shaderStage)->entryArgIdxs.tes;
 
@@ -4714,8 +4673,7 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
                                                               unsigned outVertexCount, unsigned outVertexStride,
                                                               unsigned patchConstCount,
                                                               unsigned tessFactorStride) const {
-  unsigned maxThreadCountPerThreadGroup =
-      m_gfxIp.major >= 9 ? Gfx9::MaxHsThreadsPerSubgroup : Gfx6::MaxHsThreadsPerSubgroup;
+  unsigned maxThreadCountPerThreadGroup = Gfx9::MaxHsThreadsPerSubgroup;
 
   // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
   // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
@@ -4760,12 +4718,10 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
 
   patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, optimalPatchCountPerThreadGroup);
 
-  if (m_pipelineState->isTessOffChip()) {
-    auto outPatchLdsBufferSize = (outPatchSize + patchConstSize) * 4;
-    auto tessOffChipPatchCountPerThreadGroup =
-        m_pipelineState->getTargetInfo().getGpuProperty().tessOffChipLdsBufferSize / outPatchLdsBufferSize;
-    patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, tessOffChipPatchCountPerThreadGroup);
-  }
+  auto outPatchLdsBufferSize = (outPatchSize + patchConstSize) * 4;
+  auto tessOffChipPatchCountPerThreadGroup =
+      m_pipelineState->getTargetInfo().getGpuProperty().tessOffChipLdsBufferSize / outPatchLdsBufferSize;
+  patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, tessOffChipPatchCountPerThreadGroup);
 
   // TF-Buffer-based limit for Patchers per Thread Group:
   // ---------------------------------------------------------------------------------------------
@@ -4783,35 +4739,11 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
 
   patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, tfBufferPatchCountLimit);
 
-  if (m_pipelineState->isTessOffChip()) {
-    // For all-offchip tessellation, we need to write an additional 4-byte TCS control word to the TF buffer whenever
-    // the patch-ID is zero.
-    const unsigned offChipTfBufferPatchCountLimit =
-        (tfBufferSizeInBytes - (patchCountPerThreadGroup * sizeof(unsigned))) / (tessFactorStride * sizeof(unsigned));
-    patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, offChipTfBufferPatchCountLimit);
-  }
-
-  // Adjust the patches-per-thread-group based on hardware workarounds.
-  if (m_pipelineState->getTargetInfo().getGpuWorkarounds().gfx6.miscLoadBalancePerWatt != 0) {
-    const unsigned waveSize = m_pipelineState->getTargetInfo().getGpuProperty().waveSize;
-    // Load balance per watt is a mechanism which monitors HW utilization (num waves active, instructions issued
-    // per cycle, etc.) to determine if the HW can handle the workload with fewer CUs enabled.  The SPI_LB_CU_MASK
-    // register directs the SPI to stop launching waves to a CU so it will be clock-gated.  There is a bug in the
-    // SPI which where that register setting is applied immediately, which causes any pending LS/HS/CS waves on
-    // that CU to never be launched.
-    //
-    // The workaround is to limit each LS/HS threadgroup to a single wavefront: if there's only one wave, then the
-    // CU can safely be turned off afterwards.  A microcode fix exists for CS but for GFX it was decided that the
-    // cost in power efficiency wasn't worthwhile.
-    //
-    // Clamping to threads-per-wavefront / max(input control points, threads-per-patch) will make the hardware
-    // launch a single LS/HS wave per thread-group.
-    // For vulkan, threads-per-patch is always equal with outVertexCount.
-    const unsigned maxThreadCountPerPatch = std::max(inVertexCount, outVertexCount);
-    const unsigned maxPatchCount = waveSize / maxThreadCountPerPatch;
-
-    patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, maxPatchCount);
-  }
+  // For all-offchip tessellation, we need to write an additional 4-byte TCS control word to the TF buffer whenever
+  // the patch-ID is zero.
+  const unsigned offChipTfBufferPatchCountLimit =
+      (tfBufferSizeInBytes - (patchCountPerThreadGroup * sizeof(unsigned))) / (tessFactorStride * sizeof(unsigned));
+  patchCountPerThreadGroup = std::min(patchCountPerThreadGroup, offChipTfBufferPatchCountLimit);
 
   return patchCountPerThreadGroup;
 }
@@ -4922,18 +4854,6 @@ void PatchInOutImportExport::addExportInstForGenericOutput(Value *output, unsign
 // @param builtInId : ID of the built-in variable
 // @param insertPos : Where to insert the "exp" instruction
 void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsigned builtInId, Instruction *insertPos) {
-  // Check if the shader stage is valid to use "exp" instruction to export output
-  const auto nextStage = m_pipelineState->getNextShaderStage(m_shaderStage);
-  const bool useExpInst = ((m_shaderStage == ShaderStageVertex || m_shaderStage == ShaderStageTessEval ||
-                            m_shaderStage == ShaderStageCopyShader) &&
-                           (nextStage == ShaderStageFragment || nextStage == ShaderStageInvalid));
-  assert(useExpInst);
-  (void(useExpInst)); // unused
-
-  const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage;
-  const auto &builtInOutLocs =
-      m_shaderStage == ShaderStageCopyShader ? inOutUsage.gs.builtInOutLocs : inOutUsage.builtInOutputLocMap;
-
   const auto poison = PoisonValue::get(Type::getFloatTy(*m_context));
 
   switch (builtInId) {
@@ -4971,99 +4891,6 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
         ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
     };
     emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
-    break;
-  }
-  case BuiltInLayer: {
-    assert(m_gfxIp.major <= 8); // For GFX9, gl_ViewportIndex and gl_Layer are packed
-
-    Value *layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
-
-    // NOTE: Only export gl_Layer when multi-view is disabled. Otherwise, we will export gl_ViewIndex to vertex position
-    // data.
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().multiView != MultiViewMode::Disable;
-    if (!enableMultiView) {
-      Value *args[] = {
-          ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
-          ConstantInt::get(Type::getInt32Ty(*m_context), 0x4),              // en
-          poison,                                                           // src0
-          poison,                                                           // src1
-          layer,                                                            // src2
-          poison,                                                           // src3
-          ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
-          ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
-      };
-      emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
-    }
-
-    // NOTE: We have to export gl_Layer via generic outputs as well.
-    bool hasLayerExport = true;
-    if (nextStage == ShaderStageFragment) {
-      const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-      hasLayerExport = nextBuiltInUsage.layer;
-    } else if (nextStage == ShaderStageInvalid) {
-      hasLayerExport = false;
-    }
-
-    if (hasLayerExport) {
-      assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
-      const unsigned loc = builtInOutLocs.find(BuiltInLayer)->second;
-
-      recordVertexAttribExport(loc, {layer, poison, poison, poison});
-    }
-
-    break;
-  }
-  case BuiltInViewportIndex: {
-    assert(m_gfxIp.major <= 8); // For GFX9, gl_ViewportIndex and gl_Layer are packed
-    Value *viewportIndex = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
-
-    Value *args[] = {
-        ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
-        ConstantInt::get(Type::getInt32Ty(*m_context), 0x8),              // en
-        poison,                                                           // src0
-        poison,                                                           // src1
-        poison,                                                           // src2
-        viewportIndex,                                                    // src3
-        ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
-        ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
-    };
-    emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
-
-    // NOTE: We have to export gl_ViewportIndex via generic outputs as well.
-    bool hasViewportIndexExport = true;
-    if (nextStage == ShaderStageFragment) {
-      const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-      hasViewportIndexExport = nextBuiltInUsage.viewportIndex;
-    } else if (nextStage == ShaderStageInvalid) {
-      hasViewportIndexExport = false;
-    }
-
-    if (hasViewportIndexExport) {
-      assert(builtInOutLocs.find(BuiltInViewportIndex) != builtInOutLocs.end());
-      const unsigned loc = builtInOutLocs.find(BuiltInViewportIndex)->second;
-
-      recordVertexAttribExport(loc, {viewportIndex, poison, poison, poison});
-    }
-
-    break;
-  }
-  case BuiltInViewIndex: {
-    assert(m_gfxIp.major <= 8); // For GFX9, gl_ViewportIndex and gl_ViewIndex are packed
-
-    Value *viewIndex = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
-
-    Value *args[] = {
-        ConstantInt::get(Type::getInt32Ty(*m_context), EXP_TARGET_POS_1), // tgt
-        ConstantInt::get(Type::getInt32Ty(*m_context), 0x4),              // en
-        poison,                                                           // src0
-        poison,                                                           // src1
-        viewIndex,                                                        // src2
-        poison,                                                           // src3
-        ConstantInt::get(Type::getInt1Ty(*m_context), false),             // done
-        ConstantInt::get(Type::getInt1Ty(*m_context), false)              // vm
-    };
-    emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
-
     break;
   }
   case BuiltInPrimitiveShadingRate: {
